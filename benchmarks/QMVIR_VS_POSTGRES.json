@@ -1,0 +1,68 @@
+{
+  "postgres": {
+    "target": "postgres",
+    "timestamp": "2026-03-10T07:36:26.653000",
+    "dataset": {
+      "accounts": 5000,
+      "products": 500,
+      "orders": 50000,
+      "accounts_table": "bench_accounts",
+      "products_table": "bench_products",
+      "orders_table": "bench_orders"
+    },
+    "join": {
+      "ops": 500.0,
+      "qps": 8860.574430682305,
+      "avg_ms": 0.11263694800436497,
+      "p50_ms": 0.10908299736911431,
+      "p95_ms": 0.1360000023851171,
+      "p99_ms": 0.18037499830825254
+    },
+    "sum": {
+      "ops": 500.0,
+      "qps": 1308.4339812223486,
+      "avg_ms": 0.7635743919963716,
+      "p50_ms": 0.4400830002850853,
+      "p95_ms": 2.4247499968623742,
+      "p99_ms": 2.9675420009880327
+    }
+  },
+  "qmvir": {
+    "target": "qmvir",
+    "timestamp": "2026-03-10T07:36:29.260623",
+    "dataset": {
+      "accounts": 5000,
+      "products": 500,
+      "orders": 50000,
+      "accounts_table": "bench_accounts_2986",
+      "products_table": "bench_products_2986",
+      "orders_table": "bench_orders_2986"
+    },
+    "join": {
+      "ops": 500.0,
+      "qps": 19869.918005181702,
+      "avg_ms": 0.05015441190334968,
+      "p50_ms": 0.04816600267076865,
+      "p95_ms": 0.06766699516447261,
+      "p99_ms": 0.08895900100469589
+    },
+    "sum": {
+      "ops": 500.0,
+      "qps": 678.9369050648621,
+      "avg_ms": 1.4725500539934728,
+      "p50_ms": 0.7494169985875487,
+      "p95_ms": 5.095125001389533,
+      "p99_ms": 6.829707999713719
+    }
+  },
+  "stress_postgres": null,
+  "stress_qmvir": null,
+  "shadow": {
+    "enabled": true,
+    "ok": false,
+    "sample_accounts": 128,
+    "pg_rows": 1253,
+    "qm_rows": 1206,
+    "mismatch_accounts": 10
+  }
+}
