@@ -1,0 +1,13 @@
+name: Repo Hygiene
+
+on:
+  pull_request:
+  push:
+
+jobs:
+  no-space-number-duplicates:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Reject duplicate space-number files
+        run: bash scripts/check_no_space_number_duplicates.sh .

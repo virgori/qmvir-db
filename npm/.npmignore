@@ -1,0 +1,6 @@
+bin/native/
+node_modules/
+*.tgz
+.gitignore
+*.ts
+!*.d.ts

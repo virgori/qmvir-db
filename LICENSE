@@ -1,0 +1,70 @@
+# QMvir Database — Proprietary Software License Agreements
+
+**Copyright (c) 2025-2026 VIRGORI LAB (dev@virgori.com). All Rights Reserved.**
+
+## Table of Contents
+
+1. [LICENSE GRANT](#1-license-grant)
+2. [PROHIBITED USES & RESTRICTIONS](#2-prohibited-uses--restrictions)
+3. [BINARY DISTRIBUTION](#3-binary-distribution)
+4. [DISCLAIMER OF WARRANTIES](#4-disclaimer-of-warranties)
+5. [LIMITATION OF LIABILITY](#5-limitation-of-liability)
+6. [TERMINATION](#6-termination)
+7. [GOVERNING LAW](#7-governing-law)
+
+---
+
+## 1. LICENSE GRANT
+
+Subject to the terms and conditions of this Agreement, **VIRGORI LAB** hereby grants you a **limited, non-exclusive, non-transferable, and revocable** license to install and use the QMvir Database ("Software") solely in machine-readable, compiled binary form for your internal business operations.
+
+This Software is licensed, not sold, and VIRGORI LAB retains all ownership and intellectual property rights.
+
+## 2. PROHIBITED USES & RESTRICTIONS
+
+To ensure the integrity of the Software, you expressly agree **NOT** to:
+
+### Derivatives
+- Copy, modify, adapt, or create derivative works of the source code or any part of the Software without prior explicit written authorization.
+
+### Commercialization
+- Sublicense, rent, lease, sell, or distribute the Software to any third party or use it as part of a service bureau or provider arrangement.
+
+### Reverse Engineering
+- Reverse-engineer, decompile, or disassemble the Software, or otherwise attempt to derive the source code, except to the extent that such activity is expressly permitted by applicable law.
+
+### Branding
+- Alter, obscure, or remove any copyright notices, trademarks, or proprietary legends contained within or on the Software.
+
+## 3. BINARY DISTRIBUTION
+
+Pre-compiled binaries are provided for operational convenience. While you may download and deploy these binaries internally, any form of redistribution—whether for commercial or non-commercial purposes—is strictly prohibited without express written consent from VIRGORI LAB.
+
+## 4. DISCLAIMER OF WARRANTIES
+
+**THE SOFTWARE IS PROVIDED "AS IS" AND "WITH ALL FAULTS."** TO THE MAXIMUM EXTENT PERMITTED BY LAW, VIRGORI LAB DISCLAIMS ALL WARRANTIES, WHETHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE IMPLIED WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE, AND NON-INFRINGEMENT.
+
+NO ADVICE OR INFORMATION, WHETHER ORAL OR WRITTEN, SHALL CREATE ANY WARRANTY NOT EXPRESSLY STATED HEREIN.
+
+## 5. LIMITATION OF LIABILITY
+
+IN NO EVENT SHALL VIRGORI LAB OR ITS CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, OR CONSEQUENTIAL DAMAGES (INCLUDING LOSS OF PROFITS, DATA, OR BUSINESS INTERRUPTION) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+## 6. TERMINATION
+
+This License is effective until terminated. Your rights under this License will terminate automatically and without notice if you fail to comply with any term(s). Upon termination, you shall cease all use of the Software and destroy all copies, full or partial, in your possession.
+
+## 7. GOVERNING LAW
+
+This Agreement shall be governed by and construed in accordance with the laws of the jurisdiction where the copyright holder is established, without regard to conflict of law principles.
+
+---
+
+## Enterprise Licensing
+
+**For enterprise licensing, partnerships, or custom agreements:**
+
+- **Email:** [dev@virgori.com](mailto:dev@virgori.com)
+- **Official Repository:** [github.com/virgori/qmvir](https://github.com/virgori/qmvir)
+
+---

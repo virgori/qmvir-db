@@ -1,0 +1,50 @@
+# ══════════════════════════════════════════════════════════
+# QMvir Release Dockerfile — uses pre-built wheels
+# ══════════════════════════════════════════════════════════
+# This Dockerfile is used by CI to build multi-arch images.
+# Pre-built wheels are injected at build time.
+#
+# Build manually:
+#   docker build -f Dockerfile.release --build-arg TARGETPLATFORM=linux/amd64 -t qmvir .
+# ══════════════════════════════════════════════════════════
+
+FROM python:3.13-slim
+
+ARG TARGETPLATFORM=linux/amd64
+
+LABEL maintainer="QM Team" \
+      description="QMvir — Hybrid AI-Native Database" \
+      version="4.8.2"
+
+WORKDIR /app
+
+# Install system deps
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends libgomp1 && \
+    rm -rf /var/lib/apt/lists/*
+
+# Copy wheels based on target platform
+COPY docker-wheels/${TARGETPLATFORM#linux/}/ /tmp/wheels/
+
+# Install all wheels
+RUN pip install --no-cache-dir /tmp/wheels/*.whl 2>/dev/null || \
+    echo "Warning: some wheels not available for $TARGETPLATFORM" && \
+    rm -rf /tmp/wheels
+
+# Verify installation
+RUN python -c "from qm_engine import PostgresGateway; print('qm_engine OK')"
+
+ENV QM_DATA_DIR=/data/qm \
+    QM_HOST=0.0.0.0 \
+    QM_PORT=5433 \
+    QM_LOG_LEVEL=INFO \
+    QM_ADMIN_PASSWORD=changeme
+
+EXPOSE 5433
+VOLUME ["/data/qm"]
+
+HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
+    CMD python -c "import socket; s=socket.create_connection(('127.0.0.1',5433),2); s.close()" || exit 1
+
+ENTRYPOINT ["qm-server"]
+CMD ["start", "--data-dir", "/data/qm", "--host", "0.0.0.0", "--port", "5433"]

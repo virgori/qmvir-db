@@ -1,0 +1,53 @@
+{
+  "name": "qmvir",
+  "version": "5.4.0",
+  "description": "QMvir — Hybrid AI-Native Database: OLTP + OLAP + Search + Vector + Cache. Native Rust binary + JS/TS SDK.",
+  "license": "SEE LICENSE IN LICENSE",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/virgori/qmvir-releases"
+  },
+  "homepage": "https://github.com/virgori/qmvir-releases",
+  "keywords": [
+    "database",
+    "search-engine",
+    "vector-search",
+    "analytics",
+    "oltp",
+    "olap",
+    "hybrid-database",
+    "qmvir",
+    "ai-native"
+  ],
+  "main": "./sdk/client.js",
+  "types": "./sdk/client.d.ts",
+  "exports": {
+    ".": {
+      "import": "./sdk/client.js",
+      "types": "./sdk/client.d.ts"
+    }
+  },
+  "bin": {
+    "qm": "./bin/qmvir.js",
+    "qmvir": "./bin/qmvir.js"
+  },
+  "scripts": {
+    "postinstall": "node scripts/postinstall.js"
+  },
+  "os": [
+    "darwin",
+    "linux",
+    "win32"
+  ],
+  "engines": {
+    "node": ">=16"
+  },
+  "files": [
+    "bin/",
+    "scripts/",
+    "sdk/client.js",
+    "sdk/client.d.ts",
+    "README.md",
+    "LICENSE"
+  ]
+}

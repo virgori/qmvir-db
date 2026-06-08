@@ -1,0 +1,199 @@
+stages:
+  - test
+  - build
+  - deploy
+
+variables:
+  CARGO_HOME: "$CI_PROJECT_DIR/.cargo"
+  RUST_BACKTRACE: "1"
+  TARGET: "x86_64-unknown-linux-gnu"
+  DEPLOY_PATH: "/opt/qmvir"
+  SERVICE_NAME: "qmvir"
+  # Mac is source of truth - CI/CD only builds from repository
+  SOURCE_OF_TRUTH: "Mac Local Development"
+
+# GitLab CI/CD runs on GitLab runners, never affects local Mac code
+# Local Mac code is pushed to Git, then CI/CD builds and deploys to server
+
+# Test stage
+test:rust:
+  stage: test
+  image: rust:latest
+  cache:
+    paths:
+      - .cargo/
+      - target/
+  script:
+    - rustup component add clippy rustfmt
+    - cargo fmt -- --check
+    - cargo clippy -- -D warnings
+    - cargo test --workspace --verbose
+  only:
+    - merge_requests
+    - main
+
+# Build stage - Cross-compile for Linux x86_64 on GitLab runner
+build:linux:
+  stage: build
+  image: rust:latest
+  cache:
+    paths:
+      - .cargo/
+      - target/
+  script:
+    - echo "🔧 Setting up cross-compilation environment..."
+    - mkdir -p .cargo
+    - |
+      cat > .cargo/config.toml << 'EOF'
+      [target.x86_64-unknown-linux-gnu]
+      linker = "x86_64-linux-gnu-gcc"
+      
+      [env]
+      CC_x86_64_unknown_linux_gnu = "x86_64-linux-gnu-gcc"
+      CXX_x86_64_unknown_linux_gnu = "x86_64-linux-gnu-g++"
+      AR_x86_64_unknown_linux_gnu = "x86_64-linux-gnu-ar"
+      CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER = "x86_64-linux-gnu-gcc"
+      EOF
+    
+    - echo "📦 Installing dependencies..."
+    - apt-get update && apt-get install -y pkg-config libssl-dev build-essential gcc-x86_64-linux-gnu
+    
+    - echo "🏗️ Building from repository source..."
+    - rustup target add $TARGET
+    - cargo build --release --target $TARGET --no-default-features
+    
+    - echo "✅ Build artifacts:"
+    - strip target/$TARGET/release/qmvir || true
+    - ls -la target/$TARGET/release/qmvir
+    - file target/$TARGET/release/qmvir
+  artifacts:
+    paths:
+      - target/$TARGET/release/qmvir
+    expire_in: 1 hour
+  only:
+    - main
+    - tags
+
+# Deploy stage - Deploy to production server (161.97.146.164)
+deploy:production:
+  stage: deploy
+  image: alpine:latest
+  script:
+    - echo "🚀 Deploying to production server 161.97.146.164..."
+    - echo "📋 Source: Repository (Mac is source of truth)"
+    
+    - echo "📦 Installing deployment tools..."
+    - apk add --no-cache openssh-client rsync
+    
+    # Setup SSH connection to server
+    - eval $(ssh-agent -s)
+    - echo "$SSH_PRIVATE_KEY" | tr -d '\r' | ssh-add -
+    - mkdir -p ~/.ssh
+    - chmod 700 ~/.ssh
+    - ssh-keyscan -H 161.97.146.164 >> ~/.ssh/known_hosts
+    - chmod 644 ~/.ssh/known_hosts
+    
+    - echo "📁 Creating deployment directories..."
+    - ssh root@161.97.146.164 "mkdir -p $DEPLOY_PATH/{bin,logs,config,data}"
+    
+    - echo "📤 Deploying cross-compiled binary..."
+    - rsync -avz target/$TARGET/release/qmvir root@161.97.146.164:$DEPLOY_PATH/bin/
+    - ssh root@161.97.146.164 "chmod +x $DEPLOY_PATH/bin/qmvir"
+    
+    - echo "🔍 Verifying deployment..."
+    - ssh root@161.97.146.164 "file $DEPLOY_PATH/bin/qmvir"
+    - ssh root@161.97.146.164 "ls -la $DEPLOY_PATH/bin/qmvir"
+    
+    - echo "⚙️ Setting up configuration..."
+    - |
+      ssh root@161.97.146.164 "cat > $DEPLOY_PATH/config/config.toml << 'EOF'
+      # QMvir Configuration
+      bind_address = \"0.0.0.0:5432\"
+      data_dir = \"$DEPLOY_PATH/data\"
+      log_dir = \"$DEPLOY_PATH/logs\"
+      log_level = \"info\"
+      
+      [storage]
+      wal_dir = \"$DEPLOY_PATH/data/wal\"
+      snapshot_dir = \"$DEPLOY_PATH/data/snapshots\"
+      
+      [index]
+      hnsw_m = 16
+      hnsw_m0 = 32
+      hnsw_ef_construction = 200
+      hnsw_ef_search = 50
+      
+      [performance]
+      batch_size = 1000
+      parallel_queries = 4
+      cache_size = \"1GB\"
+      EOF"
+    
+    - echo "🔧 Setting up systemd service..."
+    - |
+      ssh root@161.97.146.164 "cat > /etc/systemd/system/$SERVICE_NAME.service << 'EOF'
+      [Unit]
+      Description=QMvir Database Engine
+      After=network.target
+      
+      [Service]
+      Type=simple
+      User=root
+      WorkingDirectory=$DEPLOY_PATH
+      ExecStart=$DEPLOY_PATH/bin/qmvir --config $DEPLOY_PATH/config/config.toml
+      Restart=always
+      RestartSec=5
+      StandardOutput=journal
+      StandardError=journal
+      SyslogIdentifier=qmvir
+      
+      [Install]
+      WantedBy=multi-user.target
+      EOF"
+    
+    - echo "🔄 Restarting service..."
+    - ssh root@161.97.146.164 "systemctl daemon-reload"
+    - ssh root@161.97.146.164 "systemctl enable $SERVICE_NAME"
+    - ssh root@161.97.146.164 "systemctl restart $SERVICE_NAME"
+    
+    - echo "⏳ Waiting for service to start..."
+    - sleep 5
+    
+    - echo "📊 Checking service status..."
+    - ssh root@161.97.146.164 "systemctl is-active $SERVICE_NAME"
+    - ssh root@161.97.146.164 "systemctl status $SERVICE_NAME --no-pager -l"
+    
+    - echo "📋 Recent logs:"
+    - ssh root@161.97.146.164 "journalctl -u $SERVICE_NAME --no-pager -n 20"
+    
+    - echo "✅ Deployment completed successfully!"
+    - echo "🌐 Service is running on: http://161.97.146.164:5432"
+    - echo "📋 Source of truth: Mac local development"
+  environment:
+    name: production
+    url: http://161.97.146.164:5432
+  only:
+    - main
+    - tags
+  when: manual
+
+# Deploy stage for tags (automatic)
+deploy:release:
+  extends: deploy:production
+  only:
+    - tags
+  when: on_success
+
+# Rollback job
+rollback:production:
+  stage: deploy
+  image: alpine:latest
+  script:
+    - echo "Rolling back..."
+    - systemctl stop $SERVICE_NAME
+    - echo "Please manually restore the previous binary to $DEPLOY_PATH/bin/qmvir"
+    - echo "Then run: systemctl start $SERVICE_NAME"
+  environment:
+    name: production
+    action: stop
+  when: manual
