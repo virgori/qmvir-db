@@ -1,0 +1,89 @@
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+*.egg-info/
+build/
+target/
+node_modules/
+.DS_Store
+*.so
+*.dylib
+*.a
+.benchmarks/
+venv/
+.venv/
+.env
+.env.*
+!.env.example
+!**/.env.example
+
+# Build artifacts
+dist/
+*.whl
+*.prof
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Debug symbols
+*.dSYM/
+
+# Temp test files
+_fix_*.py
+_test_*.py
+tmp/
+
+# Nohup output
+nohup.out
+
+# OS
+Thumbs.db
+
+# Rust
+**/*.rs.bk
+qm_engine/target/
+qmvir-studio/src-tauri/target/
+
+# Mypy / Ruff
+.mypy_cache/
+.ruff_cache/
+data/
+
+# npm
+npm/bin/native/
+npm/node_modules/
+npm/*.tgz
+npm/qm-*
+
+# Runtime data
+wal/*.log
+*.wal
+*.snap
+*.pid
+*.colcache
+data/
+*/data/
+
+# Generated benchmark and audit outputs
+benchmarks/**/*.json
+docs/*.json
+docs/*_latest.json
+docs/*_last.json
+docs/*_last_*.json
+docs/native_sql_perf_profile_*.prof
+docs/profiles/
+*_regression_report.txt
+*_performance_report.txt
+*_visibility_tests.txt
+verify_vector_mapping_last.txt
+vector_last_run_*.json
+vector_timing_breakdown.json
+
+# Native/static release artifacts
+lib/*.a
+build/release/
+release_snapshots/
