@@ -1,0 +1,230 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>QMvir Dashboard</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4"></script>
+<style>
+:root{--bg:#0f172a;--card:#1e293b;--border:#334155;--text:#e2e8f0;--muted:#94a3b8;--accent:#38bdf8;--green:#4ade80;--red:#f87171;--yellow:#fbbf24}
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:system-ui,-apple-system,sans-serif;background:var(--bg);color:var(--text);min-height:100vh}
+.header{background:var(--card);border-bottom:1px solid var(--border);padding:12px 24px;display:flex;align-items:center;justify-content:space-between}
+.header h1{font-size:18px;font-weight:600}
+.header .status{display:flex;align-items:center;gap:8px;font-size:14px;color:var(--muted)}
+.header .dot{width:8px;height:8px;border-radius:50%;background:var(--green)}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:16px;padding:24px}
+.card{background:var(--card);border:1px solid var(--border);border-radius:8px;padding:20px}
+.card .label{font-size:12px;color:var(--muted);text-transform:uppercase;letter-spacing:0.5px}
+.card .value{font-size:28px;font-weight:700;margin-top:4px}
+.card .sub{font-size:12px;color:var(--muted);margin-top:2px}
+.main{padding:0 24px 24px}
+.section{background:var(--card);border:1px solid var(--border);border-radius:8px;padding:20px;margin-bottom:16px}
+.section h2{font-size:14px;font-weight:600;margin-bottom:12px;color:var(--muted);text-transform:uppercase;letter-spacing:0.5px}
+table{width:100%;border-collapse:collapse;font-size:14px}
+th{text-align:left;padding:8px 12px;border-bottom:1px solid var(--border);color:var(--muted);font-weight:500}
+td{padding:8px 12px;border-bottom:1px solid var(--border)}
+.sql-area{display:flex;gap:8px;margin-bottom:12px}
+.sql-area textarea{flex:1;background:var(--bg);border:1px solid var(--border);border-radius:6px;color:var(--text);padding:10px;font-family:monospace;font-size:13px;resize:vertical;min-height:40px}
+.sql-area button{background:var(--accent);color:var(--bg);border:none;border-radius:6px;padding:10px 20px;font-weight:600;cursor:pointer}
+.sql-area button:hover{opacity:0.85}
+#sql-result{font-family:monospace;font-size:13px;white-space:pre-wrap;max-height:300px;overflow-y:auto;background:var(--bg);padding:10px;border-radius:6px;border:1px solid var(--border)}
+.chart-container{height:200px;position:relative}
+.latency-row{display:flex;gap:24px;flex-wrap:wrap;margin-top:8px;font-size:14px}
+.latency-row span{color:var(--muted)}
+.latency-row strong{color:var(--text)}
+</style>
+</head>
+<body>
+<div class="header">
+  <h1>QMvir Dashboard v2.0.0</h1>
+  <div class="status"><span class="dot" id="status-dot"></span><span id="status-text">Connecting...</span></div>
+</div>
+
+<div class="grid">
+  <div class="card"><div class="label">Queries</div><div class="value" id="c-queries">—</div><div class="sub" id="c-qps">— qps</div></div>
+  <div class="card"><div class="label">Cache Hit Rate</div><div class="value" id="c-hitrate">—</div><div class="sub" id="c-cache">—</div></div>
+  <div class="card"><div class="label">Active TXN</div><div class="value" id="c-txn">—</div><div class="sub" id="c-commits">—</div></div>
+  <div class="card"><div class="label">WAL Size</div><div class="value" id="c-wal">—</div><div class="sub" id="c-walw">—</div></div>
+</div>
+
+<div class="main">
+  <div class="section">
+    <h2>Throughput (last 60s)</h2>
+    <div class="chart-container"><canvas id="throughput-chart"></canvas></div>
+  </div>
+
+  <div class="section">
+    <h2>Tables</h2>
+    <table>
+      <thead><tr><th>Name</th><th>Columns</th><th>Rows</th><th>Types</th></tr></thead>
+      <tbody id="table-body"><tr><td colspan="4">Loading...</td></tr></tbody>
+    </table>
+  </div>
+
+  <div class="section">
+    <h2>SQL Console</h2>
+    <div class="sql-area">
+      <textarea id="sql-input" rows="2" placeholder="SELECT * FROM users LIMIT 10"></textarea>
+      <button onclick="runQuery()">Execute</button>
+    </div>
+    <div id="sql-result"></div>
+  </div>
+
+  <div class="section">
+    <h2>Latency</h2>
+    <div class="latency-row">
+      <div><span>p50:</span> <strong id="lat-p50">—</strong></div>
+      <div><span>p99:</span> <strong id="lat-p99">—</strong></div>
+      <div><span>count:</span> <strong id="lat-count">—</strong></div>
+      <div><span>sum:</span> <strong id="lat-sum">—</strong></div>
+    </div>
+  </div>
+</div>
+
+<script>
+const BASE = location.origin;
+let prevQueries = 0, prevTime = Date.now();
+const qpsHistory = new Array(60).fill(0);
+
+const ctx = document.getElementById('throughput-chart').getContext('2d');
+const chart = new Chart(ctx, {
+  type: 'line',
+  data: {
+    labels: qpsHistory.map((_, i) => -60 + i + 's'),
+    datasets: [{
+      label: 'qps',
+      data: [...qpsHistory],
+      borderColor: '#38bdf8',
+      backgroundColor: 'rgba(56,189,248,0.1)',
+      fill: true,
+      tension: 0.3,
+      pointRadius: 0,
+    }]
+  },
+  options: {
+    responsive: true,
+    maintainAspectRatio: false,
+    scales: {
+      x: { display: false },
+      y: { beginAtZero: true, ticks: { color: '#94a3b8' }, grid: { color: '#1e293b' } }
+    },
+    plugins: { legend: { display: false } }
+  }
+});
+
+function fmt(n) {
+  if (n >= 1e6) return (n/1e6).toFixed(1) + 'M';
+  if (n >= 1e3) return (n/1e3).toFixed(1) + 'K';
+  return n.toString();
+}
+
+function fmtBytes(b) {
+  if (b >= 1e9) return (b/1e9).toFixed(1) + ' GB';
+  if (b >= 1e6) return (b/1e6).toFixed(1) + ' MB';
+  if (b >= 1e3) return (b/1e3).toFixed(1) + ' KB';
+  return b + ' B';
+}
+
+async function fetchStats() {
+  try {
+    const r = await fetch(BASE + '/api/stats');
+    const d = await r.json();
+
+    const now = Date.now();
+    const dt = (now - prevTime) / 1000;
+    const qps = dt > 0 ? Math.round((d.queries_total - prevQueries) / dt) : 0;
+    prevQueries = d.queries_total;
+    prevTime = now;
+
+    qpsHistory.push(qps);
+    qpsHistory.shift();
+    chart.data.datasets[0].data = [...qpsHistory];
+    chart.update('none');
+
+    document.getElementById('c-queries').textContent = fmt(d.queries_total);
+    document.getElementById('c-qps').textContent = qps + ' qps';
+    document.getElementById('c-hitrate').textContent = d.cache_hit_rate.toFixed(1) + '%';
+    document.getElementById('c-cache').textContent = fmt(d.cache_hits) + ' hits / ' + fmt(d.cache_misses) + ' misses';
+    document.getElementById('c-txn').textContent = Math.round(d.active_txns);
+    document.getElementById('c-commits').textContent = fmt(d.txn_commits) + ' commits';
+    document.getElementById('c-wal').textContent = fmtBytes(d.wal_size_bytes);
+    document.getElementById('c-walw').textContent = fmt(d.wal_writes) + ' writes';
+
+    document.getElementById('status-dot').style.background = '#4ade80';
+    document.getElementById('status-text').textContent = 'UP · ' + d.uptime_secs + 's';
+  } catch(e) {
+    document.getElementById('status-dot').style.background = '#f87171';
+    document.getElementById('status-text').textContent = 'Disconnected';
+  }
+}
+
+async function fetchTables() {
+  try {
+    const r = await fetch(BASE + '/api/tables');
+    const tables = await r.json();
+    const tbody = document.getElementById('table-body');
+    if (!tables.length) { tbody.innerHTML = '<tr><td colspan="4">No tables</td></tr>'; return; }
+    tbody.innerHTML = tables.map(t =>
+      `<tr><td>${esc(t.name)}</td><td>${t.columns.length}</td><td>${fmt(t.row_count)}</td><td>${t.column_types.map(esc).join(', ')}</td></tr>`
+    ).join('');
+  } catch(e) { /* ignore */ }
+}
+
+async function fetchLatency() {
+  try {
+    const r = await fetch(BASE + '/metrics');
+    const text = await r.text();
+    const p50 = extract(text, 'qmvir_query_latency_seconds_bucket{le="0.001"}');
+    const p99 = extract(text, 'qmvir_query_latency_seconds_bucket{le="0.1"}');
+    const count = extract(text, 'qmvir_query_latency_seconds_count');
+    const sum = extract(text, 'qmvir_query_latency_seconds_sum');
+    document.getElementById('lat-p50').textContent = p50;
+    document.getElementById('lat-p99').textContent = p99;
+    document.getElementById('lat-count').textContent = count;
+    document.getElementById('lat-sum').textContent = parseFloat(sum || '0').toFixed(4) + 's';
+  } catch(e) { /* ignore */ }
+}
+
+function extract(text, key) {
+  const line = text.split('\n').find(l => l.startsWith(key + ' '));
+  return line ? line.split(' ')[1] : '—';
+}
+
+function esc(s) { const d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
+
+async function runQuery() {
+  const sql = document.getElementById('sql-input').value.trim();
+  if (!sql) return;
+  const el = document.getElementById('sql-result');
+  el.textContent = 'Running...';
+  try {
+    const r = await fetch(BASE + '/api/query', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ sql })
+    });
+    if (!r.ok) { el.textContent = 'Error: ' + (await r.text()); return; }
+    const d = await r.json();
+    let out = d.columns.join(' | ') + '\n' + '─'.repeat(d.columns.length * 15) + '\n';
+    for (const row of d.rows) {
+      out += row.map(v => v ?? 'NULL').join(' | ') + '\n';
+    }
+    out += '\n' + d.command_tag;
+    el.textContent = out;
+    fetchTables();
+  } catch(e) { el.textContent = 'Error: ' + e.message; }
+}
+
+document.getElementById('sql-input').addEventListener('keydown', e => {
+  if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') runQuery();
+});
+
+// Poll every 2 seconds
+fetchStats(); fetchTables(); fetchLatency();
+setInterval(fetchStats, 2000);
+setInterval(fetchTables, 5000);
+setInterval(fetchLatency, 5000);
+</script>
+</body>
+</html>

@@ -1,0 +1,56 @@
+[build-system]
+requires = ["maturin>=1.4"]
+build-backend = "maturin"
+
+[project]
+name = "qmvir"
+version = "5.4.0"
+description = "QMvir — High-Performance Database Engine (Rust)"
+readme = "README.md"
+requires-python = ">=3.11"
+license = {text = "Proprietary"}
+authors = [
+    {name = "QM Team"}
+]
+
+keywords = [
+    "database",
+    "search-engine",
+    "vector-search",
+    "analytics",
+    "rust",
+]
+
+dependencies = []
+
+[project.scripts]
+qmvir = "qm_app:main"
+qm-server = "qm_app:main"
+qm-bench = "qm_core.bench:print_report"
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "msgpack>=1.0",
+    "lark>=1.0",
+    "lz4>=4.0",
+    "zstandard>=0.22",
+    "pytest-benchmark>=4.0",
+]
+
+[tool.maturin]
+manifest-path = "qm_engine/Cargo.toml"
+module-name = "qm_engine"
+features = ["extension-module"]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "N", "UP", "B", "SIM"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
