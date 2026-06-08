@@ -3,7 +3,7 @@
 <div align="center">
 
 [![npm version](https://badge.fury.io/js/qmvir.svg)](https://badge.fury.io/js/qmvir)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![License: Proprietary](https://img.shields.io/badge/License-Proprietary-red.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.75+-orange.svg)](https://www.rust-lang.org)
 [![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20Windows-blue.svg)]()
 
@@ -17,17 +17,17 @@
 
 ## 🎯 Overview
 
-QMvir is a **next-generation hybrid database** built in Rust that breaks traditional database boundaries by unifying multiple data paradigms in a single, high-performance engine. Whether you need transactional processing, real-time analytics, semantic search, or vector similarity search - QMvir delivers it all with PostgreSQL-compatible wire protocol.
+QMvir is a **hybrid database engine** built in Rust that combines transactional SQL, analytics-oriented execution, semantic search, and vector similarity search in one local engine. It includes a PostgreSQL wire-protocol gateway for common clients, but it is not a general PostgreSQL replacement or a production HA database.
 
 ### 🌟 What Makes QMvir Special?
 
 - **🔥 Hybrid Architecture**: OLTP + OLAP + Search + Vector in one engine
 - **⚡ Lightning Fast**: Rust-powered with SIMD optimizations and parallel processing
-- **🔌 PostgreSQL Compatible**: Drop-in replacement for existing applications
+- **🔌 PostgreSQL Wire Protocol**: Compatible with common PostgreSQL clients for supported SQL/features
 - **🧠 AI-Native**: Built-in vector search with HNSW and Product Quantization
 - **🔍 Full-Text Search**: Advanced inverted index with WAND/BMW optimization
 - **📊 Real-time Analytics**: Columnar storage with vectorized execution
-- **🛡️ Enterprise Ready**: ACID compliance, backups, security, and monitoring
+- **🛡️ Release-Surface Focus**: WAL/checkpoint recovery, backups, security, and monitoring with documented limitations
 
 ---
 
@@ -69,7 +69,7 @@ psql -h localhost -p 5433 -U admin -d qmvir
 ## ✨ Features
 
 ### 🏗️ Hybrid Architecture
-- **OLTP Engine**: ACID-compliant transactional processing with MVCC
+- **OLTP Engine**: SQL transactions with WAL/checkpoint recovery; full storage-wide MVCC remains scoped to the storage/MVCC modules and is not yet a blanket NativeSqlEngine claim
 - **OLAP Engine**: Columnar storage with vectorized execution for analytics
 - **Search Engine**: Full-text search with inverted indexes and WAND optimization
 - **Vector Engine**: HNSW indexes with Product Quantization for similarity search
@@ -83,8 +83,8 @@ psql -h localhost -p 5433 -U admin -d qmvir
 - **Adaptive Indexing**: Automatic index management and optimization
 
 ### 🔌 Compatibility & Integration
-- **PostgreSQL Wire Protocol**: Full compatibility with PostgreSQL clients
-- **Standard SQL**: ANSI SQL compliance with extensions
+- **PostgreSQL Wire Protocol**: Client compatibility for the supported gateway surface
+- **Standard SQL Subset**: ANSI-style SQL support with QMvir extensions and documented gaps
 - **Multiple APIs**: REST, WebSocket, and native Rust/Python bindings
 - **Export Formats**: Parquet, CSV, JSON support
 - **Streaming**: Real-time data ingestion and CDC (Change Data Capture)
@@ -93,7 +93,9 @@ psql -h localhost -p 5433 -U admin -d qmvir
 
 ## 📊 Performance
 
-### Benchmark Results (Median vs PostgreSQL + DuckDB)
+### Benchmark Results
+
+Benchmarks must be interpreted by mode. QMvir has fast local/in-memory scalar read and index paths. Persistent WAL `per_commit_sync` has stricter durability-at-return semantics but durable mutating workloads are currently slower than PostgreSQL in benchmarked cases. Group commit can improve throughput, but it must not be treated as PostgreSQL `synchronous_commit=on` if mutations are acknowledged before fsync.
 
 | Operation | QMvir | PostgreSQL | DuckDB | Improvement |
 |-----------|-------|------------|---------|-------------|
@@ -216,7 +218,7 @@ QM/
 
 ## 📄 License
 
-QMvir is licensed under the [MIT License](LICENSE). See the LICENSE file for details.
+QMvir is distributed under the proprietary license in [LICENSE](LICENSE). See that file for usage and distribution terms.
 
 ---
 
@@ -243,7 +245,7 @@ See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for full architecture details.
 * **Hybrid Engine:** Seamlessly handles row-based operations, complex aggregations, and massive scans.
 * **Multi-Modal Search:** Built-in Full-text search (FTS) and Vector search (HNSW) for AI-ready applications.
 * **Postgres Compatible:** Connect instantly using `psql` or any standard PG driver.
-* **Advanced Storage:** Features Binary WAL, MVCC, Snapshots, and `io_uring` optimization (Linux).
+* **Advanced Storage:** Features binary WAL, MVCC building blocks, snapshots, and `io_uring` optimization (Linux). NativeSqlEngine currently uses a separate SQL WAL/checkpoint path.
 * **V4.8+ Engine Pools:** Dedicated worker pools for Analytics, Vector search, and Compaction to prevent resource contention.
 
 ---
@@ -255,7 +257,7 @@ See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for full architecture details.
 | **Gateway** | PG v3 protocol, SCRAM authentication, CDC hooks. |
 | **NativeSqlEngine** | The primary SQL execution hot path. |
 | **Executor** | SIMD vectorized kernels, JIT compilation, and hybrid search logic. |
-| **Storage** | ACID-compliant WAL, MVCC, and snapshot management. |
+| **Storage** | WAL, MVCC building blocks, and snapshot management; NativeSqlEngine transaction isolation is documented separately. |
 | **Engines** | Specialized pools (Rayon) for compute-heavy analytics and vector tasks. |
 
 ---

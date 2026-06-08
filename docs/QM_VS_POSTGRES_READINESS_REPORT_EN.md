@@ -1,4 +1,4 @@
-# QM Database Engine — PostgreSQL Replacement Readiness Report
+# QM Database Engine — PostgreSQL Compatibility Readiness Report
 
 **Date**: 10-04-2026 (updated)  
 **Engine Version**: QM 0.5.x (Rust core)  
@@ -9,9 +9,9 @@
 
 ## Executive Summary
 
-**Verdict: QM CAN replace PostgreSQL for a growing range of workloads — and is approaching general-purpose readiness.**
+**Verdict: QM can be evaluated for selected embedded/local workloads, but it is not a general PostgreSQL replacement or production HA database.**
 
-QM excels in embedded/in-process scenarios where low latency and simplicity matter more than full SQL compliance. It outperforms PostgreSQL by 2–36× on all tested workloads due to zero network overhead and optimized in-memory execution. Latest additions: 13 native data types (including NUMERIC arbitrary precision via rust_decimal), 50+ SQL functions, EXISTS subquery, UPSERT (ON CONFLICT), RETURNING clause, INSERT INTO...SELECT, CREATE TABLE AS SELECT, TRUNCATE TABLE, PG wire protocol — now at full PostgreSQL data type and SQL DML parity.
+QM excels in embedded/in-process scenarios where low latency and simplicity matter more than full SQL compliance. Some local in-memory read/index workloads are faster than PostgreSQL in the benchmarked environment, while durable persistent-WAL mutating workloads must be reported separately and are currently slower in per-commit fsync mode. Latest additions include 13 native data types, 50+ SQL functions, EXISTS subquery, UPSERT (ON CONFLICT), RETURNING clause, INSERT INTO...SELECT, CREATE TABLE AS SELECT, TRUNCATE TABLE, and a PG wire protocol gateway for the supported SQL surface.
 
 ### Readiness Score: 7.8 / 10
 
@@ -47,8 +47,8 @@ QM excels in embedded/in-process scenarios where low latency and simplicity matt
 | CTEs (WITH, WITH RECURSIVE) | ✅ Full | Fixpoint detection, max depth 1000 |
 | Subqueries (WHERE IN, scalar, correlated) | ✅ Full | Nested + correlated |
 | Window functions (ROW_NUMBER, RANK, LAG, LEAD, etc.) | ✅ Full | PARTITION BY + ORDER BY |
-| Transactions (BEGIN/COMMIT/ROLLBACK) | ✅ Full | MVCC-based |
-| SAVEPOINT / ROLLBACK TO SAVEPOINT | ✅ Full | Named savepoints |
+| Transactions (BEGIN/COMMIT/ROLLBACK) | ⚠️ Scoped | NativeSqlEngine supports single active transaction snapshot/rollback and persistence; storage-wide multi-session MVCC is not yet a release claim |
+| SAVEPOINT / ROLLBACK TO SAVEPOINT | ❌ Not supported | Parser rejects savepoint operations in NativeSqlEngine |
 | BETWEEN, LIKE, IN, DISTINCT | ✅ Full | Pattern matching via DP |
 | GRANT / REVOKE | ✅ Basic | 6 privilege types |
 | COPY (CSV, Parquet) | ✅ Full | Bulk import/export |
@@ -293,21 +293,21 @@ All benchmarks on Apple M3, single-threaded, 10K rows, release mode.
 
 ## 9. Conclusion
 
-**QM is a high-performance embedded SQL engine that excels in its niche and is rapidly closing the gap with PostgreSQL.** It beats PostgreSQL on raw speed for in-process workloads (2–36×) and offers unique features like built-in vector search, SIMD-accelerated execution, and ML-based query optimization.
+**QM is a high-performance embedded SQL engine that excels in specific local and in-process workloads.** Some measured local read/index paths are faster than PostgreSQL in the available benchmark runs, while durable mutating workloads with per-commit fsync remain slower and must be reported separately. QM should not be described as a general PostgreSQL replacement or a production HA database.
 
 **Recent progress has eliminated the most critical gaps:**
 1. ~~Limited data types~~ → **13 native types: INT, FLOAT, NUMERIC, TEXT, BOOL, DATE, TIMESTAMP, INTERVAL, JSON, BYTEA, UUID, ARRAY, NULL** — full PostgreSQL parity
 2. ~~Missing SQL features~~ → **EXISTS, UPSERT (ON CONFLICT), RETURNING, INSERT INTO...SELECT, CREATE TABLE AS SELECT, TRUNCATE, CASE WHEN, 50+ SQL functions, CAST, COALESCE now implemented**
 3. ~~No PostgreSQL wire protocol~~ → **PG v3 protocol already exists** with SCRAM-SHA-256 auth, Parse/Bind/Execute
 
-**Remaining gaps for full PostgreSQL replacement:**
+**Remaining gaps before any broad PostgreSQL-replacement claim:**
 1. **Missing SQL features**: Views, EXPLAIN, Stored Procedures, Triggers, Sequences
 2. ~~Missing data types~~ → **NUMERIC/DECIMAL now implemented** (arbitrary precision via rust_decimal)
 3. **In-memory only** (dataset must fit in RAM)
 4. **No production replication** (code exists but untested)
 5. **ORM compatibility untested** (wire protocol exists, needs validation)
 
-**For embedded use cases** (Python apps, CLI tools, analytics pipelines, ML workloads, time-series, document storage): QM is **ready today** and superior to PostgreSQL.
+**For embedded use cases** (Python apps, CLI tools, analytics pipelines, ML workloads, time-series, document storage): QM can be evaluated today where its supported SQL surface and durability mode fit the workload. Benchmark claims must name the exact mode: memory, persistent-WAL `per_commit_sync`, or persistent-WAL `group_commit`.
 
 **For web/server applications**: QM needs Phase 1 completion + Phase 2–3 of the roadmap before it can be considered.
 

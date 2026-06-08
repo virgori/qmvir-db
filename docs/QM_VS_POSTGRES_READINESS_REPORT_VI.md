@@ -1,4 +1,4 @@
-# QM Database Engine — Báo cáo đánh giá khả năng thay thế PostgreSQL
+# QM Database Engine — Báo cáo đánh giá tương thích PostgreSQL
 
 **Ngày**: 10-04-2026 (cập nhật)  
 **Phiên bản Engine**: QM 0.5.x (Rust core)  
@@ -9,9 +9,9 @@
 
 ## Tóm tắt
 
-**Kết luận: QM CÓ THỂ thay thế PostgreSQL cho nhiều trường hợp sử dụng — và đang tiếp cận mức sẵn sàng cho mục đích tổng quát.**
+**Kết luận: QM có thể được đánh giá cho một số workload embedded/local chọn lọc, nhưng chưa phải thay thế PostgreSQL tổng quát hoặc database production HA.**
 
-QM vượt trội trong các ứng dụng embedded/in-process, nơi mà độ trễ thấp và sự đơn giản quan trọng hơn SQL compliance đầy đủ. QM nhanh hơn PostgreSQL từ 2–36× trên tất cả benchmark nhờ không có overhead mạng và thực thi in-memory tối ưu. Các bổ sung mới nhất: 13 kiểu dữ liệu native (bao gồm NUMERIC arbitrary precision via rust_decimal), 50+ hàm SQL, EXISTS subquery, UPSERT (ON CONFLICT), RETURNING clause, INSERT INTO...SELECT, CREATE TABLE AS SELECT, TRUNCATE TABLE, PG wire protocol — đã đạt tương đương PostgreSQL về kiểu dữ liệu và SQL DML.
+QM phù hợp với các ứng dụng embedded/in-process khi độ trễ thấp và sự đơn giản quan trọng hơn SQL compliance đầy đủ. Một số workload read/index local in-memory nhanh hơn PostgreSQL trong môi trường benchmark hiện có, còn workload ghi bền vững persistent-WAL phải báo cáo riêng và hiện chậm hơn ở chế độ per-commit fsync. Các bổ sung mới nhất gồm 13 kiểu dữ liệu native, 50+ hàm SQL, EXISTS subquery, UPSERT (ON CONFLICT), RETURNING clause, INSERT INTO...SELECT, CREATE TABLE AS SELECT, TRUNCATE TABLE, và PG wire protocol cho SQL surface được hỗ trợ.
 
 ### Điểm đánh giá: 7.8 / 10
 
@@ -47,8 +47,8 @@ QM vượt trội trong các ứng dụng embedded/in-process, nơi mà độ tr
 | CTEs (WITH, WITH RECURSIVE) | ✅ Đầy đủ | Fixpoint detection, max 1000 |
 | Subqueries (WHERE IN, scalar, correlated) | ✅ Đầy đủ | Lồng nhau + correlated |
 | Window functions (ROW_NUMBER, RANK, LAG, LEAD...) | ✅ Đầy đủ | PARTITION BY + ORDER BY |
-| Transactions (BEGIN/COMMIT/ROLLBACK) | ✅ Đầy đủ | Dựa trên MVCC |
-| SAVEPOINT / ROLLBACK TO SAVEPOINT | ✅ Đầy đủ | Named savepoints |
+| Transactions (BEGIN/COMMIT/ROLLBACK) | ⚠️ Có phạm vi | NativeSqlEngine hỗ trợ một transaction active với snapshot/rollback và persistence; chưa claim MVCC đa session toàn storage |
+| SAVEPOINT / ROLLBACK TO SAVEPOINT | ❌ Chưa hỗ trợ | NativeSqlEngine reject savepoint operations |
 | BETWEEN, LIKE, IN, DISTINCT | ✅ Đầy đủ | Pattern matching |
 | GRANT / REVOKE | ✅ Cơ bản | 6 loại quyền |
 | COPY (CSV, Parquet) | ✅ Đầy đủ | Bulk import/export |
@@ -225,7 +225,7 @@ Tất cả benchmark trên Apple M3, single-threaded, 10K rows, release mode.
 
 ---
 
-## 8. Lộ trình để thay thế hoàn toàn PostgreSQL
+## 8. Lộ trình trước khi mở rộng claim tương thích PostgreSQL
 
 ### Giai đoạn 1: Lấp lỗ hổng nghiêm trọng ~~(ước tính: 3-4 tuần)~~ — PHẦN LỚN HOÀN THÀNH ✅
 - [x] Thêm kiểu BOOLEAN, TIMESTAMP/DATE, JSON
@@ -276,21 +276,21 @@ Tất cả benchmark trên Apple M3, single-threaded, 10K rows, release mode.
 
 ## 9. Kết luận
 
-**QM là một SQL engine embedded hiệu năng cao, vượt trội trong phân khúc riêng của mình và đang thu hẹp nhanh chóng khoảng cách với PostgreSQL.** Nó đánh bại PostgreSQL về tốc độ thô (2–36×) cho các workload in-process và cung cấp các tính năng độc quyền như vector search tích hợp, SIMD execution, và ML query optimization.
+**QM là một SQL engine embedded hiệu năng cao cho một số workload local và in-process cụ thể.** Một số read/index path local đo được nhanh hơn PostgreSQL trong các benchmark hiện có, nhưng workload ghi bền vững với per-commit fsync vẫn chậm hơn và phải báo cáo riêng. Không nên mô tả QM là thay thế PostgreSQL tổng quát hoặc database production HA.
 
 **Tiến bộ gần đây đã loại bỏ các lỗ hổng nghiêm trọng nhất:**
 1. ~~Kiểu dữ liệu hạn chế~~ → **13 kiểu native: INT, FLOAT, NUMERIC, TEXT, BOOL, DATE, TIMESTAMP, INTERVAL, JSON, BYTEA, UUID, ARRAY, NULL** — tương đương PostgreSQL
 2. ~~Thiếu SQL features~~ → **EXISTS, UPSERT (ON CONFLICT), RETURNING, INSERT INTO...SELECT, CREATE TABLE AS SELECT, TRUNCATE, CASE WHEN, 50+ hàm SQL, CAST, COALESCE đã implement**
 3. ~~Không có PostgreSQL wire protocol~~ → **PG v3 protocol đã có sẵn** với SCRAM-SHA-256 auth, Parse/Bind/Execute
 
-**Khoảng cách còn lại để thay thế hoàn toàn PostgreSQL:**
+**Khoảng cách còn lại trước khi có thể claim thay thế PostgreSQL rộng rãi:**
 1. **Thiếu SQL features**: Views, EXPLAIN, Stored Procedures, Triggers, Sequences
 2. ~~Thiếu kiểu dữ liệu~~ → **Đã implement NUMERIC/DECIMAL** (arbitrary precision via rust_decimal)
 3. **Chỉ in-memory** (dataset phải vừa RAM)
 4. **Chưa có replication production** (code có nhưng chưa test)
 5. **Chưa test tương thích ORM** (wire protocol có, cần validate)
 
-**Cho embedded use case** (Python apps, CLI tools, analytics pipelines, ML workloads, time-series, document storage): QM **sẵn sàng ngay bây giờ** và vượt trội hơn PostgreSQL.
+**Cho embedded use case** (Python apps, CLI tools, analytics pipelines, ML workloads, time-series, document storage): QM có thể được đánh giá ngay nếu SQL surface và durability mode hiện tại phù hợp workload. Mọi benchmark claim phải ghi rõ mode: memory, persistent-WAL `per_commit_sync`, hoặc persistent-WAL `group_commit`.
 
 **Cho web/server applications**: QM cần hoàn thành Giai đoạn 1 + Giai đoạn 2–3 của lộ trình trước khi có thể được cân nhắc.
 
