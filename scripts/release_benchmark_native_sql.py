@@ -23,6 +23,9 @@ from pathlib import Path
 from typing import Any, Callable
 
 
+BENCH_WARMUP = 10
+
+
 def percentile(values: list[float], pct: float) -> float:
     if not values:
         return 0.0
@@ -33,7 +36,7 @@ def percentile(values: list[float], pct: float) -> float:
 
 def bench_latency(name: str, iterations: int, fn: Callable[[], Any]) -> dict[str, Any]:
     latencies_ms: list[float] = []
-    for _ in range(min(10, iterations)):
+    for _ in range(min(BENCH_WARMUP, iterations)):
         fn()
     start = time.perf_counter()
     for _ in range(iterations):
@@ -240,6 +243,7 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--quick", action="store_true", help="short CI smoke benchmark")
     parser.add_argument("--iterations", type=int, default=None)
+    parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--baseline", type=Path, default=Path("docs/native_sql_benchmark_baseline.json"))
     parser.add_argument("--output", type=Path, default=None)
     parser.add_argument("--build-mode", default="unknown")
@@ -253,6 +257,8 @@ def main() -> int:
         return 2
 
     iterations = args.iterations if args.iterations is not None else (50 if args.quick else 1000)
+    global BENCH_WARMUP
+    BENCH_WARMUP = max(0, args.warmup)
     env = environment(args.build_mode, args.feature_flags)
     with tempfile.TemporaryDirectory(prefix="qm-release-bench-"):
         results = run_native_sql_suite(qm_engine, iterations)

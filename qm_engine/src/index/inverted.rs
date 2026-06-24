@@ -768,6 +768,27 @@ impl InvertedIndex {
         fs::write(path, encoded).map_err(|err| format!("failed to write BM25 snapshot: {err}"))
     }
 
+    /// Clone indexed source documents for catalog snapshots.
+    pub fn clone_documents(&self) -> Vec<(DocId, String)> {
+        let mut documents: Vec<(DocId, String)> = self
+            .source_documents
+            .iter()
+            .map(|(doc_id, text)| (*doc_id, text.clone()))
+            .collect();
+        documents.sort_by_key(|(doc_id, _)| *doc_id);
+        documents
+    }
+
+    /// Rebuild a finalized index from persisted document snapshots.
+    pub fn from_documents(docs: Vec<(DocId, String)>) -> Self {
+        let mut index = Self::new();
+        for (doc_id, text) in docs {
+            index.index_document(doc_id, &text);
+        }
+        index.finalize();
+        index
+    }
+
     pub fn load_documents<P: AsRef<Path>>(path: P) -> Result<Self, String> {
         let bytes = fs::read(path).map_err(|err| format!("failed to read BM25 snapshot: {err}"))?;
         let snapshot: Bm25DocumentSnapshot = serde_json::from_slice(&bytes)

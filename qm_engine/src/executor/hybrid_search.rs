@@ -428,14 +428,8 @@ fn normalize_scores(docs: &[ScoredDoc]) -> Vec<(i64, f64)> {
     if finite_docs.is_empty() {
         return Vec::new();
     }
-    let min = finite_docs
-        .iter()
-        .map(|d| d.score)
-        .fold(f64::MAX, f64::min);
-    let max = finite_docs
-        .iter()
-        .map(|d| d.score)
-        .fold(f64::MIN, f64::max);
+    let min = finite_docs.iter().map(|d| d.score).fold(f64::MAX, f64::min);
+    let max = finite_docs.iter().map(|d| d.score).fold(f64::MIN, f64::max);
     let range = max - min;
 
     finite_docs
@@ -646,12 +640,21 @@ mod tests {
     #[test]
     fn lexical_heavy_exact_match_beats_vague_semantic_match_fixture() {
         let bm25 = vec![
-            ScoredDoc { id: 10, score: 100.0 },
+            ScoredDoc {
+                id: 10,
+                score: 100.0,
+            },
             ScoredDoc { id: 20, score: 5.0 },
         ];
         let vector = vec![
-            ScoredDoc { id: 20, score: 0.01 },
-            ScoredDoc { id: 10, score: 0.80 },
+            ScoredDoc {
+                id: 20,
+                score: 0.01,
+            },
+            ScoredDoc {
+                id: 10,
+                score: 0.80,
+            },
         ];
 
         let results = weighted_linear_fusion(&bm25, &vector, 0.95, 2);
@@ -668,8 +671,14 @@ mod tests {
             ScoredDoc { id: 20, score: 0.9 },
         ];
         let vector = vec![
-            ScoredDoc { id: 20, score: 0.01 },
-            ScoredDoc { id: 10, score: 0.95 },
+            ScoredDoc {
+                id: 20,
+                score: 0.01,
+            },
+            ScoredDoc {
+                id: 10,
+                score: 0.95,
+            },
         ];
 
         let results = weighted_linear_fusion(&bm25, &vector, 0.05, 2);
@@ -693,7 +702,10 @@ mod tests {
         let results = weighted_linear_fusion(&bm25, &vector, 0.5, 2);
 
         // Equal normalized scores must be stable and sorted by lower document id.
-        assert_eq!(results.iter().map(|row| row.id).collect::<Vec<_>>(), vec![1, 2]);
+        assert_eq!(
+            results.iter().map(|row| row.id).collect::<Vec<_>>(),
+            vec![1, 2]
+        );
     }
 
     #[test]
@@ -704,7 +716,10 @@ mod tests {
         let results = weighted_linear_fusion(&bm25, &vector, 0.5, 2);
 
         // One-source candidates are retained; equal fused scores tie by document id.
-        assert_eq!(results.iter().map(|row| row.id).collect::<Vec<_>>(), vec![10, 30]);
+        assert_eq!(
+            results.iter().map(|row| row.id).collect::<Vec<_>>(),
+            vec![10, 30]
+        );
         assert_eq!(results[0].bm25_score, None);
         assert_eq!(results[1].vector_distance, None);
     }
@@ -712,11 +727,17 @@ mod tests {
     #[test]
     fn non_finite_scores_are_sanitized_before_fusion_fixture() {
         let bm25 = vec![
-            ScoredDoc { id: 1, score: f64::NAN },
+            ScoredDoc {
+                id: 1,
+                score: f64::NAN,
+            },
             ScoredDoc { id: 2, score: 10.0 },
         ];
         let vector = vec![
-            ScoredDoc { id: 3, score: f64::INFINITY },
+            ScoredDoc {
+                id: 3,
+                score: f64::INFINITY,
+            },
             ScoredDoc { id: 4, score: 0.1 },
         ];
 
@@ -724,7 +745,10 @@ mod tests {
         let rrf = reciprocal_rank_fusion(&[bm25, vector], 60.0, 10);
 
         // NaN/inf inputs are dropped so ranking never depends on partial_cmp fallback.
-        assert_eq!(weighted.iter().map(|row| row.id).collect::<Vec<_>>(), vec![2, 4]);
+        assert_eq!(
+            weighted.iter().map(|row| row.id).collect::<Vec<_>>(),
+            vec![2, 4]
+        );
         assert_eq!(rrf.iter().map(|row| row.id).collect::<Vec<_>>(), vec![2, 4]);
         assert!(weighted.iter().all(|row| row.score.is_finite()));
         assert!(rrf.iter().all(|row| row.score.is_finite()));

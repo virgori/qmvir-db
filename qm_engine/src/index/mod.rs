@@ -13,7 +13,12 @@ pub mod bplus_tree;
 pub mod concurrent_hnsw;
 pub mod hnsw;
 pub mod inverted;
+pub mod inverted_catalog;
+pub mod json_path_catalog;
 pub mod mmap_store;
+pub mod search_checkpoint;
+pub mod trigram_catalog;
+pub mod vector_hnsw_catalog;
 pub mod roaring;
 pub mod sharded;
 pub mod wal_inverted;
@@ -28,6 +33,16 @@ pub use hnsw::{
     DistanceMetric, HnswConfig, HnswIndex, HnswMutationPolicy, HnswPqIndex, ProductQuantizer,
 };
 pub use inverted::{InvertedIndex, ScoredDoc, SearchStrategy};
+pub use inverted_catalog::{InvertedCatalogSnapshot, InvertedIndexCatalog, ManagedInvertedIndex};
+pub use json_path_catalog::{
+    extract_json_path_text, JsonPathCatalog, JsonPathCatalogSnapshot, ManagedJsonPathIndex,
+};
+pub use search_checkpoint::{encode_search_indexes, load_search_indexes};
+pub use trigram_catalog::{ManagedTrigramIndex, TrigramCatalog, TrigramCatalogSnapshot};
+pub use vector_hnsw_catalog::{
+    metric_for_distance_op, parse_hnsw_metric_from_sql, ManagedVectorHnswIndex,
+    VectorHnswCatalog, VectorHnswCatalogSnapshot,
+};
 pub use mmap_store::{AccessPattern, MmapGraphStore, MmapVectorStore};
 pub use roaring::RoaringBitmap;
 pub use sharded::{ShardedHnswIndex, ShardedInvertedIndex};

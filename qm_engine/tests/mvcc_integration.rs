@@ -472,8 +472,7 @@ mod tests {
 
         let registry = HashMap::new();
         let snapshot = test_snapshot(1, 3, Isolation::SnapshotIsolation);
-        let visible =
-            visible_version_for_row(&versions, &heads, 10, &snapshot, &registry).unwrap();
+        let visible = visible_version_for_row(&versions, &heads, 10, &snapshot, &registry).unwrap();
 
         assert_eq!(visible.version_id, 1);
         match visible.payload.cols.get("name") {

@@ -34,6 +34,13 @@ SYNC_POLICIES = {
         "durability_window_description": "Autocommit statements sync before returning; explicit transactions append during the transaction and sync once after COMMIT.",
         "claim_scope": "persistent NativeSqlEngine WAL with commit-level sync_wal; durable when COMMIT/autocommit statement returns",
     },
+    "per-commit-sync-data": {
+        "qm_sync_policy": "per_commit_sync_data",
+        "sync_before_commit_return": True,
+        "acknowledged_before_fsync": False,
+        "durability_window_description": "Autocommit statements and explicit transaction COMMIT flush buffered WAL and call File::sync_data() before returning.",
+        "claim_scope": "persistent NativeSqlEngine WAL with commit-level sync_data; durable data sync semantics, not silently equated with sync_all metadata semantics",
+    },
     "group-commit": {
         "qm_sync_policy": "group_commit",
         "sync_before_commit_return": False,
@@ -41,12 +48,26 @@ SYNC_POLICIES = {
         "durability_window_description": "Mutations are acknowledged before fsync until the configured commit count/interval flushes pending WAL.",
         "claim_scope": "persistent NativeSqlEngine WAL with benchmark group-commit batching; not equivalent to PostgreSQL synchronous_commit=on",
     },
+    "group-commit-sync": {
+        "qm_sync_policy": "group_commit_sync",
+        "sync_before_commit_return": True,
+        "acknowledged_before_fsync": False,
+        "durability_window_description": "Mutations append WAL and wait for the engine-native group commit coordinator to complete sync_all() before returning.",
+        "claim_scope": "persistent NativeSqlEngine WAL with durable group commit; concurrent commits may share one sync_all",
+    },
     "append-only-profile": {
         "qm_sync_policy": "wal_append_only",
         "sync_before_commit_return": False,
         "acknowledged_before_fsync": True,
         "durability_window_description": "WAL records are appended but benchmarked operations do not call sync_wal(); profiling only.",
         "claim_scope": "persistent NativeSqlEngine WAL append-only profiling; no synchronous durability claim",
+    },
+    "relaxed-os-buffered": {
+        "qm_sync_policy": "relaxed_os_buffered",
+        "sync_before_commit_return": False,
+        "acknowledged_before_fsync": True,
+        "durability_window_description": "WAL records are appended and flushed to the OS buffer, but benchmarked operations do not call sync_all() before returning.",
+        "claim_scope": "persistent NativeSqlEngine WAL with OS-buffer flush only; faster but not strict crash-durable at return",
     },
 }
 
@@ -210,12 +231,16 @@ class QmSyncController:
     def after_autocommit_mutation(self, engine: Any) -> None:
         if not self._persistent():
             return
-        if self.sync_policy in {"per-mutation", "per-commit"}:
+        if self.sync_policy in {"per-mutation", "per-commit", "per-commit-sync-data"}:
             if not self.engine_native_sync:
                 self.sync_now(engine)
         elif self.sync_policy == "group-commit":
             self._maybe_group_sync(engine)
-        elif self.sync_policy == "append-only-profile":
+        elif self.sync_policy in {
+            "append-only-profile",
+            "relaxed-os-buffered",
+            "group-commit-sync",
+        }:
             self.pending += 1
         else:
             raise ValueError(f"unknown sync policy {self.sync_policy}")
@@ -227,7 +252,14 @@ class QmSyncController:
             # NativeSqlEngine stages explicit transaction WAL until COMMIT, so
             # the strongest safe point available here is still COMMIT return.
             self.pending += 1
-        elif self.sync_policy in {"per-commit", "group-commit", "append-only-profile"}:
+        elif self.sync_policy in {
+            "per-commit",
+            "per-commit-sync-data",
+            "group-commit-sync",
+            "group-commit",
+            "append-only-profile",
+            "relaxed-os-buffered",
+        }:
             self.pending += 1
         else:
             raise ValueError(f"unknown sync policy {self.sync_policy}")
@@ -235,12 +267,16 @@ class QmSyncController:
     def after_transaction_commit(self, engine: Any) -> None:
         if not self._persistent():
             return
-        if self.sync_policy in {"per-mutation", "per-commit"}:
+        if self.sync_policy in {"per-mutation", "per-commit", "per-commit-sync-data"}:
             if not self.engine_native_sync:
                 self.sync_now(engine)
         elif self.sync_policy == "group-commit":
             self._maybe_group_sync(engine)
-        elif self.sync_policy == "append-only-profile":
+        elif self.sync_policy in {
+            "append-only-profile",
+            "relaxed-os-buffered",
+            "group-commit-sync",
+        }:
             self.pending += 1
         else:
             raise ValueError(f"unknown sync policy {self.sync_policy}")
@@ -261,7 +297,13 @@ def _new_qm_engine(qm_engine: Any, qm_mode: str, data_dir: Path | None) -> Any:
 def _configure_qm_sync_policy(engine: Any, qm_mode: str, sync_policy: str) -> None:
     if qm_mode != "persistent-wal" or not hasattr(engine, "set_wal_sync_policy"):
         return
-    if sync_policy in {"per-mutation", "per-commit"}:
+    if sync_policy in {
+        "per-mutation",
+        "per-commit",
+        "per-commit-sync-data",
+        "group-commit-sync",
+        "relaxed-os-buffered",
+    }:
         engine.set_wal_sync_policy(sync_policy)
     else:
         engine.set_wal_sync_policy("append-only-profile")
@@ -359,7 +401,13 @@ def run_qm(
     data_dir: Path | None = None
     if qm_mode == "persistent-wal":
         data_dir = Path(tempfile.mkdtemp(prefix="qm_pg_compare_persistent_"))
-    engine_native_sync = sync_policy in {"per-mutation", "per-commit"}
+    engine_native_sync = sync_policy in {
+        "per-mutation",
+        "per-commit",
+        "per-commit-sync-data",
+        "group-commit-sync",
+        "relaxed-os-buffered",
+    }
     sync = QmSyncController(qm_mode, sync_policy, sync_every_n, sync_interval_ms, engine_native_sync)
     engine = _new_qm_engine(qm_engine, qm_mode, data_dir)
     _configure_qm_sync_policy(engine, qm_mode, sync_policy)
@@ -383,7 +431,14 @@ def run_qm(
         item["wal_bytes_delta"] = max(0, after_wal - before_wal)
         item["sync_count_delta"] = sync_delta
         item["fsync_count_delta"] = sync_delta if qm_mode == "persistent-wal" and sync_policy != "append-only-profile" else 0
-        item["commit_waits_for_fsync"] = qm_mode == "persistent-wal" and sync_policy in {"per-mutation", "per-commit"}
+        item["commit_waits_for_fsync"] = qm_mode == "persistent-wal" and sync_policy in {
+            "per-mutation",
+            "per-commit",
+            "group-commit-sync",
+        }
+        item["commit_waits_for_sync_data"] = (
+            qm_mode == "persistent-wal" and sync_policy == "per-commit-sync-data"
+        )
         return item
 
     def batch_iterations(batch_size: int) -> int:
@@ -407,17 +462,22 @@ def run_qm(
         sync.after_autocommit_mutation(engine)
 
     results.append(qm_bench("update_by_pk", iterations, update_by_pk))
-    delete_id = next_id
+    delete_count = max(1, iterations // 2)
+    delete_start = next_id + 1
+    for offset in range(delete_count):
+        row_id = delete_start + offset
+        engine.execute(f"INSERT INTO cmp (id, v, score, name, category) VALUES ({row_id}, 1, 1, 'd', 'delete')")
+        sync.after_autocommit_mutation(engine)
+    next_id += delete_count
+    delete_id = delete_start
 
     def delete() -> None:
         nonlocal delete_id
-        delete_id += 1
-        engine.execute(f"INSERT INTO cmp (id, v, score, name, category) VALUES ({delete_id}, 1, 1, 'd', 'delete')")
-        sync.after_autocommit_mutation(engine)
         engine.execute(f"DELETE FROM cmp WHERE id = {delete_id}")
         sync.after_autocommit_mutation(engine)
+        delete_id += 1
 
-    results.append(qm_bench("delete_by_pk", max(1, iterations // 2), delete))
+    results.append(qm_bench("delete_by_pk", delete_count, delete))
     results.append(qm_bench("indexed_integer_equality", iterations, lambda: engine.execute("SELECT id FROM cmp WHERE score = 42")))
     results.append(qm_bench("indexed_string_equality_duplicate_heavy", iterations, lambda: engine.execute("SELECT id FROM cmp WHERE category = 'cat_3'")))
     results.append(qm_bench("count_indexed_equality", iterations, lambda: engine.execute("SELECT COUNT(*) FROM cmp WHERE score = 42")))
@@ -600,15 +660,20 @@ def run_pg(dsn: str, iterations: int, durability_mode: str) -> tuple[dict[str, d
     cur.execute("CREATE INDEX idx_qm_cmp_category ON qm_cmp (category)")
     results.append(bench("select_by_pk", iterations, lambda: cur.execute("SELECT name FROM qm_cmp WHERE id = %s", (target,))))
     results.append(bench("update_by_pk", iterations, lambda: cur.execute("UPDATE qm_cmp SET v = v + 1 WHERE id = %s", (target,))))
-    delete_id = next_id
+    delete_count = max(1, iterations // 2)
+    delete_start = next_id + 1
+    for offset in range(delete_count):
+        row_id = delete_start + offset
+        cur.execute("INSERT INTO qm_cmp (id, v, score, name, category) VALUES (%s, %s, %s, %s, %s)", (row_id, 1, 1, "d", "delete"))
+    next_id += delete_count
+    delete_id = delete_start
 
     def delete() -> None:
         nonlocal delete_id
-        delete_id += 1
-        cur.execute("INSERT INTO qm_cmp (id, v, score, name, category) VALUES (%s, %s, %s, %s, %s)", (delete_id, 1, 1, "d", "delete"))
         cur.execute("DELETE FROM qm_cmp WHERE id = %s", (delete_id,))
+        delete_id += 1
 
-    results.append(bench("delete_by_pk", max(1, iterations // 2), delete))
+    results.append(bench("delete_by_pk", delete_count, delete))
     results.append(bench("indexed_integer_equality", iterations, lambda: cur.execute("SELECT id FROM qm_cmp WHERE score = %s", (42,))))
     results.append(bench("indexed_string_equality_duplicate_heavy", iterations, lambda: cur.execute("SELECT id FROM qm_cmp WHERE category = %s", ("cat_3",))))
     results.append(bench("count_indexed_equality", iterations, lambda: cur.execute("SELECT COUNT(*) FROM qm_cmp WHERE score = %s", (42,))))
@@ -843,7 +908,7 @@ def main() -> int:
             "NativeSqlEngine memory mode uses default in-memory/autocommit and is not durability-equivalent to PostgreSQL",
             "NativeSqlEngine persistent-wal mode uses a real data_dir and records the selected sync_wal policy",
             "NativeSqlEngine --qm-sync-policy controls engine-native sync for per-mutation/per-commit and benchmark-controller sync for group-commit",
-            "Group-commit and append-only-profile modes are not synchronous durability claims unless sync_before_commit_return=true",
+            "Group-commit, append-only-profile, and relaxed-os-buffered modes are not synchronous durability claims unless sync_before_commit_return=true",
             "NativeSqlEngine comparison mode is recorded separately and must not be mixed with unmatched PostgreSQL durability claims",
         ],
         "qm_results": qm,

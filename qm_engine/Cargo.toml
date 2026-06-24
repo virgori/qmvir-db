@@ -1,6 +1,6 @@
 [package]
 name = "qm_engine"
-version = "5.4.0"
+version = "5.4.2"
 edition = "2021"
 description = "QMvir High-Performance Database Engine - Rust Core"
 autobins = false
@@ -37,6 +37,7 @@ crossbeam = "0.8"
 parking_lot = "0.12"
 num_cpus = "1.16"
 bytes = "1.5"
+memchr = "2.7"
 
 # SIMD & Performance
 wide = "0.7"
@@ -130,6 +131,10 @@ path = "src/bin/native_sql_core_bench.rs"
 name = "hnsw_rust_benchmark"
 path = "src/bin/hnsw_rust_benchmark.rs"
 
+[[bin]]
+name = "wal_sync_floor"
+path = "src/bin/wal_sync_floor.rs"
+
 [[example]]
 name = "vector_benchmark"
 path = "examples/vector_benchmark.rs"
@@ -153,6 +158,14 @@ path = "tests/native_sql_identity_uuid_json_hash.rs"
 [[test]]
 name = "native_sql_query_update_delete_audit"
 path = "tests/native_sql_query_update_delete_audit.rs"
+
+[[test]]
+name = "native_sql_inverted_fts"
+path = "tests/native_sql_inverted_fts.rs"
+
+[[test]]
+name = "native_sql_phase1_indexes"
+path = "tests/native_sql_phase1_indexes.rs"
 
 [[test]]
 name = "release_crash_recovery"

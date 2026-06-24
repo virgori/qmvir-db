@@ -6,7 +6,13 @@ use crate::executor::agg::{
     AggregateExecutor, HavingPredicate,
 };
 use crate::executor::simd_sum_f64;
-use crate::index::{IndexKey, IndexLookupKeyRef, IndexManager, IndexManagerSnapshot};
+use crate::index::{
+    encode_search_indexes, extract_json_path_text, load_search_indexes, metric_for_distance_op,
+    parse_hnsw_metric_from_sql, DistanceMetric, IndexKey, IndexLookupKeyRef, IndexManager,
+    IndexManagerSnapshot, InvertedCatalogSnapshot, InvertedIndexCatalog, JsonPathCatalog,
+    JsonPathCatalogSnapshot, TrigramCatalog, TrigramCatalogSnapshot, VectorHnswCatalog,
+    VectorHnswCatalogSnapshot,
+};
 use ahash::AHashMap;
 use parking_lot::RwLock as PLRwLock;
 #[cfg(feature = "python")]
@@ -22,16 +28,16 @@ use std::collections::HashSet;
 #[cfg(feature = "python")]
 use std::ffi::CString;
 use std::fs;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, BufWriter, Write};
 #[cfg(feature = "python")]
 use std::os::raw::{c_int, c_void};
 use std::path::PathBuf;
 #[cfg(feature = "python")]
 use std::ptr;
 use std::str::FromStr;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, RwLock};
-use std::time::Instant;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex, RwLock};
+use std::time::{Duration, Instant};
 
 /// Maximum nesting depth for recursive SELECT handling (subqueries, CTEs, etc.).
 const MAX_NESTING_DEPTH: usize = 128;
@@ -886,21 +892,9 @@ fn eval_expr(expr: &str, row: &NativeRow) -> Cell {
         if args.len() >= 2 {
             let json_str = eval_expr(args[0].trim(), row).as_text();
             let key = eval_expr(args[1].trim(), row).as_text();
-            if let Ok(val) = serde_json::from_str::<serde_json::Value>(&json_str) {
-                if let Some(v) = val.get(&key) {
-                    return match v {
-                        serde_json::Value::String(s) => Cell::Text(s.clone()),
-                        serde_json::Value::Number(n) => {
-                            if let Some(i) = n.as_i64() {
-                                Cell::Int(i)
-                            } else {
-                                Cell::Float(n.as_f64().unwrap_or(0.0))
-                            }
-                        }
-                        serde_json::Value::Bool(b) => Cell::Bool(*b),
-                        serde_json::Value::Null => Cell::Null,
-                        _ => Cell::Text(v.to_string()),
-                    };
+            if extract_json_path_text(&json_str, &key).is_some() {
+                if let Some(text) = extract_json_path_text(&json_str, &key) {
+                    return Cell::Text(text);
                 }
             }
             return Cell::Null;
@@ -2265,6 +2259,10 @@ struct TransactionState {
     row_undo: HashMap<String, HashMap<i64, Option<NativeRow>>>,
     tombstone_snapshot: Option<Vec<(String, i64, u64)>>,
     index_snapshot: Option<IndexManagerSnapshot>,
+    inverted_snapshot: Option<InvertedCatalogSnapshot>,
+    json_path_snapshot: Option<JsonPathCatalogSnapshot>,
+    trigram_snapshot: Option<TrigramCatalogSnapshot>,
+    vector_hnsw_snapshot: Option<VectorHnswCatalogSnapshot>,
     mvcc_tx_id: TxId,
     dirty: bool,
     wal_sql: Vec<String>,
@@ -2275,6 +2273,9 @@ enum WalSyncPolicy {
     AppendOnlyProfile = 0,
     PerMutationSync = 1,
     PerCommitSync = 2,
+    RelaxedOsBuffered = 3,
+    PerCommitSyncData = 4,
+    GroupCommitSync = 5,
 }
 
 impl WalSyncPolicy {
@@ -2282,9 +2283,177 @@ impl WalSyncPolicy {
         match code {
             1 => Self::PerMutationSync,
             2 => Self::PerCommitSync,
+            3 => Self::RelaxedOsBuffered,
+            4 => Self::PerCommitSyncData,
+            5 => Self::GroupCommitSync,
             _ => Self::AppendOnlyProfile,
         }
     }
+}
+
+const GROUP_COMMIT_DEFAULT_WINDOW_US: u64 = 250;
+const GROUP_COMMIT_DEFAULT_MAX_BATCH: u64 = 64;
+const WAL_BUF_CAPACITY: usize = 64 * 1024;
+
+type WalWriterHandle = BufWriter<fs::File>;
+
+#[cfg(unix)]
+fn sync_wal_parent_dir(wal_path: &std::path::Path) -> Result<(), String> {
+    let Some(parent) = wal_path.parent() else {
+        return Ok(());
+    };
+    let dir = fs::File::open(parent).map_err(|err| format!("WAL parent dir open failed: {err}"))?;
+    dir.sync_all()
+        .map_err(|err| format!("WAL parent dir sync failed: {err}"))
+}
+
+#[cfg(not(unix))]
+fn sync_wal_parent_dir(_wal_path: &std::path::Path) -> Result<(), String> {
+    Ok(())
+}
+
+/// Open the append WAL like PostgreSQL `wal_sync_method=open_datasync` on Unix:
+/// O_DSYNC makes flushed WAL bytes data-durable without a separate per-commit
+/// `sync_all()`. Linux and macOS both use this fast path when the filesystem
+/// accepts O_DSYNC; otherwise we fall back to flush + kernel sync.
+fn open_wal_writer(wal_path: &std::path::Path) -> Result<(WalWriterHandle, bool), String> {
+    let existed = wal_path.exists();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        match fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .read(true)
+            .custom_flags(libc::O_DSYNC)
+            .open(wal_path)
+        {
+            Ok(file) => {
+                if !existed {
+                    sync_wal_parent_dir(wal_path)?;
+                }
+                Ok((
+                    BufWriter::with_capacity(WAL_BUF_CAPACITY, file),
+                    true,
+                ))
+            }
+            Err(err) => {
+                eprintln!(
+                    "[WAL] O_DSYNC open failed ({err}); falling back to flush+kernel-sync path"
+                );
+                let file = fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .read(true)
+                    .open(wal_path)
+                    .map_err(|fallback_err| {
+                        format!("open WAL failed after O_DSYNC fallback: {fallback_err}")
+                    })?;
+                if !existed {
+                    sync_wal_parent_dir(wal_path)?;
+                }
+                Ok((
+                    BufWriter::with_capacity(WAL_BUF_CAPACITY, file),
+                    false,
+                ))
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let file = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .read(true)
+            .open(wal_path)
+            .map_err(|err| format!("open WAL failed: {err}"))?;
+        Ok((BufWriter::with_capacity(WAL_BUF_CAPACITY, file), false))
+    }
+}
+
+#[derive(Debug, Default)]
+struct GroupCommitInner {
+    generation: u64,
+    pending: u64,
+    syncing: bool,
+    completed_generation: u64,
+    completed_error: Option<String>,
+    total_groups: u64,
+    total_commits: u64,
+    max_group_size: u64,
+    total_wait_ns: u64,
+    max_wait_ns: u64,
+}
+
+#[derive(Debug)]
+struct GroupCommitState {
+    inner: Mutex<GroupCommitInner>,
+    condvar: Condvar,
+}
+
+impl Default for GroupCommitState {
+    fn default() -> Self {
+        Self {
+            inner: Mutex::new(GroupCommitInner::default()),
+            condvar: Condvar::new(),
+        }
+    }
+}
+
+#[cfg(test)]
+#[derive(Debug, Default)]
+struct WalFaultInjection {
+    fail_next_flush: AtomicU64,
+    fail_next_sync_all: AtomicU64,
+    fail_next_sync_data: AtomicU64,
+}
+
+#[derive(Debug, Default)]
+struct WalTraceCounters {
+    append_calls: AtomicU64,
+    batch_append_calls: AtomicU64,
+    statements_written: AtomicU64,
+    bytes_written: AtomicU64,
+    flush_calls: AtomicU64,
+    sync_calls: AtomicU64,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Default)]
+struct NativeSqlProfileCounters {
+    parse_ns: AtomicU64,
+    execute_ns: AtomicU64,
+    sql_dispatch_ns: AtomicU64,
+    tx_begin_ns: AtomicU64,
+    tx_stage_ns: AtomicU64,
+    tx_commit_ns: AtomicU64,
+    tx_rollback_ns: AtomicU64,
+    row_lookup_ns: AtomicU64,
+    pk_lookup_ns: AtomicU64,
+    row_clone_ns: AtomicU64,
+    wal_encode_ns: AtomicU64,
+    wal_lock_wait_ns: AtomicU64,
+    wal_write_ns: AtomicU64,
+    wal_flush_ns: AtomicU64,
+    wal_sync_ns: AtomicU64,
+    wal_sync_all_ns: AtomicU64,
+    wal_sync_data_ns: AtomicU64,
+    checkpoint_ns: AtomicU64,
+    index_update_ns: AtomicU64,
+    table_scan_ns: AtomicU64,
+    table_rewrite_count: AtomicU64,
+    index_rebuild_count: AtomicU64,
+    checkpoint_count: AtomicU64,
+    wal_append_count: AtomicU64,
+    wal_batch_append_count: AtomicU64,
+    wal_bytes: AtomicU64,
+    sync_all_count: AtomicU64,
+    sync_data_count: AtomicU64,
+    flush_count: AtomicU64,
+    pk_lookup_count: AtomicU64,
+    row_undo_count: AtomicU64,
+    wal_record_count: AtomicU64,
+    tx_sync_count: AtomicU64,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -2977,7 +3146,9 @@ impl ColumnarClassification {
         match self {
             ColumnarClassification::ZeroCopyNumericOnly => "ZERO_COPY_NUMERIC_ONLY",
             ColumnarClassification::ZeroCopyUtf8OffsetsData => "ZERO_COPY_UTF8_OFFSETS_DATA",
-            ColumnarClassification::MixedZeroCopyAndReducedCopy => "MIXED_ZERO_COPY_AND_REDUCED_COPY",
+            ColumnarClassification::MixedZeroCopyAndReducedCopy => {
+                "MIXED_ZERO_COPY_AND_REDUCED_COPY"
+            }
             ColumnarClassification::ReducedCopyFallback => "REDUCED_COPY_FALLBACK",
             ColumnarClassification::ZeroCopyNotProven => "ZERO_COPY_NOT_PROVEN",
         }
@@ -3346,10 +3517,16 @@ pub struct NativeSqlEngine {
     session_id: SessionId,
     pub tables: Arc<RwLock<HashMap<String, NativeTable>>>,
     index_mgr: Arc<IndexManager>,
+    inverted_catalog: Arc<InvertedIndexCatalog>,
+    json_path_catalog: Arc<JsonPathCatalog>,
+    trigram_catalog: Arc<TrigramCatalog>,
+    vector_hnsw_catalog: Arc<VectorHnswCatalog>,
     /// Directory for WAL + snapshot persistence. None = pure in-memory.
     pub data_dir: Option<PathBuf>,
     /// Append-only WAL file handle (shared across clones).
-    wal_writer: Arc<RwLock<Option<fs::File>>>,
+    wal_writer: Arc<RwLock<Option<WalWriterHandle>>>,
+    /// True when WAL was opened with O_DSYNC (PostgreSQL open_datasync semantics).
+    wal_open_datasync: Arc<AtomicBool>,
     /// Mutations since last checkpoint (for auto-checkpoint).
     wal_mutations: Arc<AtomicU64>,
     /// Optional engine-native WAL sync policy. Default preserves the legacy
@@ -3357,6 +3534,15 @@ pub struct NativeSqlEngine {
     wal_sync_policy: Arc<AtomicU64>,
     /// Number of WAL sync attempts completed by this engine.
     wal_sync_count: Arc<AtomicU64>,
+    /// Opportunistic group-commit coordination shared by cloned sessions.
+    group_commit: Arc<GroupCommitState>,
+    #[cfg(test)]
+    wal_faults: Arc<WalFaultInjection>,
+    /// Optional WAL hot-path counters, enabled only when QMVIR_WAL_TRACE is set.
+    wal_trace: Arc<WalTraceCounters>,
+    /// Optional native SQL timing/profile counters, enabled only when
+    /// QMVIR_NATIVE_SQL_PROFILE is set.
+    native_profile: Arc<NativeSqlProfileCounters>,
     /// Persistent checkpoint dirty tracking. In-memory engines skip marking to
     /// keep the hot DML path free of checkpoint bookkeeping.
     dirty_tracker: Arc<DirtyTracker>,
@@ -3399,10 +3585,13 @@ impl PyNativeSqlEngine {
         Self { inner }
     }
 
-    pub fn execute(&self, sql: &str) -> PyResult<(Vec<String>, Vec<Vec<Option<String>>>, String)> {
-        let result = self
-            .inner
-            .execute(sql)
+    pub fn execute(
+        &self,
+        py: Python<'_>,
+        sql: &str,
+    ) -> PyResult<(Vec<String>, Vec<Vec<Option<String>>>, String)> {
+        let result = py
+            .allow_threads(|| self.inner.execute(sql))
             .map_err(pyo3::exceptions::PyRuntimeError::new_err)?;
         let columns = result
             .columns
@@ -3452,9 +3641,9 @@ impl PyNativeSqlEngine {
     ) -> PyResult<PyObject> {
         let mut index = crate::index::InvertedIndex::new();
         for (doc_id, text) in documents {
-            let doc_id: u32 = doc_id.try_into().map_err(|_| {
-                pyo3::exceptions::PyValueError::new_err("BM25 doc_id must fit u32")
-            })?;
+            let doc_id: u32 = doc_id
+                .try_into()
+                .map_err(|_| pyo3::exceptions::PyValueError::new_err("BM25 doc_id must fit u32"))?;
             index.index_document(doc_id, &text);
         }
         index.finalize();
@@ -3531,10 +3720,11 @@ impl PyNativeSqlEngine {
 
     pub fn execute_timeout(
         &self,
+        py: Python<'_>,
         sql: &str,
         _timeout_ms: u64,
     ) -> PyResult<(Vec<String>, Vec<Vec<Option<String>>>, String)> {
-        self.execute(sql)
+        self.execute(py, sql)
     }
 
     pub fn checkpoint(&self) -> PyResult<()> {
@@ -3553,8 +3743,9 @@ impl PyNativeSqlEngine {
                 "sync_wal requires data_dir",
             ));
         }
-        self.inner.wal_sync();
-        Ok(())
+        self.inner
+            .wal_sync()
+            .map_err(pyo3::exceptions::PyRuntimeError::new_err)
     }
 
     pub fn set_wal_sync_policy(&self, policy: &str) -> PyResult<()> {
@@ -3563,8 +3754,169 @@ impl PyNativeSqlEngine {
             .map_err(pyo3::exceptions::PyValueError::new_err)
     }
 
+    pub fn new_session(&self) -> PyResult<Self> {
+        Ok(Self {
+            inner: self.inner.new_session(),
+        })
+    }
+
     pub fn wal_sync_count(&self) -> PyResult<u64> {
         Ok(self.inner.wal_sync_count())
+    }
+
+    pub fn wal_trace_snapshot(&self) -> PyResult<PyObject> {
+        Python::with_gil(|py| {
+            let (
+                append_calls,
+                batch_append_calls,
+                statements_written,
+                bytes_written,
+                flush_calls,
+                sync_calls,
+                enabled,
+            ) = self.inner.wal_trace_snapshot();
+            let dict = pyo3::types::PyDict::new_bound(py);
+            dict.set_item("enabled", enabled)?;
+            dict.set_item("append_calls", append_calls)?;
+            dict.set_item("batch_append_calls", batch_append_calls)?;
+            dict.set_item("statements_written", statements_written)?;
+            dict.set_item("bytes_written", bytes_written)?;
+            dict.set_item("flush_calls", flush_calls)?;
+            dict.set_item("sync_calls", sync_calls)?;
+            Ok(dict.into())
+        })
+    }
+
+    pub fn group_commit_snapshot(&self) -> PyResult<PyObject> {
+        Python::with_gil(|py| {
+            let (
+                total_groups,
+                total_commits,
+                max_group_size,
+                total_wait_ns,
+                max_wait_ns,
+                generation,
+            ) = self.inner.group_commit_snapshot();
+            let dict = pyo3::types::PyDict::new_bound(py);
+            dict.set_item("total_groups", total_groups)?;
+            dict.set_item("total_commits", total_commits)?;
+            dict.set_item("max_group_size", max_group_size)?;
+            dict.set_item("total_wait_ns", total_wait_ns)?;
+            dict.set_item("max_wait_ns", max_wait_ns)?;
+            dict.set_item("generation", generation)?;
+            Ok(dict.into())
+        })
+    }
+
+    pub fn reset_profile_snapshot(&self) -> PyResult<()> {
+        self.inner.reset_profile_snapshot();
+        Ok(())
+    }
+
+    pub fn profile_snapshot(&self) -> PyResult<PyObject> {
+        Python::with_gil(|py| {
+            let profile = &self.inner.native_profile;
+            let dict = pyo3::types::PyDict::new_bound(py);
+            dict.set_item("enabled", NativeSqlEngine::native_profile_enabled())?;
+            dict.set_item("parse_ns", profile.parse_ns.load(Ordering::Relaxed))?;
+            dict.set_item("plan_ns", 0u64)?;
+            dict.set_item("execute_ns", profile.execute_ns.load(Ordering::Relaxed))?;
+            dict.set_item(
+                "sql_dispatch_ns",
+                profile.sql_dispatch_ns.load(Ordering::Relaxed),
+            )?;
+            dict.set_item("tx_begin_ns", profile.tx_begin_ns.load(Ordering::Relaxed))?;
+            dict.set_item("tx_stage_ns", profile.tx_stage_ns.load(Ordering::Relaxed))?;
+            dict.set_item("tx_commit_ns", profile.tx_commit_ns.load(Ordering::Relaxed))?;
+            dict.set_item(
+                "tx_rollback_ns",
+                profile.tx_rollback_ns.load(Ordering::Relaxed),
+            )?;
+            dict.set_item(
+                "row_lookup_ns",
+                profile.row_lookup_ns.load(Ordering::Relaxed),
+            )?;
+            dict.set_item("pk_lookup_ns", profile.pk_lookup_ns.load(Ordering::Relaxed))?;
+            dict.set_item("row_clone_ns", profile.row_clone_ns.load(Ordering::Relaxed))?;
+            dict.set_item(
+                "wal_encode_ns",
+                profile.wal_encode_ns.load(Ordering::Relaxed),
+            )?;
+            dict.set_item(
+                "wal_lock_wait_ns",
+                profile.wal_lock_wait_ns.load(Ordering::Relaxed),
+            )?;
+            dict.set_item("wal_write_ns", profile.wal_write_ns.load(Ordering::Relaxed))?;
+            dict.set_item("wal_flush_ns", profile.wal_flush_ns.load(Ordering::Relaxed))?;
+            dict.set_item("wal_sync_ns", profile.wal_sync_ns.load(Ordering::Relaxed))?;
+            dict.set_item(
+                "wal_sync_all_ns",
+                profile.wal_sync_all_ns.load(Ordering::Relaxed),
+            )?;
+            dict.set_item(
+                "wal_sync_data_ns",
+                profile.wal_sync_data_ns.load(Ordering::Relaxed),
+            )?;
+            dict.set_item(
+                "checkpoint_ns",
+                profile.checkpoint_ns.load(Ordering::Relaxed),
+            )?;
+            dict.set_item(
+                "index_update_ns",
+                profile.index_update_ns.load(Ordering::Relaxed),
+            )?;
+            dict.set_item(
+                "table_scan_ns",
+                profile.table_scan_ns.load(Ordering::Relaxed),
+            )?;
+            dict.set_item(
+                "table_rewrite_count",
+                profile.table_rewrite_count.load(Ordering::Relaxed),
+            )?;
+            dict.set_item(
+                "index_rebuild_count",
+                profile.index_rebuild_count.load(Ordering::Relaxed),
+            )?;
+            dict.set_item(
+                "checkpoint_count",
+                profile.checkpoint_count.load(Ordering::Relaxed),
+            )?;
+            dict.set_item(
+                "wal_append_count",
+                profile.wal_append_count.load(Ordering::Relaxed),
+            )?;
+            dict.set_item(
+                "wal_batch_append_count",
+                profile.wal_batch_append_count.load(Ordering::Relaxed),
+            )?;
+            dict.set_item("wal_bytes", profile.wal_bytes.load(Ordering::Relaxed))?;
+            dict.set_item(
+                "sync_all_count",
+                profile.sync_all_count.load(Ordering::Relaxed),
+            )?;
+            dict.set_item(
+                "sync_data_count",
+                profile.sync_data_count.load(Ordering::Relaxed),
+            )?;
+            dict.set_item("flush_count", profile.flush_count.load(Ordering::Relaxed))?;
+            dict.set_item(
+                "pk_lookup_count",
+                profile.pk_lookup_count.load(Ordering::Relaxed),
+            )?;
+            dict.set_item(
+                "row_undo_count",
+                profile.row_undo_count.load(Ordering::Relaxed),
+            )?;
+            dict.set_item(
+                "wal_record_count",
+                profile.wal_record_count.load(Ordering::Relaxed),
+            )?;
+            dict.set_item(
+                "tx_sync_count",
+                profile.tx_sync_count.load(Ordering::Relaxed),
+            )?;
+            Ok(dict.into())
+        })
     }
 
     pub fn snapshot_info(&self) -> PyResult<PyObject> {
@@ -3756,7 +4108,10 @@ impl PyNativeSqlEngine {
         Ok(obj)
     }
 
-    fn native_columnar_batch_to_py(py: Python<'_>, batch: NativeColumnarBatch) -> PyResult<PyObject> {
+    fn native_columnar_batch_to_py(
+        py: Python<'_>,
+        batch: NativeColumnarBatch,
+    ) -> PyResult<PyObject> {
         let out = PyDict::new_bound(py);
         let columns = PyList::empty_bound(py);
         let column_names = PyList::empty_bound(py);
@@ -3817,8 +4172,7 @@ impl PyNativeSqlEngine {
                     validity,
                 } => {
                     let offsets_owner = Py::new(py, PyNativeBuffer::from_i64(offsets))?;
-                    let offsets_view =
-                        PyMemoryView::from_bound(offsets_owner.bind(py).as_any())?;
+                    let offsets_view = PyMemoryView::from_bound(offsets_owner.bind(py).as_any())?;
                     let data_owner = Py::new(py, PyNativeBuffer::from_u8(data))?;
                     let data_view = PyMemoryView::from_bound(data_owner.bind(py).as_any())?;
                     d.set_item("offsets", &offsets_view)?;
@@ -3877,7 +4231,10 @@ impl PyNativeSqlEngine {
     ) -> PyResult<PyObject> {
         let reduced = Self::query_result_to_columnar_py(py, result)?;
         let dict = reduced.bind(py).downcast::<PyDict>()?;
-        dict.set_item("classification", ColumnarClassification::ReducedCopyFallback.as_str())?;
+        dict.set_item(
+            "classification",
+            ColumnarClassification::ReducedCopyFallback.as_str(),
+        )?;
         dict.set_item("zero_copy_subtype", py.None())?;
         dict.set_item("batch_kind", "COLUMNAR_BATCH")?;
         dict.set_item("zero_copy", false)?;
@@ -4139,6 +4496,123 @@ fn sql_like_match(text: &str, pattern: &str) -> bool {
     prev[pl]
 }
 
+/// Fast path for `LIKE '%literal%'` without `_` wildcards.
+fn like_literal_contains(haystack: &str, needle: &str, case_insensitive: bool) -> bool {
+    if case_insensitive {
+        haystack
+            .to_ascii_lowercase()
+            .contains(&needle.to_ascii_lowercase())
+    } else {
+        memchr::memmem::find(haystack.as_bytes(), needle.as_bytes()).is_some()
+    }
+}
+
+fn materialize_id_rows(row_ids: &[i64]) -> Vec<Vec<Option<Vec<u8>>>> {
+    if row_ids.len() >= 4096 {
+        row_ids
+            .par_iter()
+            .map(|row_id| vec![Some(row_id.to_string().into_bytes())])
+            .collect()
+    } else {
+        row_ids
+            .iter()
+            .map(|row_id| vec![Some(row_id.to_string().into_bytes())])
+            .collect()
+    }
+}
+
+fn collect_like_contains_row_ids(
+    table: &NativeTable,
+    col_name: &str,
+    needle: &str,
+    is_ilike: bool,
+    limit: Option<usize>,
+    sort_results: bool,
+) -> Vec<i64> {
+    if limit.is_none() && table.rows.len() >= 4096 {
+        let col = col_name.to_string();
+        let needle = needle.to_string();
+        let mut row_ids: Vec<i64> = table
+            .rows
+            .par_iter()
+            .filter_map(|(id, row)| {
+                row.cols
+                    .get(col.as_str())
+                    .filter(|cell| like_literal_contains(&cell.as_text(), &needle, is_ilike))
+                    .map(|_| *id)
+            })
+            .collect();
+        if sort_results {
+            row_ids.sort_unstable();
+        }
+        return row_ids;
+    }
+
+    let mut row_ids = Vec::new();
+    for (&row_id, row) in &table.rows {
+        let Some(cell) = row.cols.get(col_name) else {
+            continue;
+        };
+        if like_literal_contains(&cell.as_text(), needle, is_ilike) {
+            row_ids.push(row_id);
+            if limit.is_some_and(|lim| row_ids.len() >= lim) {
+                break;
+            }
+        }
+    }
+    row_ids
+}
+
+fn materialize_like_contains_id_rows(
+    table: &NativeTable,
+    col_name: &str,
+    needle: &str,
+    is_ilike: bool,
+    limit: Option<usize>,
+) -> Vec<Vec<Option<Vec<u8>>>> {
+    if table.rows.len() >= 4096 {
+        let col = col_name.to_string();
+        let needle = needle.to_string();
+        let mut rows: Vec<Vec<Option<Vec<u8>>>> = table
+            .rows
+            .par_iter()
+            .filter_map(|(id, row)| {
+                row.cols
+                    .get(col.as_str())
+                    .filter(|cell| like_literal_contains(&cell.as_text(), &needle, is_ilike))
+                    .map(|_| vec![Some(id.to_string().into_bytes())])
+            })
+            .collect();
+        if let Some(lim) = limit {
+            rows.truncate(lim);
+        }
+        return rows;
+    }
+
+    let mut rows_out = Vec::new();
+    for (&row_id, row) in &table.rows {
+        let Some(cell) = row.cols.get(col_name) else {
+            continue;
+        };
+        if like_literal_contains(&cell.as_text(), needle, is_ilike) {
+            rows_out.push(vec![Some(row_id.to_string().into_bytes())]);
+            if limit.is_some_and(|lim| rows_out.len() >= lim) {
+                break;
+            }
+        }
+    }
+    rows_out
+}
+
+/// Parsed CREATE INDEX specialized index kind.
+enum CreateIndexKind {
+    BTree,
+    InvertedGin,
+    Trigram,
+    JsonPath(String),
+    Hnsw(DistanceMetric),
+}
+
 impl NativeSqlEngine {
     pub fn new() -> Self {
         let mvcc_tx_mgr = Arc::new(MvccTransactionManager::new());
@@ -4147,11 +4621,21 @@ impl NativeSqlEngine {
             session_id,
             tables: Arc::new(RwLock::new(HashMap::new())),
             index_mgr: Arc::new(IndexManager::new()),
+            inverted_catalog: Arc::new(InvertedIndexCatalog::new()),
+            json_path_catalog: Arc::new(JsonPathCatalog::new()),
+            trigram_catalog: Arc::new(TrigramCatalog::new()),
+            vector_hnsw_catalog: Arc::new(VectorHnswCatalog::new()),
             data_dir: None,
             wal_writer: Arc::new(RwLock::new(None)),
+            wal_open_datasync: Arc::new(AtomicBool::new(false)),
             wal_mutations: Arc::new(AtomicU64::new(0)),
             wal_sync_policy: Arc::new(AtomicU64::new(WalSyncPolicy::AppendOnlyProfile as u64)),
             wal_sync_count: Arc::new(AtomicU64::new(0)),
+            group_commit: Arc::new(GroupCommitState::default()),
+            #[cfg(test)]
+            wal_faults: Arc::new(WalFaultInjection::default()),
+            wal_trace: Arc::new(WalTraceCounters::default()),
+            native_profile: Arc::new(NativeSqlProfileCounters::default()),
             dirty_tracker: Arc::new(DirtyTracker::new()),
             last_checkpoint_profile: Arc::new(RwLock::new(CheckpointProfile::default())),
             auth: AuthManager::new(),
@@ -4175,11 +4659,21 @@ impl NativeSqlEngine {
             session_id,
             tables: Arc::new(RwLock::new(HashMap::new())),
             index_mgr: Arc::new(IndexManager::new()),
+            inverted_catalog: Arc::new(InvertedIndexCatalog::new()),
+            json_path_catalog: Arc::new(JsonPathCatalog::new()),
+            trigram_catalog: Arc::new(TrigramCatalog::new()),
+            vector_hnsw_catalog: Arc::new(VectorHnswCatalog::new()),
             data_dir: Some(dir.clone()),
             wal_writer: Arc::new(RwLock::new(None)),
+            wal_open_datasync: Arc::new(AtomicBool::new(false)),
             wal_mutations: Arc::new(AtomicU64::new(0)),
             wal_sync_policy: Arc::new(AtomicU64::new(WalSyncPolicy::AppendOnlyProfile as u64)),
             wal_sync_count: Arc::new(AtomicU64::new(0)),
+            group_commit: Arc::new(GroupCommitState::default()),
+            #[cfg(test)]
+            wal_faults: Arc::new(WalFaultInjection::default()),
+            wal_trace: Arc::new(WalTraceCounters::default()),
+            native_profile: Arc::new(NativeSqlProfileCounters::default()),
             dirty_tracker: Arc::new(DirtyTracker::new()),
             last_checkpoint_profile: Arc::new(RwLock::new(CheckpointProfile::default())),
             auth: AuthManager::with_data_dir(dir.clone()),
@@ -4210,14 +4704,16 @@ impl NativeSqlEngine {
         }
         // Open WAL for appending new mutations.
         let wal_path = dir.join("native_sql.wal");
-        if let Ok(f) = fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&wal_path)
-        {
-            if let Ok(mut guard) = engine.wal_writer.write() {
-                *guard = Some(f);
+        match open_wal_writer(&wal_path) {
+            Ok((writer, open_datasync)) => {
+                if let Ok(mut guard) = engine.wal_writer.write() {
+                    *guard = Some(writer);
+                }
+                engine
+                    .wal_open_datasync
+                    .store(open_datasync, Ordering::Relaxed);
             }
+            Err(err) => eprintln!("[WAL] Failed to open append log: {err}"),
         }
         engine
     }
@@ -4239,6 +4735,15 @@ impl NativeSqlEngine {
             }
             "per_mutation_sync" | "per_mutation" => WalSyncPolicy::PerMutationSync as u64,
             "per_commit_sync" | "per_commit" => WalSyncPolicy::PerCommitSync as u64,
+            "per_commit_sync_data" | "per_commit_data" | "per-commit-sync-data" => {
+                WalSyncPolicy::PerCommitSyncData as u64
+            }
+            "group_commit_sync" | "group-commit-sync" | "group_commit" => {
+                WalSyncPolicy::GroupCommitSync as u64
+            }
+            "relaxed_os_buffered" | "relaxed_buffered" | "relaxed" => {
+                WalSyncPolicy::RelaxedOsBuffered as u64
+            }
             other => return Err(format!("unknown WAL sync policy: {other}")),
         };
         self.wal_sync_policy.store(code, Ordering::Relaxed);
@@ -4249,9 +4754,149 @@ impl NativeSqlEngine {
         self.wal_sync_count.load(Ordering::Relaxed)
     }
 
+    pub fn group_commit_snapshot(&self) -> (u64, u64, u64, u64, u64, u64) {
+        let guard = self
+            .group_commit
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        (
+            guard.total_groups,
+            guard.total_commits,
+            guard.max_group_size,
+            guard.total_wait_ns,
+            guard.max_wait_ns,
+            guard.generation,
+        )
+    }
+
+    pub fn wal_trace_snapshot(&self) -> (u64, u64, u64, u64, u64, u64, bool) {
+        (
+            self.wal_trace.append_calls.load(Ordering::Relaxed),
+            self.wal_trace.batch_append_calls.load(Ordering::Relaxed),
+            self.wal_trace.statements_written.load(Ordering::Relaxed),
+            self.wal_trace.bytes_written.load(Ordering::Relaxed),
+            self.wal_trace.flush_calls.load(Ordering::Relaxed),
+            self.wal_trace.sync_calls.load(Ordering::Relaxed),
+            Self::wal_trace_enabled(),
+        )
+    }
+
+    fn native_profile_enabled() -> bool {
+        std::env::var_os("QMVIR_NATIVE_SQL_PROFILE").is_some()
+    }
+
+    fn profile_ns(counter: &AtomicU64, elapsed: std::time::Duration) {
+        counter.fetch_add(
+            elapsed.as_nanos().min(u128::from(u64::MAX)) as u64,
+            Ordering::Relaxed,
+        );
+    }
+
+    #[cfg(test)]
+    fn consume_fault(counter: &AtomicU64) -> bool {
+        counter
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |value| {
+                if value > 0 {
+                    Some(value - 1)
+                } else {
+                    None
+                }
+            })
+            .is_ok()
+    }
+
+    #[cfg(test)]
+    fn inject_next_wal_flush_failure_for_test(&self) {
+        self.wal_faults.fail_next_flush.store(1, Ordering::SeqCst);
+    }
+
+    #[cfg(test)]
+    fn inject_next_wal_sync_all_failure_for_test(&self) {
+        self.wal_faults
+            .fail_next_sync_all
+            .store(1, Ordering::SeqCst);
+    }
+
+    #[cfg(test)]
+    fn inject_next_wal_sync_data_failure_for_test(&self) {
+        self.wal_faults
+            .fail_next_sync_data
+            .store(1, Ordering::SeqCst);
+    }
+
+    fn maybe_fail_wal_flush_for_test(&self) -> Result<(), String> {
+        #[cfg(test)]
+        {
+            if Self::consume_fault(&self.wal_faults.fail_next_flush) {
+                return Err("injected WAL flush failure".to_string());
+            }
+        }
+        Ok(())
+    }
+
+    fn maybe_fail_wal_sync_all_for_test(&self) -> Result<(), String> {
+        #[cfg(test)]
+        {
+            if Self::consume_fault(&self.wal_faults.fail_next_sync_all) {
+                return Err("injected WAL sync_all failure".to_string());
+            }
+        }
+        Ok(())
+    }
+
+    fn maybe_fail_wal_sync_data_for_test(&self) -> Result<(), String> {
+        #[cfg(test)]
+        {
+            if Self::consume_fault(&self.wal_faults.fail_next_sync_data) {
+                return Err("injected WAL sync_data failure".to_string());
+            }
+        }
+        Ok(())
+    }
+
+    #[allow(dead_code)]
+    fn reset_profile_snapshot(&self) {
+        let profile = &self.native_profile;
+        profile.parse_ns.store(0, Ordering::Relaxed);
+        profile.execute_ns.store(0, Ordering::Relaxed);
+        profile.sql_dispatch_ns.store(0, Ordering::Relaxed);
+        profile.tx_begin_ns.store(0, Ordering::Relaxed);
+        profile.tx_stage_ns.store(0, Ordering::Relaxed);
+        profile.tx_commit_ns.store(0, Ordering::Relaxed);
+        profile.tx_rollback_ns.store(0, Ordering::Relaxed);
+        profile.row_lookup_ns.store(0, Ordering::Relaxed);
+        profile.pk_lookup_ns.store(0, Ordering::Relaxed);
+        profile.row_clone_ns.store(0, Ordering::Relaxed);
+        profile.wal_encode_ns.store(0, Ordering::Relaxed);
+        profile.wal_lock_wait_ns.store(0, Ordering::Relaxed);
+        profile.wal_write_ns.store(0, Ordering::Relaxed);
+        profile.wal_flush_ns.store(0, Ordering::Relaxed);
+        profile.wal_sync_ns.store(0, Ordering::Relaxed);
+        profile.wal_sync_all_ns.store(0, Ordering::Relaxed);
+        profile.wal_sync_data_ns.store(0, Ordering::Relaxed);
+        profile.checkpoint_ns.store(0, Ordering::Relaxed);
+        profile.index_update_ns.store(0, Ordering::Relaxed);
+        profile.table_scan_ns.store(0, Ordering::Relaxed);
+        profile.table_rewrite_count.store(0, Ordering::Relaxed);
+        profile.index_rebuild_count.store(0, Ordering::Relaxed);
+        profile.checkpoint_count.store(0, Ordering::Relaxed);
+        profile.wal_append_count.store(0, Ordering::Relaxed);
+        profile.wal_batch_append_count.store(0, Ordering::Relaxed);
+        profile.wal_bytes.store(0, Ordering::Relaxed);
+        profile.sync_all_count.store(0, Ordering::Relaxed);
+        profile.sync_data_count.store(0, Ordering::Relaxed);
+        profile.flush_count.store(0, Ordering::Relaxed);
+        profile.pk_lookup_count.store(0, Ordering::Relaxed);
+        profile.row_undo_count.store(0, Ordering::Relaxed);
+        profile.wal_record_count.store(0, Ordering::Relaxed);
+        profile.tx_sync_count.store(0, Ordering::Relaxed);
+    }
+
     pub fn new_session(&self) -> Self {
         let mut session = self.clone();
         session.session_id = self.mvcc_tx_mgr.register_session();
+        session.transaction = Arc::new(RwLock::new(None));
         session
     }
 
@@ -4322,14 +4967,18 @@ impl NativeSqlEngine {
         }
     }
 
-    fn after_successful_autocommit_wal_mutation(&self) {
+    fn after_successful_autocommit_wal_mutation(&self) -> Result<(), String> {
         match WalSyncPolicy::from_code(self.wal_sync_policy.load(Ordering::Relaxed) as u8) {
-            WalSyncPolicy::PerMutationSync | WalSyncPolicy::PerCommitSync => self.wal_sync(),
+            WalSyncPolicy::PerMutationSync | WalSyncPolicy::PerCommitSync => self.wal_sync()?,
+            WalSyncPolicy::PerCommitSyncData => self.wal_sync_data()?,
+            WalSyncPolicy::GroupCommitSync => self.wal_group_commit_sync()?,
+            WalSyncPolicy::RelaxedOsBuffered => self.wal_flush_only()?,
             WalSyncPolicy::AppendOnlyProfile => {}
         }
         if self.wal_mutations.fetch_add(1, Ordering::Relaxed) + 1 >= CHECKPOINT_INTERVAL {
             self.checkpoint();
         }
+        Ok(())
     }
 
     fn cell_query_bytes(cell: &Cell) -> Option<Vec<u8>> {
@@ -4395,17 +5044,7 @@ impl NativeSqlEngine {
         if projection.len() == 1 {
             let col = projection[0].as_str();
             if col == "id" {
-                let mut rows = Vec::with_capacity(row_ids.len());
-                for row_id in row_ids {
-                    if let Some(row) = t.rows.get(row_id) {
-                        rows.push(vec![row
-                            .cols
-                            .get(col)
-                            .and_then(Self::cell_query_bytes)
-                            .or_else(|| Some(row_id.to_string().into_bytes()))]);
-                    }
-                }
-                return rows;
+                return materialize_id_rows(row_ids);
             }
 
             let mut rows = Vec::with_capacity(row_ids.len());
@@ -4676,6 +5315,11 @@ impl NativeSqlEngine {
     }
 
     fn begin_transaction(&self) -> Result<QueryResult, String> {
+        let profile_start = if Self::native_profile_enabled() {
+            Some(Instant::now())
+        } else {
+            None
+        };
         let mut tx = self
             .transaction
             .write()
@@ -4691,31 +5335,18 @@ impl NativeSqlEngine {
             row_undo: HashMap::new(),
             tombstone_snapshot: None,
             index_snapshot: None,
+            inverted_snapshot: None,
+            json_path_snapshot: None,
+            trigram_snapshot: None,
+            vector_hnsw_snapshot: None,
             mvcc_tx_id,
             dirty: false,
-            wal_sql: Vec::new(),
+            wal_sql: Vec::with_capacity(128),
         });
-        Ok(Self::empty_ok("BEGIN"))
-    }
-
-    fn ensure_transaction_snapshot(&self) -> Result<(), String> {
-        let mut tx = self
-            .transaction
-            .write()
-            .map_err(|_| "transaction lock poisoned")?;
-        let state = tx
-            .as_mut()
-            .ok_or_else(|| "no active transaction".to_string())?;
-        if state.tombstone_snapshot.is_none() {
-            state.tombstone_snapshot = Some(
-                self.tombstone_log
-                    .read()
-                    .map_err(|_| "tombstone lock poisoned")?
-                    .clone(),
-            );
+        if let Some(start) = profile_start {
+            Self::profile_ns(&self.native_profile.tx_begin_ns, start.elapsed());
         }
-        state.dirty = true;
-        Ok(())
+        Ok(Self::empty_ok("BEGIN"))
     }
 
     fn record_transaction_row_undos(
@@ -4724,6 +5355,12 @@ impl NativeSqlEngine {
         rows: Vec<(i64, Option<NativeRow>)>,
         snapshot_indexes: bool,
     ) -> Result<(), String> {
+        let profile_start = if Self::native_profile_enabled() {
+            Some(Instant::now())
+        } else {
+            None
+        };
+        let undo_count = rows.len() as u64;
         if rows.is_empty() && !snapshot_indexes {
             return Ok(());
         }
@@ -4744,12 +5381,24 @@ impl NativeSqlEngine {
         }
         if snapshot_indexes && state.index_snapshot.is_none() {
             state.index_snapshot = Some(self.index_mgr.snapshot());
+            state.inverted_snapshot = Some(self.inverted_catalog.snapshot());
+            state.json_path_snapshot = Some(self.json_path_catalog.snapshot());
+            state.trigram_snapshot = Some(self.trigram_catalog.snapshot());
+            state.vector_hnsw_snapshot = Some(self.vector_hnsw_catalog.snapshot());
         }
         let table_undo = state.row_undo.entry(table.to_string()).or_default();
         for (row_id, before) in rows {
             table_undo.entry(row_id).or_insert(before);
         }
         state.dirty = true;
+        if let Some(start) = profile_start {
+            let elapsed = start.elapsed();
+            Self::profile_ns(&self.native_profile.row_clone_ns, elapsed);
+            Self::profile_ns(&self.native_profile.tx_stage_ns, elapsed);
+            self.native_profile
+                .row_undo_count
+                .fetch_add(undo_count, Ordering::Relaxed);
+        }
         Ok(())
     }
 
@@ -4779,6 +5428,10 @@ impl NativeSqlEngine {
         }
         if state.index_snapshot.is_none() {
             state.index_snapshot = Some(self.index_mgr.snapshot());
+            state.inverted_snapshot = Some(self.inverted_catalog.snapshot());
+            state.json_path_snapshot = Some(self.json_path_catalog.snapshot());
+            state.trigram_snapshot = Some(self.trigram_catalog.snapshot());
+            state.vector_hnsw_snapshot = Some(self.vector_hnsw_catalog.snapshot());
         }
         state.dirty = true;
         Ok(())
@@ -4807,7 +5460,44 @@ impl NativeSqlEngine {
         })
     }
 
+    fn table_has_fk_references(
+        tables: &HashMap<String, NativeTable>,
+        table: &str,
+        on_delete: bool,
+    ) -> bool {
+        tables.values().any(|child_table| {
+            child_table.foreign_keys.iter().any(|fk| {
+                fk.ref_table == table
+                    && if on_delete {
+                        matches!(
+                            fk.on_delete,
+                            FkAction::Cascade
+                                | FkAction::SetNull
+                                | FkAction::SetDefault
+                                | FkAction::Restrict
+                                | FkAction::NoAction
+                        )
+                    } else {
+                        matches!(
+                            fk.on_update,
+                            FkAction::Cascade
+                                | FkAction::SetNull
+                                | FkAction::SetDefault
+                                | FkAction::Restrict
+                                | FkAction::NoAction
+                        )
+                    }
+            })
+        })
+    }
+
     fn commit_transaction(&self, with_wal: bool) -> Result<QueryResult, String> {
+        let profile_enabled = Self::native_profile_enabled();
+        let profile_start = if profile_enabled {
+            Some(Instant::now())
+        } else {
+            None
+        };
         let tx_state = self
             .transaction
             .write()
@@ -4825,21 +5515,69 @@ impl NativeSqlEngine {
         self.mvcc_tx_mgr
             .commit(self.session_id, tx_state.mvcc_tx_id)?;
         if with_wal {
-            for sql in &tx_state.wal_sql {
-                self.wal_append(sql);
-                if self.wal_mutations.fetch_add(1, Ordering::Relaxed) + 1 >= CHECKPOINT_INTERVAL {
+            let wal_statement_count = tx_state.wal_sql.len() as u64;
+            if wal_statement_count > 0 {
+                if profile_enabled {
+                    self.native_profile
+                        .wal_record_count
+                        .fetch_add(wal_statement_count, Ordering::Relaxed);
+                }
+                self.wal_append_batch(&tx_state.wal_sql)?;
+                let previous = self
+                    .wal_mutations
+                    .fetch_add(wal_statement_count, Ordering::Relaxed);
+                match WalSyncPolicy::from_code(self.wal_sync_policy.load(Ordering::Relaxed) as u8) {
+                    WalSyncPolicy::PerMutationSync | WalSyncPolicy::PerCommitSync => {
+                        if profile_enabled {
+                            self.native_profile
+                                .tx_sync_count
+                                .fetch_add(1, Ordering::Relaxed);
+                        }
+                        self.wal_sync()?
+                    }
+                    WalSyncPolicy::PerCommitSyncData => {
+                        if profile_enabled {
+                            self.native_profile
+                                .tx_sync_count
+                                .fetch_add(1, Ordering::Relaxed);
+                        }
+                        self.wal_sync_data()?
+                    }
+                    WalSyncPolicy::GroupCommitSync => {
+                        if profile_enabled {
+                            self.native_profile
+                                .tx_sync_count
+                                .fetch_add(1, Ordering::Relaxed);
+                        }
+                        self.wal_group_commit_sync()?
+                    }
+                    WalSyncPolicy::RelaxedOsBuffered => {
+                        if profile_enabled {
+                            self.native_profile
+                                .tx_sync_count
+                                .fetch_add(1, Ordering::Relaxed);
+                        }
+                        self.wal_flush_only()?
+                    }
+                    WalSyncPolicy::AppendOnlyProfile => {}
+                }
+                if previous + wal_statement_count >= CHECKPOINT_INTERVAL {
                     self.checkpoint();
                 }
             }
-            match WalSyncPolicy::from_code(self.wal_sync_policy.load(Ordering::Relaxed) as u8) {
-                WalSyncPolicy::PerMutationSync | WalSyncPolicy::PerCommitSync => self.wal_sync(),
-                WalSyncPolicy::AppendOnlyProfile => {}
-            }
+        }
+        if let Some(start) = profile_start {
+            Self::profile_ns(&self.native_profile.tx_commit_ns, start.elapsed());
         }
         Ok(Self::empty_ok("COMMIT"))
     }
 
     fn rollback_transaction(&self) -> Result<QueryResult, String> {
+        let profile_start = if Self::native_profile_enabled() {
+            Some(Instant::now())
+        } else {
+            None
+        };
         let tx_state = self
             .transaction
             .write()
@@ -4866,9 +5604,35 @@ impl NativeSqlEngine {
                 if let Some(index_snapshot) = tx_state.index_snapshot {
                     self.index_mgr.restore_snapshot(index_snapshot);
                 }
+                if let Some(inverted_snapshot) = tx_state.inverted_snapshot {
+                    self.inverted_catalog.restore_snapshot(inverted_snapshot);
+                }
+                if let Some(json_path_snapshot) = tx_state.json_path_snapshot {
+                    self.json_path_catalog.restore_snapshot(json_path_snapshot);
+                }
+                if let Some(trigram_snapshot) = tx_state.trigram_snapshot {
+                    self.trigram_catalog.restore_snapshot(trigram_snapshot);
+                }
+                if let Some(vector_hnsw_snapshot) = tx_state.vector_hnsw_snapshot {
+                    self.vector_hnsw_catalog
+                        .restore_snapshot(vector_hnsw_snapshot);
+                }
                 self.buf_pool.clear_all_caches();
             } else if let Some(index_snapshot) = tx_state.index_snapshot {
                 self.index_mgr.restore_snapshot(index_snapshot);
+                if let Some(inverted_snapshot) = tx_state.inverted_snapshot {
+                    self.inverted_catalog.restore_snapshot(inverted_snapshot);
+                }
+                if let Some(json_path_snapshot) = tx_state.json_path_snapshot {
+                    self.json_path_catalog.restore_snapshot(json_path_snapshot);
+                }
+                if let Some(trigram_snapshot) = tx_state.trigram_snapshot {
+                    self.trigram_catalog.restore_snapshot(trigram_snapshot);
+                }
+                if let Some(vector_hnsw_snapshot) = tx_state.vector_hnsw_snapshot {
+                    self.vector_hnsw_catalog
+                        .restore_snapshot(vector_hnsw_snapshot);
+                }
                 let mut tables = self.tables.write().map_err(|_| "table lock poisoned")?;
                 for (table_name, row_undos) in tx_state.row_undo {
                     if let Some(table) = tables.get_mut(&table_name) {
@@ -4923,6 +5687,9 @@ impl NativeSqlEngine {
         }
         self.mvcc_tx_mgr
             .abort(self.session_id, tx_state.mvcc_tx_id)?;
+        if let Some(start) = profile_start {
+            Self::profile_ns(&self.native_profile.tx_rollback_ns, start.elapsed());
+        }
         Ok(Self::empty_ok("ROLLBACK"))
     }
 
@@ -4939,32 +5706,411 @@ impl NativeSqlEngine {
         }
     }
 
-    /// Append a SQL statement to the WAL (buffered, no fsync per call).
-    /// Group-commit: fsync is deferred to `wal_sync` which is called at
-    /// checkpoint boundaries or every CHECKPOINT_INTERVAL mutations.
-    /// This eliminates per-statement fsync overhead for batch workloads.
-    fn wal_append(&self, sql: &str) {
-        if let Ok(mut guard) = self.wal_writer.write() {
-            if let Some(ref mut f) = *guard {
-                if writeln!(f, "{}", sql).is_err() {
-                    return;
-                }
-                // Flush to OS page-cache (cheap). fsync deferred to wal_sync().
-                let _ = f.flush();
-            }
+    fn wal_trace_enabled() -> bool {
+        std::env::var_os("QMVIR_WAL_TRACE").is_some()
+    }
+
+    fn trace_wal_append(&self, statements: u64, bytes: u64, batch: bool) {
+        if !Self::wal_trace_enabled() {
+            return;
         }
+        if batch {
+            self.wal_trace
+                .batch_append_calls
+                .fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.wal_trace.append_calls.fetch_add(1, Ordering::Relaxed);
+        }
+        self.wal_trace
+            .statements_written
+            .fetch_add(statements, Ordering::Relaxed);
+        self.wal_trace
+            .bytes_written
+            .fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    /// Append a SQL statement to the WAL. Strict durability is not acknowledged
+    /// here; callers that promise sync-at-return must call `wal_sync` before
+    /// returning success.
+    fn wal_append(&self, sql: &str) -> Result<(), String> {
+        let profile_enabled = Self::native_profile_enabled();
+        let lock_start = if profile_enabled {
+            Some(Instant::now())
+        } else {
+            None
+        };
+        let mut guard = self
+            .wal_writer
+            .write()
+            .map_err(|_| "WAL writer lock poisoned".to_string())?;
+        if let Some(start) = lock_start {
+            Self::profile_ns(&self.native_profile.wal_lock_wait_ns, start.elapsed());
+        }
+        let Some(ref mut f) = *guard else {
+            return if self.data_dir.is_none() {
+                Ok(())
+            } else {
+                Err("WAL writer is not open".to_string())
+            };
+        };
+        let write_start = if profile_enabled {
+            Some(Instant::now())
+        } else {
+            None
+        };
+        writeln!(f, "{}", sql).map_err(|err| format!("WAL append failed: {err}"))?;
+        f.flush()
+            .map_err(|err| format!("WAL append flush failed: {err}"))?;
+        if let Some(start) = write_start {
+            Self::profile_ns(&self.native_profile.wal_write_ns, start.elapsed());
+            self.native_profile
+                .wal_append_count
+                .fetch_add(1, Ordering::Relaxed);
+            self.native_profile
+                .wal_bytes
+                .fetch_add(sql.len() as u64 + 1, Ordering::Relaxed);
+        }
+        self.trace_wal_append(1, sql.len() as u64 + 1, false);
+        Ok(())
+    }
+
+    /// Append a transaction's WAL statements under one writer lock. Commit
+    /// durability is still enforced by the following `wal_sync` in strict modes.
+    fn wal_append_batch(&self, sqls: &[String]) -> Result<(), String> {
+        if sqls.is_empty() {
+            return Ok(());
+        }
+        let profile_enabled = Self::native_profile_enabled();
+        let lock_start = if profile_enabled {
+            Some(Instant::now())
+        } else {
+            None
+        };
+        let mut guard = self
+            .wal_writer
+            .write()
+            .map_err(|_| "WAL writer lock poisoned".to_string())?;
+        if let Some(start) = lock_start {
+            Self::profile_ns(&self.native_profile.wal_lock_wait_ns, start.elapsed());
+        }
+        let Some(ref mut f) = *guard else {
+            return if self.data_dir.is_none() {
+                Ok(())
+            } else {
+                Err("WAL writer is not open".to_string())
+            };
+        };
+        let mut written = 0u64;
+        let mut bytes = 0u64;
+        let write_start = if profile_enabled {
+            Some(Instant::now())
+        } else {
+            None
+        };
+        for sql in sqls {
+            writeln!(f, "{}", sql).map_err(|err| format!("WAL batch append failed: {err}"))?;
+            written += 1;
+            bytes += sql.len() as u64 + 1;
+        }
+        f.flush()
+            .map_err(|err| format!("WAL batch append flush failed: {err}"))?;
+        if let Some(start) = write_start {
+            Self::profile_ns(&self.native_profile.wal_write_ns, start.elapsed());
+            self.native_profile
+                .wal_batch_append_count
+                .fetch_add(1, Ordering::Relaxed);
+            self.native_profile
+                .wal_bytes
+                .fetch_add(bytes, Ordering::Relaxed);
+        }
+        if written > 0 {
+            self.trace_wal_append(written, bytes, true);
+        }
+        Ok(())
     }
 
     /// Force WAL durability: fsync to stable storage.
     /// Called once per checkpoint interval (every CHECKPOINT_INTERVAL mutations).
-    fn wal_sync(&self) {
-        if let Ok(mut guard) = self.wal_writer.write() {
-            if let Some(ref mut f) = *guard {
-                let _ = f.flush();
-                let _ = f.sync_all();
-                self.wal_sync_count.fetch_add(1, Ordering::Relaxed);
+    fn wal_sync(&self) -> Result<(), String> {
+        let profile_enabled = Self::native_profile_enabled();
+        let lock_start = if profile_enabled {
+            Some(Instant::now())
+        } else {
+            None
+        };
+        let mut guard = self
+            .wal_writer
+            .write()
+            .map_err(|_| "WAL writer lock poisoned".to_string())?;
+        if let Some(start) = lock_start {
+            Self::profile_ns(&self.native_profile.wal_lock_wait_ns, start.elapsed());
+        }
+        let Some(ref mut f) = *guard else {
+            return if self.data_dir.is_none() {
+                Ok(())
+            } else {
+                Err("WAL writer is not open".to_string())
+            };
+        };
+        let flush_start = if profile_enabled {
+            Some(Instant::now())
+        } else {
+            None
+        };
+        self.maybe_fail_wal_flush_for_test()?;
+        f.flush()
+            .map_err(|err| format!("WAL flush before sync failed: {err}"))?;
+        if let Some(start) = flush_start {
+            Self::profile_ns(&self.native_profile.wal_flush_ns, start.elapsed());
+            self.native_profile
+                .flush_count
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        if Self::wal_trace_enabled() {
+            self.wal_trace.flush_calls.fetch_add(1, Ordering::Relaxed);
+        }
+        let open_datasync = self.wal_open_datasync.load(Ordering::Relaxed);
+        if !open_datasync {
+            let sync_start = if profile_enabled {
+                Some(Instant::now())
+            } else {
+                None
+            };
+            #[cfg(target_os = "linux")]
+            {
+                self.maybe_fail_wal_sync_data_for_test()?;
+                f.get_ref()
+                    .sync_data()
+                    .map_err(|err| format!("WAL sync_data failed: {err}"))?;
+                if let Some(start) = sync_start {
+                    let elapsed = start.elapsed();
+                    Self::profile_ns(&self.native_profile.wal_sync_ns, elapsed);
+                    Self::profile_ns(&self.native_profile.wal_sync_data_ns, elapsed);
+                    self.native_profile
+                        .sync_data_count
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                self.maybe_fail_wal_sync_all_for_test()?;
+                f.get_ref()
+                    .sync_all()
+                    .map_err(|err| format!("WAL sync_all failed: {err}"))?;
+                if let Some(start) = sync_start {
+                    let elapsed = start.elapsed();
+                    Self::profile_ns(&self.native_profile.wal_sync_ns, elapsed);
+                    Self::profile_ns(&self.native_profile.wal_sync_all_ns, elapsed);
+                    self.native_profile
+                        .sync_all_count
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            if Self::wal_trace_enabled() {
+                self.wal_trace.sync_calls.fetch_add(1, Ordering::Relaxed);
+            }
+        } else if profile_enabled {
+            self.native_profile
+                .sync_data_count
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        self.wal_sync_count.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// Force WAL data durability without forcing all metadata where the
+    /// platform distinguishes it. This is an explicit non-default policy; WAL
+    /// file creation still happens before this path is selected.
+    fn wal_sync_data(&self) -> Result<(), String> {
+        let profile_enabled = Self::native_profile_enabled();
+        let lock_start = if profile_enabled {
+            Some(Instant::now())
+        } else {
+            None
+        };
+        let mut guard = self
+            .wal_writer
+            .write()
+            .map_err(|_| "WAL writer lock poisoned".to_string())?;
+        if let Some(start) = lock_start {
+            Self::profile_ns(&self.native_profile.wal_lock_wait_ns, start.elapsed());
+        }
+        let Some(ref mut f) = *guard else {
+            return if self.data_dir.is_none() {
+                Ok(())
+            } else {
+                Err("WAL writer is not open".to_string())
+            };
+        };
+        let flush_start = if profile_enabled {
+            Some(Instant::now())
+        } else {
+            None
+        };
+        self.maybe_fail_wal_flush_for_test()?;
+        f.flush()
+            .map_err(|err| format!("WAL flush before sync_data failed: {err}"))?;
+        if let Some(start) = flush_start {
+            Self::profile_ns(&self.native_profile.wal_flush_ns, start.elapsed());
+            self.native_profile
+                .flush_count
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        if Self::wal_trace_enabled() {
+            self.wal_trace.flush_calls.fetch_add(1, Ordering::Relaxed);
+        }
+        let open_datasync = self.wal_open_datasync.load(Ordering::Relaxed);
+        if open_datasync {
+            if profile_enabled {
+                self.native_profile
+                    .sync_data_count
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            self.wal_sync_count.fetch_add(1, Ordering::Relaxed);
+            return Ok(());
+        }
+        let sync_start = if profile_enabled {
+            Some(Instant::now())
+        } else {
+            None
+        };
+        self.maybe_fail_wal_sync_data_for_test()?;
+        f.get_ref()
+            .sync_data()
+            .map_err(|err| format!("WAL sync_data failed: {err}"))?;
+        if let Some(start) = sync_start {
+            let elapsed = start.elapsed();
+            Self::profile_ns(&self.native_profile.wal_sync_ns, elapsed);
+            Self::profile_ns(&self.native_profile.wal_sync_data_ns, elapsed);
+            self.native_profile
+                .sync_data_count
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        if Self::wal_trace_enabled() {
+            self.wal_trace.sync_calls.fetch_add(1, Ordering::Relaxed);
+        }
+        self.wal_sync_count.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// Opportunistic durable group commit. Each caller has already appended its
+    /// WAL bytes before entering this function. The leader waits a short window,
+    /// forces one `sync_all`, then acknowledges all waiters in the generation.
+    fn wal_group_commit_sync(&self) -> Result<(), String> {
+        if self.data_dir.is_none() {
+            return Ok(());
+        }
+        let wait_start = Instant::now();
+        let mut guard = self
+            .group_commit
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let my_generation = guard.generation;
+        guard.pending = guard.pending.saturating_add(1);
+        guard.total_commits = guard.total_commits.saturating_add(1);
+        guard.max_group_size = guard.max_group_size.max(guard.pending);
+
+        if guard.syncing {
+            if guard.pending >= GROUP_COMMIT_DEFAULT_MAX_BATCH {
+                self.group_commit.condvar.notify_one();
+            }
+            while guard.generation == my_generation {
+                guard = self
+                    .group_commit
+                    .condvar
+                    .wait(guard)
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+            }
+            if guard.completed_generation == my_generation {
+                if let Some(err) = guard.completed_error.clone() {
+                    return Err(err);
+                }
+            }
+            return Ok(());
+        }
+
+        guard.syncing = true;
+        let window = Duration::from_micros(GROUP_COMMIT_DEFAULT_WINDOW_US);
+        while guard.pending < GROUP_COMMIT_DEFAULT_MAX_BATCH {
+            let (next_guard, timeout) = self
+                .group_commit
+                .condvar
+                .wait_timeout(guard, window)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            guard = next_guard;
+            if timeout.timed_out() {
+                break;
             }
         }
+        let group_size = guard.pending.max(1);
+        drop(guard);
+
+        let sync_result = self.wal_sync();
+
+        let wait_ns = wait_start.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64;
+        let mut guard = self
+            .group_commit
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        guard.total_groups = guard.total_groups.saturating_add(1);
+        guard.max_group_size = guard.max_group_size.max(group_size);
+        guard.total_wait_ns = guard
+            .total_wait_ns
+            .saturating_add(wait_ns.saturating_mul(group_size));
+        guard.max_wait_ns = guard.max_wait_ns.max(wait_ns);
+        guard.pending = 0;
+        guard.completed_generation = guard.generation;
+        guard.completed_error = sync_result.as_ref().err().cloned();
+        guard.generation = guard.generation.saturating_add(1);
+        guard.syncing = false;
+        self.group_commit.condvar.notify_all();
+        sync_result
+    }
+
+    /// Flush buffered WAL bytes to the OS without forcing stable storage.
+    /// This is intentionally weaker than `wal_sync` and is only used by
+    /// explicitly selected relaxed policies.
+    fn wal_flush_only(&self) -> Result<(), String> {
+        let profile_enabled = Self::native_profile_enabled();
+        let lock_start = if profile_enabled {
+            Some(Instant::now())
+        } else {
+            None
+        };
+        let mut guard = self
+            .wal_writer
+            .write()
+            .map_err(|_| "WAL writer lock poisoned".to_string())?;
+        if let Some(start) = lock_start {
+            Self::profile_ns(&self.native_profile.wal_lock_wait_ns, start.elapsed());
+        }
+        let Some(ref mut f) = *guard else {
+            return if self.data_dir.is_none() {
+                Ok(())
+            } else {
+                Err("WAL writer is not open".to_string())
+            };
+        };
+        let flush_start = if profile_enabled {
+            Some(Instant::now())
+        } else {
+            None
+        };
+        self.maybe_fail_wal_flush_for_test()?;
+        f.flush()
+            .map_err(|err| format!("WAL relaxed flush failed: {err}"))?;
+        if let Some(start) = flush_start {
+            Self::profile_ns(&self.native_profile.wal_flush_ns, start.elapsed());
+            self.native_profile
+                .flush_count
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        if Self::wal_trace_enabled() {
+            self.wal_trace.flush_calls.fetch_add(1, Ordering::Relaxed);
+        }
+        Ok(())
     }
 
     /// Replay WAL file to rebuild in-memory state.
@@ -5080,12 +6226,28 @@ impl NativeSqlEngine {
         if let Ok(index_data) = fs::read(&index_path) {
             let _ = self.index_mgr.load_catalog(&index_data);
         }
+        let search_path = dir.join("native_sql.search_indexes");
+        if let Ok(search_data) = fs::read(&search_path) {
+            let _ = load_search_indexes(
+                &self.inverted_catalog,
+                &self.json_path_catalog,
+                &self.trigram_catalog,
+                &self.vector_hnsw_catalog,
+                &search_data,
+            );
+        }
         self.dirty_tracker.clear_after_checkpoint();
     }
 
     /// Write a table-level binary checkpoint and truncate WAL.
     pub fn checkpoint(&self) {
         let checkpoint_start = Instant::now();
+        let profile_enabled = Self::native_profile_enabled();
+        if profile_enabled {
+            self.native_profile
+                .checkpoint_count
+                .fetch_add(1, Ordering::Relaxed);
+        }
         let mut profile = CheckpointProfile {
             checkpoint_trigger_reason: "manual_or_checkpoint_interval".to_string(),
             ..CheckpointProfile::default()
@@ -5125,7 +6287,15 @@ impl NativeSqlEngine {
         // Group-commit: flush + fsync buffered WAL writes before snapshotting.
         if self.wal_mutations.load(Ordering::Relaxed) > 0 {
             let sync_start = Instant::now();
-            self.wal_sync();
+            if let Err(err) = self.wal_sync() {
+                profile.checkpoint_trigger_reason =
+                    format!("failed_wal_sync_before_checkpoint: {err}");
+                profile.checkpoint_total_ms = checkpoint_start.elapsed().as_secs_f64() * 1000.0;
+                if let Ok(mut guard) = self.last_checkpoint_profile.write() {
+                    *guard = profile;
+                }
+                return;
+            }
             profile.temp_file_sync_ms += sync_start.elapsed().as_secs_f64() * 1000.0;
             profile.fsync_count += 1;
         }
@@ -5314,6 +6484,26 @@ impl NativeSqlEngine {
             profile.index_catalog_write_ms = index_start.elapsed().as_secs_f64() * 1000.0;
         }
 
+        let search_path = dir.join("native_sql.search_indexes");
+        let search_tmp = dir.join("native_sql.search_indexes.tmp");
+        if let Ok(search_data) = encode_search_indexes(
+            &self.inverted_catalog,
+            &self.json_path_catalog,
+            &self.trigram_catalog,
+            &self.vector_hnsw_catalog,
+        ) {
+            let search_unchanged = fs::read(&search_path)
+                .map(|existing| existing == search_data)
+                .unwrap_or(false);
+            if !search_unchanged && fs::write(&search_tmp, &search_data).is_ok() {
+                if let Ok(f) = fs::File::open(&search_tmp) {
+                    let _ = f.sync_data();
+                    profile.fsync_count += 1;
+                }
+                let _ = fs::rename(&search_tmp, &search_path);
+            }
+        }
+
         // Compatibility marker for existing Python API/tests. The actual
         // checkpoint state is loaded from the table manifest when present.
         let snap_path = dir.join("native_sql.snap");
@@ -5358,8 +6548,16 @@ impl NativeSqlEngine {
             // Reopen for appending.
             let wal_reopen_start = Instant::now();
             if let Ok(mut guard) = self.wal_writer.write() {
-                if let Ok(f2) = fs::OpenOptions::new().append(true).open(&wal_path) {
-                    *guard = Some(f2);
+                match open_wal_writer(&wal_path) {
+                    Ok((writer, open_datasync)) => {
+                        *guard = Some(writer);
+                        self.wal_open_datasync
+                            .store(open_datasync, Ordering::Relaxed);
+                    }
+                    Err(err) => {
+                        profile.checkpoint_trigger_reason =
+                            format!("failed_wal_reopen: {err}");
+                    }
                 }
             }
             profile.wal_reopen_ms = wal_reopen_start.elapsed().as_secs_f64() * 1000.0;
@@ -5377,6 +6575,21 @@ impl NativeSqlEngine {
         self.dirty_tracker.clear_after_checkpoint();
         profile.checkpoint_total_ms = checkpoint_start.elapsed().as_secs_f64() * 1000.0;
         let _ = profile.observed_sync_ms();
+        if profile_enabled {
+            Self::profile_ns(
+                &self.native_profile.checkpoint_ns,
+                checkpoint_start.elapsed(),
+            );
+            self.native_profile
+                .table_rewrite_count
+                .fetch_add(profile.table_file_rewrite_count, Ordering::Relaxed);
+            self.native_profile
+                .index_rebuild_count
+                .fetch_add(profile.index_file_rewrite_count, Ordering::Relaxed);
+            self.native_profile
+                .sync_data_count
+                .fetch_add(profile.fsync_count, Ordering::Relaxed);
+        }
         if let Ok(mut guard) = self.last_checkpoint_profile.write() {
             *guard = profile;
         }
@@ -5498,7 +6711,14 @@ impl NativeSqlEngine {
     }
 
     pub fn execute(&self, sql: &str) -> Result<QueryResult, String> {
-        self.execute_inner(sql, true)
+        if Self::native_profile_enabled() {
+            let start = Instant::now();
+            let result = self.execute_inner(sql, true);
+            Self::profile_ns(&self.native_profile.execute_ns, start.elapsed());
+            result
+        } else {
+            self.execute_inner(sql, true)
+        }
     }
 
     pub fn execute_columnar_internal(&self, sql: &str) -> Result<NativeColumnarBatch, String> {
@@ -5591,7 +6811,8 @@ impl NativeSqlEngine {
                         validity: None,
                     },
                     zero_copy: true,
-                    copy_reason: "memoryview exposes Rust-owned Arc<[i64]>; no Python copy".to_string(),
+                    copy_reason: "memoryview exposes Rust-owned Arc<[i64]>; no Python copy"
+                        .to_string(),
                 });
                 has_numeric = true;
                 continue;
@@ -5603,8 +6824,7 @@ impl NativeSqlEngine {
                         .int_cols
                         .get(col.as_str())
                         .ok_or_else(|| format!("integer column cache missing for {col}"))?;
-                    let values: Arc<[i64]> =
-                        values[..row_count].to_vec().into_boxed_slice().into();
+                    let values: Arc<[i64]> = values[..row_count].to_vec().into_boxed_slice().into();
                     columns.push(NativeColumn {
                         name: col,
                         logical_type: "INTEGER".to_string(),
@@ -5616,8 +6836,8 @@ impl NativeSqlEngine {
                             validity: None,
                         },
                         zero_copy: true,
-                        copy_reason:
-                            "memoryview exposes Rust-owned Arc<[i64]>; no Python copy".to_string(),
+                        copy_reason: "memoryview exposes Rust-owned Arc<[i64]>; no Python copy"
+                            .to_string(),
                     });
                     has_numeric = true;
                 }
@@ -5626,8 +6846,7 @@ impl NativeSqlEngine {
                         .float_cols
                         .get(col.as_str())
                         .ok_or_else(|| format!("float column cache missing for {col}"))?;
-                    let values: Arc<[f64]> =
-                        values[..row_count].to_vec().into_boxed_slice().into();
+                    let values: Arc<[f64]> = values[..row_count].to_vec().into_boxed_slice().into();
                     columns.push(NativeColumn {
                         name: col,
                         logical_type: "FLOAT8".to_string(),
@@ -5639,8 +6858,8 @@ impl NativeSqlEngine {
                             validity: None,
                         },
                         zero_copy: true,
-                        copy_reason:
-                            "memoryview exposes Rust-owned Arc<[f64]>; no Python copy".to_string(),
+                        copy_reason: "memoryview exposes Rust-owned Arc<[f64]>; no Python copy"
+                            .to_string(),
                     });
                     has_numeric = true;
                 }
@@ -5917,12 +7136,9 @@ impl NativeSqlEngine {
         } else {
             None
         };
-        if is_mutation && tx_active {
-            self.ensure_transaction_snapshot()?;
-        }
         if is_mutation && self.data_dir.is_some() && !tx_active {
             if let Some(sql) = wal_sql.as_deref() {
-                self.wal_append(sql);
+                self.wal_append(sql)?;
             }
         }
         let result = match plan {
@@ -5975,7 +7191,7 @@ impl NativeSqlEngine {
                 _ => {}
             }
             if self.data_dir.is_some() && !tx_active {
-                self.after_successful_autocommit_wal_mutation();
+                self.after_successful_autocommit_wal_mutation()?;
             }
         }
         result
@@ -6326,7 +7542,7 @@ impl NativeSqlEngine {
                 self.record_transaction_row_undos(
                     table,
                     vec![(id, t.rows.get(&id).cloned())],
-                    !table_indexes.is_empty(),
+                    false,
                 )?;
             }
             let (_, row) = rows.pop().unwrap();
@@ -6445,33 +7661,27 @@ impl NativeSqlEngine {
         let mut count = 0usize;
         {
             let mut g = self.tables.write().map_err(|_| "table lock poisoned")?;
+            let has_fk_references = Self::table_has_fk_references(&g, table, false);
             if let Some(t) = g.get(table) {
                 resolved = Self::coerce_assignments_for_table(t, &resolved)?;
             }
-            self.check_fk_on_update(&g, table, row_id, &resolved)?;
+            if has_fk_references {
+                self.check_fk_on_update(&g, table, row_id, &resolved)?;
+            }
             if let Some(t) = g.get(table) {
                 Self::enforce_constraints_on_update(t, &[row_id], &resolved)?;
                 Self::validate_update_vector_dimensions(t, &resolved)?;
             }
-            self.apply_fk_on_update(&mut g, table, row_id, &resolved);
+            if has_fk_references {
+                self.apply_fk_on_update(&mut g, table, row_id, &resolved);
+            }
             if let Some(t) = g.get_mut(table) {
                 if let Some(row) = t.rows.get_mut(&row_id) {
                     if self.transaction_active() {
-                        let snapshot_indexes = {
-                            let indexes = self.index_mgr.indexes.read();
-                            indexes.values().any(|tree| {
-                                tree.table == table
-                                    && tree.columns.iter().any(|idx_col| {
-                                        resolved
-                                            .iter()
-                                            .any(|(changed_col, _)| changed_col == idx_col)
-                                    })
-                            })
-                        };
                         self.record_transaction_row_undos(
                             table,
                             vec![(row_id, Some(row.clone()))],
-                            snapshot_indexes,
+                            false,
                         )?;
                     }
                     self.update_indexes(table, row_id, row, &resolved);
@@ -6500,18 +7710,23 @@ impl NativeSqlEngine {
         {
             let mut g = self.tables.write().map_err(|_| "table lock poisoned")?;
             if g.get(table).and_then(|t| t.rows.get(&row_id)).is_some() {
-                self.check_fk_on_delete(&g, table, row_id)?;
+                let has_fk_references = Self::table_has_fk_references(&g, table, true);
+                if has_fk_references {
+                    self.check_fk_on_delete(&g, table, row_id)?;
+                }
                 if let Some(row) = g.get(table).and_then(|t| t.rows.get(&row_id)) {
                     if self.transaction_active() {
                         self.record_transaction_row_undos(
                             table,
                             vec![(row_id, Some(row.clone()))],
-                            true,
+                            false,
                         )?;
                     }
                     self.remove_from_indexes(table, row_id, row);
                 }
-                self.apply_fk_on_delete(&mut g, table, row_id);
+                if has_fk_references {
+                    self.apply_fk_on_delete(&mut g, table, row_id);
+                }
                 if let Some(t) = g.get_mut(table) {
                     if t.rows.remove(&row_id).is_some() {
                         deleted = 1;
@@ -6653,11 +7868,19 @@ impl NativeSqlEngine {
         with_wal: bool,
         username: &str,
     ) -> Result<QueryResult, String> {
+        let parse_start = if Self::native_profile_enabled() {
+            Some(Instant::now())
+        } else {
+            None
+        };
         let s = sql.trim().trim_end_matches(';').trim();
         if s.is_empty() {
             return Ok(Self::empty_ok("OK"));
         }
         let up = s.to_ascii_uppercase();
+        if let Some(start) = parse_start {
+            Self::profile_ns(&self.native_profile.parse_ns, start.elapsed());
+        }
         if up.starts_with("CREATE SEQUENCE")
             || up.starts_with("ALTER SEQUENCE")
             || up.starts_with("DROP SEQUENCE")
@@ -6814,8 +8037,8 @@ impl NativeSqlEngine {
             if result.is_ok() {
                 self.mark_table_schema_dirty(tbl);
                 if autocommit_wal_mutation {
-                    self.wal_append(s);
-                    self.after_successful_autocommit_wal_mutation();
+                    self.wal_append(s)?;
+                    self.after_successful_autocommit_wal_mutation()?;
                 }
             }
             return result;
@@ -6832,8 +8055,8 @@ impl NativeSqlEngine {
             if result.is_ok() {
                 self.mark_table_data_dirty(tbl_name, 1);
                 if autocommit_wal_mutation {
-                    self.wal_append(s);
-                    self.after_successful_autocommit_wal_mutation();
+                    self.wal_append(s)?;
+                    self.after_successful_autocommit_wal_mutation()?;
                 }
             }
             return result;
@@ -6845,8 +8068,8 @@ impl NativeSqlEngine {
             if result.is_ok() {
                 self.mark_index_catalog_dirty(Self::parse_create_index_table(s).as_deref());
                 if autocommit_wal_mutation {
-                    self.wal_append(s);
-                    self.after_successful_autocommit_wal_mutation();
+                    self.wal_append(s)?;
+                    self.after_successful_autocommit_wal_mutation()?;
                 }
             }
             return result;
@@ -6857,8 +8080,8 @@ impl NativeSqlEngine {
             if result.is_ok() {
                 self.mark_index_catalog_dirty(None);
                 if autocommit_wal_mutation {
-                    self.wal_append(s);
-                    self.after_successful_autocommit_wal_mutation();
+                    self.wal_append(s)?;
+                    self.after_successful_autocommit_wal_mutation()?;
                 }
             }
             return result;
@@ -6867,18 +8090,15 @@ impl NativeSqlEngine {
             let tbl = Self::parse_ident_after(s, "DELETE FROM").unwrap_or("");
             self.auth
                 .check_privilege(username, tbl, Privilege::Delete)?;
-            if self.transaction_active() {
-                self.ensure_transaction_snapshot()?;
-            }
             let result = self.handle_delete(s);
-            if result.is_ok() && with_wal && self.transaction_active() {
+            if result.is_ok() && with_wal && tx_active_at_start {
                 self.record_transaction_wal(s)?;
             }
             if result.is_ok() {
                 self.mark_table_data_dirty(tbl, 1);
                 if autocommit_wal_mutation {
-                    self.wal_append(s);
-                    self.after_successful_autocommit_wal_mutation();
+                    self.wal_append(s)?;
+                    self.after_successful_autocommit_wal_mutation()?;
                 }
             }
             return result;
@@ -6887,18 +8107,15 @@ impl NativeSqlEngine {
             let tbl = Self::parse_ident_after(s, "INSERT INTO").unwrap_or("");
             self.auth
                 .check_privilege(username, tbl, Privilege::Insert)?;
-            if self.transaction_active() {
-                self.ensure_transaction_snapshot()?;
-            }
             let result = self.handle_insert(s);
-            if result.is_ok() && with_wal && self.transaction_active() {
+            if result.is_ok() && with_wal && tx_active_at_start {
                 self.record_transaction_wal(s)?;
             }
             if result.is_ok() {
                 self.mark_table_data_dirty(tbl, 1);
                 if autocommit_wal_mutation {
-                    self.wal_append(s);
-                    self.after_successful_autocommit_wal_mutation();
+                    self.wal_append(s)?;
+                    self.after_successful_autocommit_wal_mutation()?;
                 }
             }
             return result;
@@ -6907,18 +8124,15 @@ impl NativeSqlEngine {
             let tbl = Self::parse_ident_after(s, "UPDATE").unwrap_or("");
             self.auth
                 .check_privilege(username, tbl, Privilege::Update)?;
-            if self.transaction_active() {
-                self.ensure_transaction_snapshot()?;
-            }
             let result = self.handle_update(s);
-            if result.is_ok() && with_wal && self.transaction_active() {
+            if result.is_ok() && with_wal && tx_active_at_start {
                 self.record_transaction_wal(s)?;
             }
             if result.is_ok() {
                 self.mark_table_data_dirty(tbl, 1);
                 if autocommit_wal_mutation {
-                    self.wal_append(s);
-                    self.after_successful_autocommit_wal_mutation();
+                    self.wal_append(s)?;
+                    self.after_successful_autocommit_wal_mutation()?;
                 }
             }
             return result;
@@ -6931,8 +8145,8 @@ impl NativeSqlEngine {
             if result.is_ok() {
                 self.mark_table_schema_dirty(tbl);
                 if autocommit_wal_mutation {
-                    self.wal_append(s);
-                    self.after_successful_autocommit_wal_mutation();
+                    self.wal_append(s)?;
+                    self.after_successful_autocommit_wal_mutation()?;
                 }
             }
             return result;
@@ -6944,8 +8158,8 @@ impl NativeSqlEngine {
             if result.is_ok() {
                 self.mark_table_schema_dirty(tbl);
                 if autocommit_wal_mutation {
-                    self.wal_append(s);
-                    self.after_successful_autocommit_wal_mutation();
+                    self.wal_append(s)?;
+                    self.after_successful_autocommit_wal_mutation()?;
                 }
             }
             return result;
@@ -8539,6 +9753,392 @@ impl NativeSqlEngine {
         Ok(Self::empty_ok("DROP TABLE"))
     }
 
+    /// Index kind parsed from CREATE INDEX ... USING ...
+    fn parse_create_index_spec(s: &str) -> Result<(String, String, Vec<String>, CreateIndexKind), String> {
+        let up = s.to_ascii_uppercase();
+        let on_idx = up.find(" ON ").ok_or("Invalid CREATE INDEX: missing ON")?;
+        let idx_kw = up.find("INDEX").ok_or("Invalid CREATE INDEX")?;
+        let name = s[idx_kw + 5..on_idx].trim().trim_matches('"');
+        if name.is_empty() {
+            return Err("Invalid CREATE INDEX: missing index name".into());
+        }
+
+        let kind = if up.contains("USING JSON_PATH") {
+            let path = Self::parse_using_string_arg(s, "JSON_PATH")?;
+            CreateIndexKind::JsonPath(path)
+        } else if up.contains("USING HNSW") || up.contains("USING IVFFLAT") {
+            CreateIndexKind::Hnsw(parse_hnsw_metric_from_sql(s))
+        } else if up.contains("USING GIN_TRGM") || up.contains("USING TRGM") || up.contains("USING TRIGRAM") {
+            CreateIndexKind::Trigram
+        } else if up.contains("USING GIN") || up.contains("USING INVERTED") {
+            CreateIndexKind::InvertedGin
+        } else {
+            CreateIndexKind::BTree
+        };
+
+        let s_trim = if let Some(using_idx) = up.find(" USING ") {
+            &s[..using_idx]
+        } else {
+            s
+        };
+        let up_trim = s_trim.to_ascii_uppercase();
+        let on_idx = up_trim.find(" ON ").ok_or("Invalid CREATE INDEX: missing ON")?;
+
+        let after_on = &s_trim[on_idx + 4..];
+        let after_on_up = after_on.to_ascii_uppercase();
+        let (table, cols) = if let Some(paren_open) = after_on.find('(') {
+            let table = after_on[..paren_open].trim().trim_matches('"');
+            let paren_close = after_on
+                .rfind(')')
+                .ok_or("Invalid CREATE INDEX: missing )")?;
+            let cols: Vec<String> = after_on[paren_open + 1..paren_close]
+                .split(',')
+                .map(|c| c.trim().trim_matches('"').to_string())
+                .filter(|c| !c.is_empty())
+                .collect();
+            (table.to_string(), cols)
+        } else if !matches!(kind, CreateIndexKind::BTree) {
+            let using_idx = after_on_up
+                .find("USING ")
+                .ok_or("Invalid CREATE INDEX: missing USING clause")?;
+            let table = after_on[..using_idx].trim().trim_matches('"');
+            let cols_start = after_on[using_idx..]
+                .find('(')
+                .ok_or("Invalid CREATE INDEX: missing (")?;
+            let cols_part = &after_on[using_idx + cols_start..];
+            let paren_close = cols_part
+                .rfind(')')
+                .ok_or("Invalid CREATE INDEX: missing )")?;
+            let cols: Vec<String> = cols_part[1..paren_close]
+                .split(',')
+                .map(|c| c.trim().trim_matches('"').to_string())
+                .filter(|c| !c.is_empty())
+                .collect();
+            (table.to_string(), cols)
+        } else {
+            return Err("Invalid CREATE INDEX: missing (".into());
+        };
+
+        if table.is_empty() {
+            return Err("Invalid CREATE INDEX: missing table".into());
+        }
+        if cols.is_empty() {
+            return Err("Invalid CREATE INDEX: no columns specified".into());
+        }
+        if matches!(
+            kind,
+            CreateIndexKind::JsonPath(_)
+                | CreateIndexKind::Trigram
+                | CreateIndexKind::InvertedGin
+                | CreateIndexKind::Hnsw(_)
+        ) && cols.len() != 1
+        {
+            return Err("specialized index supports exactly one column".into());
+        }
+        Ok((name.to_string(), table, cols, kind))
+    }
+
+    fn parse_using_string_arg(sql: &str, using_kw: &str) -> Result<String, String> {
+        let up = sql.to_ascii_uppercase();
+        let marker = format!("USING {using_kw}");
+        let start = up.find(&marker).ok_or("missing USING clause")?;
+        let mut rest = sql[start + marker.len()..].trim_start();
+        if rest.starts_with('(') {
+            rest = rest[1..].trim_start();
+        }
+        let quote = rest.chars().next().ok_or("missing path argument")?;
+        if quote != '\'' && quote != '"' {
+            return Err("path argument must be quoted".into());
+        }
+        let end = rest[1..]
+            .find(quote)
+            .ok_or("unterminated path argument")?;
+        Ok(rest[1..1 + end].to_string())
+    }
+
+    fn maintain_json_path_indexes_for_row(&self, table: &str, row_id: i64, row: &NativeRow) {
+        for entry in self.json_path_catalog.indexes_for_table(table) {
+            let col = &entry.meta.key.column;
+            let path = &entry.meta.key.path;
+            if let Some(cell) = row.cols.get(col.as_str()) {
+                if let Some(val) = extract_json_path_text(&cell.as_text(), path) {
+                    entry.insert(row_id, &val);
+                }
+            }
+        }
+    }
+
+    fn remove_json_path_indexes_for_row(&self, table: &str, row_id: i64, row: &NativeRow) {
+        for entry in self.json_path_catalog.indexes_for_table(table) {
+            let col = &entry.meta.key.column;
+            let path = &entry.meta.key.path;
+            if let Some(cell) = row.cols.get(col.as_str()) {
+                if let Some(val) = extract_json_path_text(&cell.as_text(), path) {
+                    entry.remove(row_id, &val);
+                }
+            }
+        }
+    }
+
+    fn maintain_trigram_indexes_for_row(&self, table: &str, row_id: i64, row: &NativeRow) {
+        for entry in self.trigram_catalog.indexes_for_table(table) {
+            let col = &entry.meta.key.column;
+            if let Some(cell) = row.cols.get(col.as_str()) {
+                entry.index_text(row_id, &cell.as_text());
+            }
+        }
+    }
+
+    fn remove_trigram_indexes_for_row(&self, table: &str, row_id: i64, row: &NativeRow) {
+        for entry in self.trigram_catalog.indexes_for_table(table) {
+            let col = &entry.meta.key.column;
+            if let Some(cell) = row.cols.get(col.as_str()) {
+                entry.remove_text(row_id, &cell.as_text());
+            }
+        }
+    }
+
+    fn backfill_json_path_index(
+        &self,
+        entry: &crate::index::ManagedJsonPathIndex,
+        table: &str,
+    ) -> Result<(), String> {
+        let g = self.tables.read().map_err(|_| "table lock poisoned")?;
+        let Some(t) = g.get(table) else {
+            return Ok(());
+        };
+        let col = entry.meta.key.column.clone();
+        let path = entry.meta.key.path.clone();
+        entry.clear();
+        for (&row_id, row) in &t.rows {
+            if let Some(cell) = row.cols.get(col.as_str()) {
+                if let Some(val) = extract_json_path_text(&cell.as_text(), &path) {
+                    entry.insert(row_id, &val);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn backfill_trigram_index(
+        &self,
+        entry: &crate::index::ManagedTrigramIndex,
+        table: &str,
+    ) -> Result<(), String> {
+        let g = self.tables.read().map_err(|_| "table lock poisoned")?;
+        let Some(t) = g.get(table) else {
+            return Ok(());
+        };
+        let col = entry.meta.key.column.clone();
+        entry.clear();
+        for (&row_id, row) in &t.rows {
+            if let Some(cell) = row.cols.get(col.as_str()) {
+                entry.index_text(row_id, &cell.as_text());
+            }
+        }
+        Ok(())
+    }
+
+    fn backfill_vector_hnsw_index(
+        &self,
+        entry: &crate::index::ManagedVectorHnswIndex,
+        table: &str,
+    ) -> Result<(), String> {
+        let g = self.tables.read().map_err(|_| "table lock poisoned")?;
+        let Some(t) = g.get(table) else {
+            return Ok(());
+        };
+        let col = entry.meta.key.column.clone();
+        let mut vectors = Vec::new();
+        for (&row_id, row) in &t.rows {
+            if let Some(cell) = row.cols.get(col.as_str()) {
+                if let Some(vec) = Self::parse_vector_cell(cell) {
+                    if let Ok(external_id) = u32::try_from(row_id) {
+                        vectors.push((external_id, vec));
+                    }
+                }
+            }
+        }
+        entry.batch_build(vectors);
+        Ok(())
+    }
+
+    fn ensure_vector_hnsw_index(
+        &self,
+        table: &str,
+        column: &str,
+        metric: DistanceMetric,
+        dim: usize,
+    ) -> Result<Arc<crate::index::ManagedVectorHnswIndex>, String> {
+        if let Some(entry) = self.vector_hnsw_catalog.find(table, column, metric) {
+            if entry.len() > 0 {
+                return Ok(entry);
+            }
+            self.backfill_vector_hnsw_index(&entry, table)?;
+            return Ok(entry);
+        }
+        let name = format!(
+            "auto_hnsw_{}_{}_{}",
+            table,
+            column,
+            match metric {
+                DistanceMetric::L2 => "l2",
+                DistanceMetric::Cosine => "cosine",
+                DistanceMetric::InnerProduct => "ip",
+            }
+        );
+        let entry = self.vector_hnsw_catalog.create_index(
+            name,
+            table.to_string(),
+            column.to_string(),
+            dim,
+            metric,
+        );
+        self.backfill_vector_hnsw_index(&entry, table)?;
+        Ok(entry)
+    }
+
+    fn maintain_vector_hnsw_indexes_for_row(&self, table: &str, row_id: i64, row: &NativeRow) {
+        for entry in self.vector_hnsw_catalog.indexes_for_table(table) {
+            let col = &entry.meta.key.column;
+            if let Some(cell) = row.cols.get(col.as_str()) {
+                if let Some(vec) = Self::parse_vector_cell(cell) {
+                    entry.index_vector(row_id, vec);
+                }
+            }
+        }
+    }
+
+    fn remove_vector_hnsw_indexes_for_row(&self, table: &str, row_id: i64) {
+        for entry in self.vector_hnsw_catalog.indexes_for_table(table) {
+            entry.remove_vector(row_id);
+        }
+    }
+
+    fn ensure_json_path_index(
+        &self,
+        table: &str,
+        column: &str,
+        path: &str,
+    ) -> Result<Arc<crate::index::ManagedJsonPathIndex>, String> {
+        if let Some(entry) = self.json_path_catalog.find(table, column, path) {
+            return Ok(entry);
+        }
+        let name = format!("auto_json_{table}_{column}_{path}");
+        let entry = self.json_path_catalog.create_index(
+            name,
+            table.to_string(),
+            column.to_string(),
+            path.to_string(),
+        );
+        self.backfill_json_path_index(&entry, table)?;
+        Ok(entry)
+    }
+
+    fn parse_json_path_eq_predicate(pred: &str) -> Option<(String, String, String)> {
+        let pred = Self::strip_predicate_parens(pred);
+        let up = pred.to_ascii_uppercase();
+        if !up.contains("JSON_EXTRACT_PATH_TEXT(") || !up.contains('=') {
+            return None;
+        }
+        let eq_idx = find_op_top_level(pred, "=")?;
+        let lhs = pred[..eq_idx].trim();
+        let rhs = Self::parse_value(pred[eq_idx + 1..].trim());
+        let Cell::Text(value) = rhs else {
+            return None;
+        };
+        let lhs_up = lhs.to_ascii_uppercase();
+        if !lhs_up.starts_with("JSON_EXTRACT_PATH_TEXT(") || !lhs.ends_with(')') {
+            return None;
+        }
+        let inner = &lhs["JSON_EXTRACT_PATH_TEXT(".len()..lhs.len() - 1];
+        let args: Vec<&str> = split_function_args(inner);
+        if args.len() < 2 {
+            return None;
+        }
+        let col = args[0].trim().trim_matches('"').to_string();
+        let path = Self::parse_value(args[1].trim());
+        let Cell::Text(path) = path else {
+            return None;
+        };
+        Some((col, path, value))
+    }
+
+    fn parse_like_contains_predicate(pred: &str) -> Option<(String, String)> {
+        let pred = Self::strip_predicate_parens(pred);
+        let up = pred.to_ascii_uppercase();
+        if up.contains(" ILIKE ") {
+            return None;
+        }
+        let kw_idx = up.find(" LIKE ")?;
+        let col = pred[..kw_idx].trim().trim_matches('"').to_string();
+        let mut pattern = pred[kw_idx + 6..].trim().trim_end_matches(';').trim();
+        if (pattern.starts_with('\'') && pattern.ends_with('\''))
+            || (pattern.starts_with('"') && pattern.ends_with('"'))
+        {
+            pattern = &pattern[1..pattern.len() - 1];
+        }
+        if !pattern.starts_with('%') || !pattern.ends_with('%') || pattern.len() < 3 {
+            return None;
+        }
+        let needle = pattern[1..pattern.len() - 1].to_string();
+        if needle.is_empty() {
+            return None;
+        }
+        Some((col, needle))
+    }
+
+    fn row_text_for_inverted_columns(row: &NativeRow, columns: &[String]) -> Option<String> {
+        let mut parts = Vec::with_capacity(columns.len());
+        for col in columns {
+            parts.push(row.cols.get(col.as_str())?.as_text());
+        }
+        Some(parts.join(" "))
+    }
+
+    fn maintain_inverted_indexes_for_row(&self, table: &str, row_id: i64, row: &NativeRow) {
+        for entry in self.inverted_catalog.indexes_for_table(table) {
+            if let Some(text) = Self::row_text_for_inverted_columns(row, &entry.meta.columns) {
+                if let Ok(doc_id) = u32::try_from(row_id) {
+                    entry.index_row(doc_id, &text);
+                }
+            }
+        }
+    }
+
+    fn remove_inverted_indexes_for_row(&self, table: &str, row_id: i64) {
+        if let Ok(doc_id) = u32::try_from(row_id) {
+            for entry in self.inverted_catalog.indexes_for_table(table) {
+                entry.remove_row(doc_id);
+            }
+        }
+    }
+
+    fn parse_fts_predicate(pred_part: &str) -> Option<(String, String)> {
+        let up = pred_part.to_ascii_uppercase();
+        let op = if let Some(idx) = up.find(" @@ ") {
+            (" @@ ", idx)
+        } else if let Some(idx) = up.find(" MATCH ") {
+            (" MATCH ", idx)
+        } else {
+            return None;
+        };
+        let col = pred_part[..op.1].trim().trim_matches('"').to_string();
+        let mut query_raw = pred_part[op.1 + op.0.len()..]
+            .trim()
+            .trim_end_matches(';')
+            .trim();
+        if (query_raw.starts_with('\'') && query_raw.ends_with('\''))
+            || (query_raw.starts_with('"') && query_raw.ends_with('"'))
+        {
+            query_raw = &query_raw[1..query_raw.len() - 1];
+        }
+        if col.is_empty() || query_raw.is_empty() {
+            return None;
+        }
+        Some((col, query_raw.to_string()))
+    }
+
     /// Handle `CREATE INDEX name ON table (col1, ...)`.
     fn parse_create_index_table(s: &str) -> Option<String> {
         let up = s.to_ascii_uppercase();
@@ -8554,46 +10154,76 @@ impl NativeSqlEngine {
 
     /// Handle `CREATE INDEX name ON table (col1, ...)`.
     fn handle_create_index(&self, s: &str) -> Result<QueryResult, String> {
-        // Parse: CREATE [UNIQUE] INDEX <name> ON <table> (<columns>)
-        let up = s.to_ascii_uppercase();
-        let on_idx = up.find(" ON ").ok_or("Invalid CREATE INDEX: missing ON")?;
+        let (name, table, cols, kind) = Self::parse_create_index_spec(s)?;
+        let col = cols[0].clone();
 
-        // Extract index name (between INDEX and ON)
-        let idx_kw = up.find("INDEX").ok_or("Invalid CREATE INDEX")?;
-        let name = s[idx_kw + 5..on_idx].trim().trim_matches('"');
-        if name.is_empty() {
-            return Err("Invalid CREATE INDEX: missing index name".into());
-        }
-
-        // Extract table name (between ON and open paren)
-        let paren_open = s.find('(').ok_or("Invalid CREATE INDEX: missing (")?;
-        let table = s[on_idx + 4..paren_open].trim().trim_matches('"');
-
-        // Extract columns
-        let paren_close = s.rfind(')').ok_or("Invalid CREATE INDEX: missing )")?;
-        let cols: Vec<String> = s[paren_open + 1..paren_close]
-            .split(',')
-            .map(|c| c.trim().trim_matches('"').to_string())
-            .filter(|c| !c.is_empty())
-            .collect();
-
-        if cols.is_empty() {
-            return Err("Invalid CREATE INDEX: no columns specified".into());
-        }
-
-        // Create the index and populate from existing table data
-        let tree = self.index_mgr.create_manual_index(name, table, &cols);
-
-        // Back-fill: scan existing rows and insert into the new index
-        let g = self.tables.read().map_err(|_| "table lock poisoned")?;
-        if let Some(t) = g.get(table) {
-            for (&row_id, row) in &t.rows {
-                for col in &cols {
-                    if let Some(val) = row.cols.get(col.as_str()) {
-                        if let Some(idx_key) = Self::index_key_for_cell(val) {
-                            tree.insert(idx_key, row_id);
+        match kind {
+            CreateIndexKind::InvertedGin => {
+                let entry = self
+                    .inverted_catalog
+                    .create_index(name, table.clone(), cols);
+                let g = self.tables.read().map_err(|_| "table lock poisoned")?;
+                if let Some(t) = g.get(&table) {
+                    for (&row_id, row) in &t.rows {
+                        if let Some(text) = Self::row_text_for_inverted_columns(row, &entry.meta.columns) {
+                            if let Ok(doc_id) = u32::try_from(row_id) {
+                                entry.index_row(doc_id, &text);
+                            }
                         }
                     }
+                }
+                entry.finalize_if_needed();
+            }
+            CreateIndexKind::JsonPath(path) => {
+                let entry = self.json_path_catalog.create_index(
+                    name,
+                    table.clone(),
+                    col,
+                    path,
+                );
+                self.backfill_json_path_index(&entry, &table)?;
+            }
+            CreateIndexKind::Trigram => {
+                let entry = self
+                    .trigram_catalog
+                    .create_index(name, table.clone(), col);
+                self.backfill_trigram_index(&entry, &table)?;
+            }
+            CreateIndexKind::Hnsw(metric) => {
+                let g = self.tables.read().map_err(|_| "table lock poisoned")?;
+                let dim = g
+                    .get(&table)
+                    .and_then(|t| Self::existing_vector_dim(t, &col))
+                    .ok_or_else(|| {
+                        format!(
+                            "CREATE INDEX USING hnsw requires VECTOR column \"{}\" with at least one row",
+                            col
+                        )
+                    })?;
+                let entry = self.vector_hnsw_catalog.create_index(
+                    name,
+                    table.clone(),
+                    col,
+                    dim,
+                    metric,
+                );
+                self.backfill_vector_hnsw_index(&entry, &table)?;
+            }
+            CreateIndexKind::BTree => {
+                let tree = self.index_mgr.create_manual_index(&name, &table, &cols);
+                let g = self.tables.read().map_err(|_| "table lock poisoned")?;
+                if let Some(t) = g.get(&table) {
+                    let mut entries = Vec::with_capacity(t.rows.len());
+                    for (&row_id, row) in &t.rows {
+                        for col_name in &cols {
+                            if let Some(val) = row.cols.get(col_name.as_str()) {
+                                if let Some(idx_key) = Self::index_key_for_cell(val) {
+                                    entries.push((idx_key, row_id));
+                                }
+                            }
+                        }
+                    }
+                    tree.bulk_load(entries);
                 }
             }
         }
@@ -8606,7 +10236,12 @@ impl NativeSqlEngine {
         let name = Self::parse_ident_after(s, "DROP INDEX")
             .ok_or("Invalid DROP INDEX")?
             .trim_matches('"');
-        if self.index_mgr.drop_index(name) {
+        if self.index_mgr.drop_index(name)
+            || self.inverted_catalog.drop_index(name)
+            || self.json_path_catalog.drop_index(name)
+            || self.trigram_catalog.drop_index(name)
+            || self.vector_hnsw_catalog.drop_index(name)
+        {
             Ok(Self::empty_ok("DROP INDEX"))
         } else {
             Err(format!("Index '{}' does not exist", name))
@@ -9636,6 +11271,11 @@ impl NativeSqlEngine {
     }
 
     fn remove_from_indexes(&self, table: &str, row_id: i64, row: &NativeRow) {
+        let profile_start = if Self::native_profile_enabled() {
+            Some(Instant::now())
+        } else {
+            None
+        };
         let indexes = self.index_mgr.indexes.read();
         for (_name, tree) in indexes.iter() {
             if tree.table != table {
@@ -9649,9 +11289,21 @@ impl NativeSqlEngine {
                 }
             }
         }
+        if let Some(start) = profile_start {
+            Self::profile_ns(&self.native_profile.index_update_ns, start.elapsed());
+        }
+        self.remove_inverted_indexes_for_row(table, row_id);
+        self.remove_json_path_indexes_for_row(table, row_id, row);
+        self.remove_trigram_indexes_for_row(table, row_id, row);
+        self.remove_vector_hnsw_indexes_for_row(table, row_id);
     }
 
     fn insert_into_indexes(&self, table: &str, row_id: i64, row: &NativeRow) {
+        let profile_start = if Self::native_profile_enabled() {
+            Some(Instant::now())
+        } else {
+            None
+        };
         let indexes = self.index_mgr.indexes.read();
         for (_name, tree) in indexes.iter() {
             if tree.table != table {
@@ -9665,6 +11317,50 @@ impl NativeSqlEngine {
                 }
             }
         }
+        if let Some(start) = profile_start {
+            Self::profile_ns(&self.native_profile.index_update_ns, start.elapsed());
+        }
+        self.maintain_inverted_indexes_for_row(table, row_id, row);
+        self.maintain_json_path_indexes_for_row(table, row_id, row);
+        self.maintain_trigram_indexes_for_row(table, row_id, row);
+        self.maintain_vector_hnsw_indexes_for_row(table, row_id, row);
+        self.maybe_warm_adaptive_vector_hnsw_indexes(table);
+    }
+
+    fn maybe_warm_adaptive_vector_hnsw_indexes(&self, table: &str) {
+        const HNSW_ADAPTIVE_MIN_ROWS: usize = 256;
+        let cols_dims = {
+            let g = match self.tables.read() {
+                Ok(g) => g,
+                Err(_) => return,
+            };
+            let Some(t) = g.get(table) else {
+                return;
+            };
+            if t.rows.len() != HNSW_ADAPTIVE_MIN_ROWS {
+                return;
+            }
+            t.columns
+                .iter()
+                .filter_map(|col| {
+                    let dim = Self::vector_column_dim(t, col);
+                    if dim > 0 {
+                        Some((col.clone(), dim))
+                    } else {
+                        None
+                    }
+                })
+                .collect::<Vec<_>>()
+        };
+        for (col, dim) in cols_dims {
+            for metric in [
+                DistanceMetric::L2,
+                DistanceMetric::Cosine,
+                DistanceMetric::InnerProduct,
+            ] {
+                let _ = self.ensure_vector_hnsw_index(table, &col, metric, dim);
+            }
+        }
     }
 
     /// DP-05: Update indexes when a row's column values change.
@@ -9675,6 +11371,11 @@ impl NativeSqlEngine {
         old_row: &NativeRow,
         new_vals: &[(String, Cell)],
     ) {
+        let profile_start = if Self::native_profile_enabled() {
+            Some(Instant::now())
+        } else {
+            None
+        };
         let indexes = self.index_mgr.indexes.read();
         for (_name, tree) in indexes.iter() {
             if tree.table != table {
@@ -9695,6 +11396,55 @@ impl NativeSqlEngine {
                     }
                 }
             }
+        }
+        for entry in self.inverted_catalog.indexes_for_table(table) {
+            let touched = new_vals
+                .iter()
+                .any(|(col, _)| entry.meta.columns.iter().any(|indexed| indexed == col));
+            if touched {
+                self.remove_inverted_indexes_for_row(table, row_id);
+                let mut merged_row = old_row.clone();
+                for (col, val) in new_vals {
+                    merged_row.cols.insert(col.clone(), val.clone());
+                }
+                self.maintain_inverted_indexes_for_row(table, row_id, &merged_row);
+            }
+        }
+        for entry in self.json_path_catalog.indexes_for_table(table) {
+            let touched = new_vals.iter().any(|(col, _)| col == &entry.meta.key.column);
+            if touched {
+                self.remove_json_path_indexes_for_row(table, row_id, old_row);
+                let mut merged_row = old_row.clone();
+                for (col, val) in new_vals {
+                    merged_row.cols.insert(col.clone(), val.clone());
+                }
+                self.maintain_json_path_indexes_for_row(table, row_id, &merged_row);
+            }
+        }
+        for entry in self.trigram_catalog.indexes_for_table(table) {
+            let touched = new_vals.iter().any(|(col, _)| col == &entry.meta.key.column);
+            if touched {
+                self.remove_trigram_indexes_for_row(table, row_id, old_row);
+                let mut merged_row = old_row.clone();
+                for (col, val) in new_vals {
+                    merged_row.cols.insert(col.clone(), val.clone());
+                }
+                self.maintain_trigram_indexes_for_row(table, row_id, &merged_row);
+            }
+        }
+        for entry in self.vector_hnsw_catalog.indexes_for_table(table) {
+            let touched = new_vals.iter().any(|(col, _)| col == &entry.meta.key.column);
+            if touched {
+                self.remove_vector_hnsw_indexes_for_row(table, row_id);
+                let mut merged_row = old_row.clone();
+                for (col, val) in new_vals {
+                    merged_row.cols.insert(col.clone(), val.clone());
+                }
+                self.maintain_vector_hnsw_indexes_for_row(table, row_id, &merged_row);
+            }
+        }
+        if let Some(start) = profile_start {
+            Self::profile_ns(&self.native_profile.index_update_ns, start.elapsed());
         }
     }
 
@@ -9740,6 +11490,7 @@ impl NativeSqlEngine {
         let has_where = up_work.contains("WHERE");
 
         let mut g = self.tables.write().map_err(|_| "table lock poisoned")?;
+        let has_fk_references = Self::table_has_fk_references(&g, table, true);
         let mut deleted = 0usize;
         let mut returning_rows: Vec<Vec<Option<Vec<u8>>>> = Vec::new();
 
@@ -9758,17 +11509,67 @@ impl NativeSqlEngine {
             if pred_part.is_empty() {
                 return Err("DELETE: missing WHERE predicate".to_string());
             }
+            if !tx_active && ret_cols_expanded.is_empty() && !has_fk_references {
+                if let Some(row_id) = Self::parse_simple_id_eq_predicate(pred_part) {
+                    let lookup_start = if Self::native_profile_enabled() {
+                        Some(Instant::now())
+                    } else {
+                        None
+                    };
+                    let exists = g
+                        .get(table)
+                        .map(|t| t.rows.contains_key(&row_id))
+                        .unwrap_or(false);
+                    if let Some(start) = lookup_start {
+                        Self::profile_ns(&self.native_profile.pk_lookup_ns, start.elapsed());
+                        self.native_profile
+                            .pk_lookup_count
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
+                    if exists {
+                        if let Some(row) = g.get(table).and_then(|t| t.rows.get(&row_id)) {
+                            self.remove_from_indexes(table, row_id, row);
+                        }
+                        if let Some(t) = g.get_mut(table) {
+                            t.rows.remove(&row_id);
+                        }
+                        drop(g);
+                        self.buf_pool.invalidate(table);
+                        return Ok(Self::empty_ok("DELETE 1"));
+                    }
+                    return Ok(Self::empty_ok("DELETE 0"));
+                }
+            }
             let mut to_delete: Vec<i64> = Vec::new();
             if let Some(t) = g.get(table) {
                 if let Some(row_id) = Self::parse_simple_id_eq_predicate(pred_part) {
+                    let lookup_start = if Self::native_profile_enabled() {
+                        Some(Instant::now())
+                    } else {
+                        None
+                    };
                     if t.rows.contains_key(&row_id) {
                         to_delete.push(row_id);
                     }
+                    if let Some(start) = lookup_start {
+                        Self::profile_ns(&self.native_profile.pk_lookup_ns, start.elapsed());
+                        self.native_profile
+                            .pk_lookup_count
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
                 } else {
+                    let scan_start = if Self::native_profile_enabled() {
+                        Some(Instant::now())
+                    } else {
+                        None
+                    };
                     for (&row_id, row) in &t.rows {
                         if Self::eval_condition_for_row(row_id, row, pred_part) {
                             to_delete.push(row_id);
                         }
+                    }
+                    if let Some(start) = scan_start {
+                        Self::profile_ns(&self.native_profile.table_scan_ns, start.elapsed());
                     }
                 }
             }
@@ -9785,8 +11586,10 @@ impl NativeSqlEngine {
             }
 
             // L-05: Check FK constraints before deleting (child tables referencing this one).
-            for &row_id in &to_delete {
-                self.check_fk_on_delete(&g, table, row_id)?;
+            if has_fk_references {
+                for &row_id in &to_delete {
+                    self.check_fk_on_delete(&g, table, row_id)?;
+                }
             }
 
             if tx_active {
@@ -9799,7 +11602,7 @@ impl NativeSqlEngine {
                             .collect::<Vec<_>>()
                     })
                     .unwrap_or_default();
-                self.record_transaction_row_undos(table, undo_rows, true)?;
+                self.record_transaction_row_undos(table, undo_rows, false)?;
             }
 
             // DP-05: Remove from B+Tree indexes before deleting rows.
@@ -9812,8 +11615,10 @@ impl NativeSqlEngine {
             }
 
             // L-05: Cascade/SetNull FK actions on child tables.
-            for &row_id in &to_delete {
-                self.apply_fk_on_delete(&mut g, table, row_id);
+            if has_fk_references {
+                for &row_id in &to_delete {
+                    self.apply_fk_on_delete(&mut g, table, row_id);
+                }
             }
 
             // Delete rows.
@@ -9842,8 +11647,10 @@ impl NativeSqlEngine {
             }
 
             // L-05: Check FK constraints for ALL rows.
-            for &row_id in &row_ids {
-                self.check_fk_on_delete(&g, table, row_id)?;
+            if has_fk_references {
+                for &row_id in &row_ids {
+                    self.check_fk_on_delete(&g, table, row_id)?;
+                }
             }
 
             if tx_active {
@@ -9856,7 +11663,7 @@ impl NativeSqlEngine {
                             .collect::<Vec<_>>()
                     })
                     .unwrap_or_default();
-                self.record_transaction_row_undos(table, undo_rows, true)?;
+                self.record_transaction_row_undos(table, undo_rows, false)?;
             }
 
             // DP-05: Remove all rows from indexes before mutable operations.
@@ -9869,8 +11676,10 @@ impl NativeSqlEngine {
             }
 
             // L-05: Cascade/SetNull FK actions on child tables (needs &mut g).
-            for &row_id in &row_ids {
-                self.apply_fk_on_delete(&mut g, table, row_id);
+            if has_fk_references {
+                for &row_id in &row_ids {
+                    self.apply_fk_on_delete(&mut g, table, row_id);
+                }
             }
 
             if let Some(t) = g.get_mut(table) {
@@ -10129,6 +11938,7 @@ impl NativeSqlEngine {
         };
         let has_table_indexes = !table_indexes.is_empty();
         let mut index_changes: Vec<(i64, Option<NativeRow>, NativeRow)> = Vec::new();
+        let pending_inverted_ids: Vec<i64> = prepared_rows.iter().map(|(id, _)| *id).collect();
         {
             let mut g = self.tables.write().map_err(|_| "table lock poisoned")?;
 
@@ -10184,16 +11994,38 @@ impl NativeSqlEngine {
                     .iter()
                     .map(|(id, _)| (*id, t.rows.get(id).cloned()))
                     .collect();
-                self.record_transaction_row_undos(table, undo_rows, has_table_indexes)?;
+                self.record_transaction_row_undos(table, undo_rows, false)?;
             }
 
-            if matches!(conflict_action, ConflictAction::None)
-                && returning_cols.is_empty()
-                && !has_table_indexes
-            {
+            if matches!(conflict_action, ConflictAction::None) && returning_cols.is_empty() {
                 inserted_count = prepared_rows.len();
-                for (id, row) in prepared_rows.drain(..) {
-                    t.rows.insert(id, row);
+                if has_table_indexes {
+                    for (id, row) in &prepared_rows {
+                        t.rows.insert(*id, row.clone());
+                    }
+                    let index_start = if Self::native_profile_enabled() {
+                        Some(Instant::now())
+                    } else {
+                        None
+                    };
+                    for (id, row) in &prepared_rows {
+                        for tree in &table_indexes {
+                            for col in &tree.columns {
+                                if let Some(val) = row.cols.get(col) {
+                                    if let Some(idx_key) = Self::index_key_for_cell(val) {
+                                        tree.insert(idx_key, *id);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if let Some(start) = index_start {
+                        Self::profile_ns(&self.native_profile.index_update_ns, start.elapsed());
+                    }
+                } else {
+                    for (id, row) in prepared_rows.drain(..) {
+                        t.rows.insert(id, row);
+                    }
                 }
             } else {
                 for (id, row) in &prepared_rows {
@@ -10282,6 +12114,23 @@ impl NativeSqlEngine {
                                 }
                             }
                         }
+                    }
+                }
+            }
+        }
+
+        if !pending_inverted_ids.is_empty()
+            && (!self.inverted_catalog.indexes_for_table(table).is_empty()
+                || !self.json_path_catalog.indexes_for_table(table).is_empty()
+                || !self.trigram_catalog.indexes_for_table(table).is_empty())
+        {
+            let g = self.tables.read().map_err(|_| "table lock poisoned")?;
+            if let Some(t) = g.get(table) {
+                for id in pending_inverted_ids {
+                    if let Some(row) = t.rows.get(&id) {
+                        self.maintain_inverted_indexes_for_row(table, id, row);
+                        self.maintain_json_path_indexes_for_row(table, id, row);
+                        self.maintain_trigram_indexes_for_row(table, id, row);
                     }
                 }
             }
@@ -10525,31 +12374,9 @@ impl NativeSqlEngine {
         }
 
         let mut g = self.tables.write().map_err(|_| "table lock poisoned")?;
+        let has_fk_references = Self::table_has_fk_references(&g, table, false);
         let mut count = 0usize;
         let mut returning_rows: Vec<Vec<Option<Vec<u8>>>> = Vec::new();
-
-        // Collect matching row IDs (read-only phase).
-        let row_ids: Vec<i64> = if let Some(t) = g.get(table) {
-            if let Some(ref pred) = where_pred {
-                if let Some(row_id) = Self::parse_simple_id_eq_predicate(pred) {
-                    if t.rows.contains_key(&row_id) {
-                        vec![row_id]
-                    } else {
-                        Vec::new()
-                    }
-                } else {
-                    t.rows
-                        .iter()
-                        .filter(|(id, row)| Self::eval_condition_for_row(**id, row, pred))
-                        .map(|(&id, _)| id)
-                        .collect()
-                }
-            } else {
-                t.rows.keys().copied().collect()
-            }
-        } else {
-            Vec::new()
-        };
 
         // Expand RETURNING * to actual columns
         let ret_cols_expanded: Vec<String> =
@@ -10559,14 +12386,105 @@ impl NativeSqlEngine {
                 returning_cols
             };
 
+        if !tx_active && ret_cols_expanded.is_empty() && !has_fk_references {
+            if let Some(ref pred) = where_pred {
+                if let Some(row_id) = Self::parse_simple_id_eq_predicate(pred) {
+                    let lookup_start = if Self::native_profile_enabled() {
+                        Some(Instant::now())
+                    } else {
+                        None
+                    };
+                    let exists = g
+                        .get(table)
+                        .map(|t| t.rows.contains_key(&row_id))
+                        .unwrap_or(false);
+                    if let Some(start) = lookup_start {
+                        Self::profile_ns(&self.native_profile.pk_lookup_ns, start.elapsed());
+                        self.native_profile
+                            .pk_lookup_count
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
+                    if !exists {
+                        return Ok(Self::empty_ok("UPDATE 0"));
+                    }
+
+                    if let Some(t) = g.get(table) {
+                        assignments = Self::coerce_assignments_for_table(t, &assignments)?;
+                        Self::enforce_constraints_on_update(t, &[row_id], &assignments)?;
+                        Self::validate_update_vector_dimensions(t, &assignments)?;
+                    }
+
+                    if let Some(t) = g.get_mut(table) {
+                        if let Some(row) = t.rows.get_mut(&row_id) {
+                            self.update_indexes(table, row_id, row, &assignments);
+                            for (col, val) in &assignments {
+                                row.cols.insert(col.clone(), val.clone());
+                            }
+                            drop(g);
+                            self.buf_pool.invalidate(table);
+                            return Ok(Self::empty_ok("UPDATE 1"));
+                        }
+                    }
+                    return Ok(Self::empty_ok("UPDATE 0"));
+                }
+            }
+        }
+
+        // Collect matching row IDs (read-only phase).
+        let row_ids: Vec<i64> = if let Some(t) = g.get(table) {
+            if let Some(ref pred) = where_pred {
+                if let Some(row_id) = Self::parse_simple_id_eq_predicate(pred) {
+                    let lookup_start = if Self::native_profile_enabled() {
+                        Some(Instant::now())
+                    } else {
+                        None
+                    };
+                    let result = if t.rows.contains_key(&row_id) {
+                        vec![row_id]
+                    } else {
+                        Vec::new()
+                    };
+                    if let Some(start) = lookup_start {
+                        Self::profile_ns(&self.native_profile.pk_lookup_ns, start.elapsed());
+                        self.native_profile
+                            .pk_lookup_count
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
+                    result
+                } else {
+                    let scan_start = if Self::native_profile_enabled() {
+                        Some(Instant::now())
+                    } else {
+                        None
+                    };
+                    let result = t
+                        .rows
+                        .iter()
+                        .filter(|(id, row)| Self::eval_condition_for_row(**id, row, pred))
+                        .map(|(&id, _)| id)
+                        .collect();
+                    if let Some(start) = scan_start {
+                        Self::profile_ns(&self.native_profile.table_scan_ns, start.elapsed());
+                    }
+                    result
+                }
+            } else {
+                t.rows.keys().copied().collect()
+            }
+        } else {
+            Vec::new()
+        };
+
         if !row_ids.is_empty() {
             if let Some(t) = g.get(table) {
                 assignments = Self::coerce_assignments_for_table(t, &assignments)?;
             }
 
             // FK ON UPDATE constraint check (RESTRICT / NO ACTION).
-            for &row_id in &row_ids {
-                self.check_fk_on_update(&g, table, row_id, &assignments)?;
+            if has_fk_references {
+                for &row_id in &row_ids {
+                    self.check_fk_on_update(&g, table, row_id, &assignments)?;
+                }
             }
 
             // Column constraints (NOT NULL, UNIQUE, CHECK) validation.
@@ -10585,23 +12503,14 @@ impl NativeSqlEngine {
                             .collect::<Vec<_>>()
                     })
                     .unwrap_or_default();
-                let snapshot_indexes = {
-                    let indexes = self.index_mgr.indexes.read();
-                    indexes.values().any(|tree| {
-                        tree.table == table
-                            && tree.columns.iter().any(|idx_col| {
-                                assignments
-                                    .iter()
-                                    .any(|(changed_col, _)| changed_col == idx_col)
-                            })
-                    })
-                };
-                self.record_transaction_row_undos(table, undo_rows, snapshot_indexes)?;
+                self.record_transaction_row_undos(table, undo_rows, false)?;
             }
 
             // FK ON UPDATE actions (CASCADE / SET NULL / SET DEFAULT) on child tables.
-            for &row_id in &row_ids {
-                self.apply_fk_on_update(&mut g, table, row_id, &assignments);
+            if has_fk_references {
+                for &row_id in &row_ids {
+                    self.apply_fk_on_update(&mut g, table, row_id, &assignments);
+                }
             }
 
             // Apply the update to parent rows.
@@ -12429,9 +14338,219 @@ impl NativeSqlEngine {
         let where_idx = up.find("WHERE").ok_or("Invalid SELECT WHERE")?;
         let (pred_part, limit) = Self::split_trailing_limit_clause(&s[where_idx + 5..]);
 
+        if let Some((col_name, query)) = Self::parse_fts_predicate(pred_part) {
+            let top_k = limit.unwrap_or(10);
+            let entry = self
+                .inverted_catalog
+                .find_for_column(table, &col_name)
+                .ok_or_else(|| {
+                    format!(
+                        "no inverted index on {}.{} for full-text search",
+                        table, col_name
+                    )
+                })?;
+            let hits = entry.search(&query, top_k);
+            let select_cols = Self::parse_select_columns(s);
+            let g = self.tables.read().map_err(|_| "table lock poisoned")?;
+            let t = g
+                .get(table)
+                .ok_or(format!("table \"{}\" does not exist", table))?;
+            let out_cols: Vec<String> =
+                if select_cols.is_empty() || (select_cols.len() == 1 && select_cols[0] == "*") {
+                    t.columns.clone()
+                } else {
+                    select_cols
+                };
+            let columns: Vec<(String, i32, i16)> = out_cols
+                .iter()
+                .map(|c| {
+                    let o = t.col_oid(c);
+                    let len = match o {
+                        oid::INT8 => 8i16,
+                        oid::FLOAT8 => 8,
+                        _ => -1,
+                    };
+                    (c.clone(), o, len)
+                })
+                .collect();
+            let row_ids: Vec<i64> = hits.iter().map(|hit| hit.doc_id as i64).collect();
+            let rows_out = Self::materialize_indexed_projection_rows(t, &row_ids, &out_cols);
+            let row_count = rows_out.len();
+            return Ok(QueryResult {
+                columns,
+                rows: rows_out,
+                command_tag: format!("SELECT {}", row_count),
+            });
+        }
+
+        if let Some((col, path, value)) = Self::parse_json_path_eq_predicate(pred_part) {
+            let entry = self.ensure_json_path_index(table, &col, &path)?;
+            let mut row_ids = entry.lookup(&value);
+            if let Some(lim) = limit {
+                row_ids.truncate(lim);
+            }
+            let select_cols = Self::parse_select_columns(s);
+            let g = self.tables.read().map_err(|_| "table lock poisoned")?;
+            let t = g
+                .get(table)
+                .ok_or(format!("table \"{}\" does not exist", table))?;
+            let out_cols: Vec<String> =
+                if select_cols.is_empty() || (select_cols.len() == 1 && select_cols[0] == "*") {
+                    t.columns.clone()
+                } else {
+                    select_cols
+                };
+            let columns: Vec<(String, i32, i16)> = out_cols
+                .iter()
+                .map(|c| {
+                    let o = t.col_oid(c);
+                    let len = match o {
+                        oid::INT8 => 8i16,
+                        oid::FLOAT8 => 8,
+                        _ => -1,
+                    };
+                    (c.clone(), o, len)
+                })
+                .collect();
+            let rows_out = Self::materialize_indexed_projection_rows(t, &row_ids, &out_cols);
+            let row_count = rows_out.len();
+            return Ok(QueryResult {
+                columns,
+                rows: rows_out,
+                command_tag: format!("SELECT {}", row_count),
+            });
+        }
+
         // M-17: Support LIKE / ILIKE predicates.
         let pred_up = pred_part.to_ascii_uppercase();
         if pred_up.contains(" LIKE ") || pred_up.contains(" ILIKE ") {
+            if let Some((col_name, needle)) = Self::parse_like_contains_predicate(pred_part) {
+                let is_ilike = pred_up.contains(" ILIKE ");
+                let select_cols = Self::parse_select_columns(s);
+                let id_only =
+                    select_cols.len() == 1 && (select_cols[0] == "id" || select_cols[0] == "*");
+                let g = self.tables.read().map_err(|_| "table lock poisoned")?;
+                let t = g
+                    .get(table)
+                    .ok_or(format!("table \"{}\" does not exist", table))?;
+                let out_cols: Vec<String> =
+                    if select_cols.is_empty() || (select_cols.len() == 1 && select_cols[0] == "*") {
+                        t.columns.clone()
+                    } else {
+                        select_cols
+                    };
+                let columns: Vec<(String, i32, i16)> = out_cols
+                    .iter()
+                    .map(|c| {
+                        let o = t.col_oid(c);
+                        let len = match o {
+                            oid::INT8 => 8i16,
+                            oid::FLOAT8 => 8,
+                            _ => -1,
+                        };
+                        (c.clone(), o, len)
+                    })
+                    .collect();
+
+                let table_rows = t.rows.len();
+                let use_direct_id_scan =
+                    id_only && out_cols == vec!["id".to_string()] && limit.is_none();
+                if use_direct_id_scan {
+                    let rows_out = if let Some(entry) = self.trigram_catalog.find(table, &col_name) {
+                        if entry.should_scan_table(&needle, table_rows) {
+                            materialize_like_contains_id_rows(
+                                t, &col_name, &needle, is_ilike, limit,
+                            )
+                        } else {
+                            let mut row_ids = entry.search_contains(&needle);
+                            if row_ids.len() * 2 > table_rows {
+                                materialize_like_contains_id_rows(
+                                    t, &col_name, &needle, is_ilike, limit,
+                                )
+                            } else {
+                                if !entry.contains_match_is_exact(&needle) {
+                                    row_ids.retain(|row_id| {
+                                        t.rows.get(row_id).and_then(|row| {
+                                            row.cols.get(col_name.as_str()).map(|c| {
+                                                like_literal_contains(
+                                                    &c.as_text(),
+                                                    &needle,
+                                                    is_ilike,
+                                                )
+                                            })
+                                        })
+                                        .unwrap_or(false)
+                                    });
+                                }
+                                row_ids
+                                    .iter()
+                                    .map(|id| vec![Some(id.to_string().into_bytes())])
+                                    .collect()
+                            }
+                        }
+                    } else {
+                        materialize_like_contains_id_rows(
+                            t, &col_name, &needle, is_ilike, limit,
+                        )
+                    };
+                    let row_count = rows_out.len();
+                    return Ok(QueryResult {
+                        columns,
+                        rows: rows_out,
+                        command_tag: format!("SELECT {}", row_count),
+                    });
+                }
+
+                let mut row_ids: Vec<i64> = Vec::new();
+                if let Some(entry) = self.trigram_catalog.find(table, &col_name) {
+                    if entry.should_scan_table(&needle, table_rows) {
+                        row_ids = collect_like_contains_row_ids(
+                            t, &col_name, &needle, is_ilike, limit, false,
+                        );
+                    } else {
+                        let exact_trigram = entry.contains_match_is_exact(&needle);
+                        row_ids = entry.search_contains(&needle);
+                        if row_ids.len() * 2 > table_rows {
+                            row_ids = collect_like_contains_row_ids(
+                                t, &col_name, &needle, is_ilike, limit, false,
+                            );
+                        } else if !exact_trigram {
+                            row_ids.retain(|row_id| {
+                                t.rows.get(row_id).and_then(|row| {
+                                    row.cols
+                                        .get(col_name.as_str())
+                                        .map(|c| {
+                                            like_literal_contains(&c.as_text(), &needle, is_ilike)
+                                        })
+                                })
+                                .unwrap_or(false)
+                            });
+                        }
+                        if let Some(lim) = limit {
+                            row_ids.truncate(lim);
+                        }
+                    }
+                } else {
+                    row_ids = collect_like_contains_row_ids(
+                        t, &col_name, &needle, is_ilike, limit, false,
+                    );
+                }
+
+                let rows_out = if id_only && out_cols == vec!["id".to_string()] {
+                    row_ids
+                        .iter()
+                        .map(|id| vec![Some(id.to_string().into_bytes())])
+                        .collect()
+                } else {
+                    Self::materialize_indexed_projection_rows(t, &row_ids, &out_cols)
+                };
+                let row_count = rows_out.len();
+                return Ok(QueryResult {
+                    columns,
+                    rows: rows_out,
+                    command_tag: format!("SELECT {}", row_count),
+                });
+            }
             let is_ilike = pred_up.contains(" ILIKE ");
             let keyword = if is_ilike { " ILIKE " } else { " LIKE " };
             let kw_idx = pred_up.find(keyword).unwrap();
@@ -12604,6 +14723,8 @@ impl NativeSqlEngine {
                 let g = self.tables.read().map_err(|_| "table lock poisoned")?;
                 if let Some(t) = g.get(table) {
                     let select_cols = Self::parse_select_columns(s);
+                    let id_only_query =
+                        select_cols.len() == 1 && select_cols[0] == "id";
                     let out_cols: Vec<String> = if select_cols.is_empty()
                         || (select_cols.len() == 1 && select_cols[0] == "*")
                     {
@@ -12630,8 +14751,13 @@ impl NativeSqlEngine {
                     } else {
                         &row_ids
                     };
-                    let rows_out =
-                        Self::materialize_indexed_projection_rows(t, materialize_ids, &out_cols);
+                    let id_only =
+                        id_only_query && out_cols == vec!["id".to_string()];
+                    let rows_out = if id_only {
+                        materialize_id_rows(materialize_ids)
+                    } else {
+                        Self::materialize_indexed_projection_rows(t, materialize_ids, &out_cols)
+                    };
                     let row_count = rows_out.len();
                     return Ok(QueryResult {
                         columns,
@@ -12716,10 +14842,10 @@ impl NativeSqlEngine {
         let total_start = std::time::Instant::now();
         let mut parse_planner_ms = 0.0;
         let vector_literal_parse_ms;
-        let cache_lookup_ms;
-        let distance_scan_ms;
-        let topk_selection_ms;
-        let result_materialization_ms;
+        let mut cache_lookup_ms = 0.0;
+        let mut distance_scan_ms = 0.0;
+        let mut topk_selection_ms = 0.0;
+        let mut result_materialization_ms = 0.0;
 
         let parse_start = std::time::Instant::now();
         let up = s.to_ascii_uppercase();
@@ -12806,8 +14932,8 @@ impl NativeSqlEngine {
             0
         };
 
-        let g = self.tables.read().map_err(|_| "table lock poisoned")?;
-        let t = g
+        let mut table_guard = self.tables.read().map_err(|_| "table lock poisoned")?;
+        let mut t = table_guard
             .get(&table as &str)
             .ok_or(format!("table \"{}\" does not exist", table))?;
 
@@ -12831,8 +14957,168 @@ impl NativeSqlEngine {
             .collect();
         parse_planner_ms += parse_start.elapsed().as_secs_f64() * 1000.0;
 
-        // pgvector ORDER BY distance operators are exact unless an explicit ANN index
-        // path is selected. Keep this path exact so all three metrics match brute force.
+        let dist_metric = match op {
+            DistOp::L2 => DistanceMetric::L2,
+            DistOp::Cosine => DistanceMetric::Cosine,
+            DistOp::InnerProduct => DistanceMetric::InnerProduct,
+        };
+        const HNSW_ADAPTIVE_MIN_ROWS: usize = 256;
+        let want = offset + limit;
+        let table_row_count = t.rows.len();
+        let id_only_knn = out_cols.len() == 1 && out_cols[0] == "id";
+        fn vector_candidate_cmp(a: (f32, i64), b: (f32, i64)) -> std::cmp::Ordering {
+            a.0.partial_cmp(&b.0)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.1.cmp(&b.1))
+        }
+
+        let adaptive_hnsw =
+            where_pred_str.is_none() && table_row_count >= HNSW_ADAPTIVE_MIN_ROWS && want > 0;
+        if adaptive_hnsw {
+            let table_owned = table.clone();
+            let vec_col_owned = vec_col.clone();
+            let dim_hint = self
+                .vector_hnsw_catalog
+                .find(&table_owned, &vec_col_owned, dist_metric)
+                .map(|entry| entry.meta.dim)
+                .filter(|dim| *dim > 0)
+                .unwrap_or_else(|| Self::vector_column_dim(t, &vec_col_owned));
+
+            if dim_hint == 0 {
+                let result = QueryResult {
+                    columns,
+                    rows: Vec::new(),
+                    command_tag: "SELECT 0".to_string(),
+                };
+                let total_ms = total_start.elapsed().as_secs_f64() * 1000.0;
+                let timing = if include_timing {
+                    serde_json::json!({
+                        "sql_parse_planner_ms": parse_planner_ms,
+                        "vector_literal_parse_ms": vector_literal_parse_ms,
+                        "cache_lookup_ms": 0.0,
+                        "distance_scan_ms": 0.0,
+                        "topk_selection_ms": 0.0,
+                        "result_materialization_ms": 0.0,
+                        "total_ms": total_ms,
+                        "rows_scanned": 0,
+                        "dim": 0,
+                        "limit": limit,
+                        "offset": offset,
+                        "hnsw_path": true
+                    })
+                } else {
+                    serde_json::Value::Null
+                };
+                return Ok((result, timing));
+            }
+            if dim_hint != query_vec.len() {
+                return Err(format!(
+                    "vector dimension mismatch: column {} has dim {}, query has dim {}",
+                    vec_col, dim_hint, query_vec.len()
+                ));
+            }
+
+            let mut hnsw_hits: Option<Vec<(i64, f32)>> = None;
+            let mut hnsw_rows_scanned = table_row_count;
+            if let Some(entry) = self
+                .vector_hnsw_catalog
+                .find(&table_owned, &vec_col_owned, dist_metric)
+            {
+                if entry.len() > 0 {
+                    hnsw_rows_scanned = entry.len();
+                    hnsw_hits = Some(entry.search(&query_vec, want));
+                }
+            }
+            if hnsw_hits.is_none() {
+                drop(table_guard);
+                if let Ok(entry) = self.ensure_vector_hnsw_index(
+                    &table_owned,
+                    &vec_col_owned,
+                    dist_metric,
+                    dim_hint,
+                ) {
+                    if entry.len() > 0 {
+                        hnsw_rows_scanned = entry.len();
+                        hnsw_hits = Some(entry.search(&query_vec, want));
+                    }
+                }
+                table_guard = self.tables.read().map_err(|_| "table lock poisoned")?;
+                t = table_guard
+                    .get(&table_owned as &str)
+                    .ok_or(format!("table \"{}\" does not exist", table_owned))?;
+            }
+            if let Some(hits) = hnsw_hits {
+                let topk_start = std::time::Instant::now();
+                let mut scored: Vec<(f32, i64)> =
+                    hits.into_iter().map(|(id, dist)| (dist, id)).collect();
+                if scored.len() > 1 {
+                    scored.sort_by(|a, b| vector_candidate_cmp(*a, *b));
+                }
+                topk_selection_ms = topk_start.elapsed().as_secs_f64() * 1000.0;
+
+                let materialize_start = std::time::Instant::now();
+                let rows_out: Vec<Vec<Option<Vec<u8>>>> = if id_only_knn {
+                    scored
+                        .iter()
+                        .skip(offset)
+                        .take(limit)
+                        .map(|(_dist, id)| vec![Some(id.to_string().into_bytes())])
+                        .collect()
+                } else {
+                    scored
+                        .iter()
+                        .skip(offset)
+                        .take(limit)
+                        .map(|(_dist, id)| {
+                            let row = t.rows.get(id);
+                            out_cols
+                                .iter()
+                                .map(|c| {
+                                    if c == "id" {
+                                        row.and_then(|r| r.cols.get(c.as_str()))
+                                            .and_then(Self::cell_query_bytes)
+                                            .or_else(|| Some(id.to_string().into_bytes()))
+                                    } else {
+                                        row.and_then(|r| r.cols.get(c.as_str()))
+                                            .map(|v| v.as_text().into_bytes())
+                                            .or_else(|| Some(b"".to_vec()))
+                                    }
+                                })
+                                .collect()
+                        })
+                        .collect()
+                };
+                result_materialization_ms = materialize_start.elapsed().as_secs_f64() * 1000.0;
+                let row_count = rows_out.len();
+                let result = QueryResult {
+                    columns,
+                    rows: rows_out,
+                    command_tag: format!("SELECT {}", row_count),
+                };
+                let total_ms = total_start.elapsed().as_secs_f64() * 1000.0;
+                let timing = if include_timing {
+                    serde_json::json!({
+                        "sql_parse_planner_ms": parse_planner_ms,
+                        "vector_literal_parse_ms": vector_literal_parse_ms,
+                        "cache_lookup_ms": cache_lookup_ms,
+                        "distance_scan_ms": distance_scan_ms,
+                        "topk_selection_ms": topk_selection_ms,
+                        "result_materialization_ms": result_materialization_ms,
+                        "total_ms": total_ms,
+                        "rows_scanned": hnsw_rows_scanned,
+                        "dim": dim_hint,
+                        "limit": limit,
+                        "offset": offset,
+                        "hnsw_path": true
+                    })
+                } else {
+                    serde_json::Value::Null
+                };
+                return Ok((result, timing));
+            }
+        }
+
+        // Exact scan fallback: build flat vector cache only when HNSW is unavailable.
         let cache_start = std::time::Instant::now();
         let vector_cache = self.cached_vector_column(&table, &vec_col, t);
         cache_lookup_ms = cache_start.elapsed().as_secs_f64() * 1000.0;
@@ -12892,14 +15178,8 @@ impl NativeSqlEngine {
                     .then_with(|| self.id.cmp(&other.id))
             }
         }
-        fn vector_candidate_cmp(a: (f32, i64), b: (f32, i64)) -> std::cmp::Ordering {
-            a.0.partial_cmp(&b.0)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| a.1.cmp(&b.1))
-        }
 
         let scan_start = std::time::Instant::now();
-        let want = offset + limit;
         let use_heap = want > 0 && want < vector_cache.row_ids.len();
         let mut scored: Vec<(f32, i64)> = if use_heap {
             Vec::new()
@@ -13114,6 +15394,19 @@ impl NativeSqlEngine {
         }
         out.push(']');
         out
+    }
+
+    fn vector_column_dim(table: &NativeTable, column: &str) -> usize {
+        for row in table.rows.values() {
+            if let Some(cell) = row.cols.get(column) {
+                if let Some(vec) = Self::parse_vector_cell(cell) {
+                    if !vec.is_empty() {
+                        return vec.len();
+                    }
+                }
+            }
+        }
+        0
     }
 
     fn parse_vector_cell(cell: &Cell) -> Option<Vec<f32>> {
@@ -15803,10 +18096,15 @@ mod tests {
             .unwrap();
 
         let batch = engine
-            .execute_columnar_internal("SELECT id, score, ratio FROM zc_numeric ORDER BY id LIMIT 2")
+            .execute_columnar_internal(
+                "SELECT id, score, ratio FROM zc_numeric ORDER BY id LIMIT 2",
+            )
             .unwrap();
 
-        assert_eq!(batch.classification, ColumnarClassification::ZeroCopyNumericOnly);
+        assert_eq!(
+            batch.classification,
+            ColumnarClassification::ZeroCopyNumericOnly
+        );
         assert_eq!(batch.row_count, 2);
         assert!(batch.columns.iter().all(|col| col.zero_copy));
         match &batch.columns[1].data {
@@ -15836,7 +18134,10 @@ mod tests {
             .execute_columnar_internal("SELECT label FROM zc_utf8 ORDER BY id LIMIT 2")
             .unwrap();
 
-        assert_eq!(batch.classification, ColumnarClassification::ZeroCopyUtf8OffsetsData);
+        assert_eq!(
+            batch.classification,
+            ColumnarClassification::ZeroCopyUtf8OffsetsData
+        );
         match &batch.columns[0].data {
             NativeColumnData::Utf8 { offsets, data, .. } => {
                 assert_eq!(&offsets[..], &[0, 2, 5]);
@@ -17283,6 +19584,381 @@ mod tests {
                 vec![2]
             );
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn per_commit_sync_open_datasync_recovers_on_unix() {
+        let dir = std::env::temp_dir().join(format!(
+            "qm_open_datasync_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        {
+            let engine = NativeSqlEngine::with_data_dir(dir.clone());
+            engine.set_wal_sync_policy("per_commit_sync").unwrap();
+            #[cfg(unix)]
+            assert!(
+                engine
+                    .wal_open_datasync
+                    .load(std::sync::atomic::Ordering::Relaxed),
+                "persistent WAL should open with O_DSYNC on Unix"
+            );
+            engine
+                .execute("CREATE TABLE odsync_wal (id INTEGER PRIMARY KEY, v INTEGER)")
+                .unwrap();
+            engine
+                .execute("INSERT INTO odsync_wal (id, v) VALUES (1, 10)")
+                .unwrap();
+            engine.execute("BEGIN").unwrap();
+            engine
+                .execute("UPDATE odsync_wal SET v = 42 WHERE id = 1")
+                .unwrap();
+            engine.execute("COMMIT").unwrap();
+            assert!(engine.wal_sync_count() >= 2);
+        }
+        {
+            let engine = NativeSqlEngine::with_data_dir(dir.clone());
+            assert_eq!(
+                sorted_ids_from_sql(&engine, "SELECT id FROM odsync_wal WHERE v = 42"),
+                vec![1]
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn relaxed_os_buffered_policy_flushes_without_syncing_at_return() {
+        let dir = std::env::temp_dir().join(format!(
+            "qm_relaxed_os_buffered_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        {
+            let engine = NativeSqlEngine::with_data_dir(dir.clone());
+            engine.set_wal_sync_policy("relaxed_os_buffered").unwrap();
+            engine
+                .execute("CREATE TABLE relaxed_wal (id INTEGER PRIMARY KEY, v INTEGER)")
+                .unwrap();
+            engine
+                .execute("INSERT INTO relaxed_wal (id, v) VALUES (1, 10)")
+                .unwrap();
+            engine.execute("BEGIN").unwrap();
+            engine
+                .execute("UPDATE relaxed_wal SET v = 11 WHERE id = 1")
+                .unwrap();
+            engine.execute("COMMIT").unwrap();
+            assert_eq!(engine.wal_sync_count(), 0);
+            engine.wal_sync().unwrap();
+            assert_eq!(engine.wal_sync_count(), 1);
+        }
+        {
+            let engine = NativeSqlEngine::with_data_dir(dir.clone());
+            assert_eq!(
+                sorted_ids_from_sql(&engine, "SELECT id FROM relaxed_wal WHERE v = 11"),
+                vec![1]
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn per_commit_sync_data_policy_syncs_at_return_and_recovers() {
+        let dir = std::env::temp_dir().join(format!(
+            "qm_per_commit_sync_data_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        {
+            let engine = NativeSqlEngine::with_data_dir(dir.clone());
+            engine.set_wal_sync_policy("per_commit_sync_data").unwrap();
+            engine
+                .execute("CREATE TABLE sync_data_wal (id INTEGER PRIMARY KEY, v INTEGER)")
+                .unwrap();
+            engine
+                .execute("INSERT INTO sync_data_wal (id, v) VALUES (1, 10)")
+                .unwrap();
+            engine.execute("BEGIN").unwrap();
+            engine
+                .execute("UPDATE sync_data_wal SET v = 12 WHERE id = 1")
+                .unwrap();
+            engine.execute("COMMIT").unwrap();
+            assert_eq!(engine.wal_sync_count(), 3);
+        }
+        {
+            let engine = NativeSqlEngine::with_data_dir(dir.clone());
+            assert_eq!(
+                sorted_ids_from_sql(&engine, "SELECT id FROM sync_data_wal WHERE v = 12"),
+                vec![1]
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn group_commit_sync_single_commit_recovers_after_return() {
+        let dir = std::env::temp_dir().join(format!(
+            "qm_group_commit_single_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        {
+            let engine = NativeSqlEngine::with_data_dir(dir.clone());
+            engine.set_wal_sync_policy("group_commit_sync").unwrap();
+            engine
+                .execute("CREATE TABLE gc_single (id INTEGER PRIMARY KEY, v INTEGER)")
+                .unwrap();
+            engine
+                .execute("INSERT INTO gc_single (id, v) VALUES (1, 20)")
+                .unwrap();
+            assert!(engine.wal_sync_count() >= 2);
+            let (groups, commits, max_group, _, _, _) = engine.group_commit_snapshot();
+            assert!(groups >= 2);
+            assert!(commits >= 2);
+            assert!(max_group >= 1);
+        }
+        {
+            let engine = NativeSqlEngine::with_data_dir(dir.clone());
+            assert_eq!(
+                sorted_ids_from_sql(&engine, "SELECT id FROM gc_single WHERE v = 20"),
+                vec![1]
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn group_commit_sync_batches_concurrent_wal_appends_and_recovers() {
+        use std::sync::{Arc, Barrier};
+        use std::thread;
+
+        let dir = std::env::temp_dir().join(format!(
+            "qm_group_commit_batch_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let engine = NativeSqlEngine::with_data_dir(dir.clone());
+        engine.set_wal_sync_policy("per_commit_sync").unwrap();
+        engine
+            .execute("CREATE TABLE gc_batch (id INTEGER PRIMARY KEY, v INTEGER)")
+            .unwrap();
+        let before_syncs = engine.wal_sync_count();
+        engine.set_wal_sync_policy("group_commit_sync").unwrap();
+
+        let workers = 16usize;
+        let barrier = Arc::new(Barrier::new(workers));
+        let mut handles = Vec::new();
+        for id in 0..workers {
+            let session = engine.new_session();
+            let barrier = Arc::clone(&barrier);
+            handles.push(thread::spawn(move || {
+                barrier.wait();
+                session
+                    .wal_append(&format!(
+                        "INSERT INTO gc_batch (id, v) VALUES ({}, {})",
+                        id + 1,
+                        (id + 1) * 10
+                    ))
+                    .unwrap();
+                session.wal_group_commit_sync().unwrap();
+            }));
+        }
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        let group_syncs = engine.wal_sync_count().saturating_sub(before_syncs);
+        let (groups, commits, max_group, _, _, _) = engine.group_commit_snapshot();
+        assert!(commits >= workers as u64);
+        assert!(groups >= 1);
+        assert!(max_group >= 2, "expected at least one grouped sync");
+        assert!(
+            group_syncs < workers as u64,
+            "expected fewer syncs than commits, got {group_syncs} syncs for {workers} commits"
+        );
+
+        drop(engine);
+        let engine = NativeSqlEngine::with_data_dir(dir.clone());
+        assert_eq!(
+            sorted_ids_from_sql(&engine, "SELECT id FROM gc_batch ORDER BY id"),
+            (1..=workers as i64).collect::<Vec<_>>()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn group_commit_sync_rollback_does_not_append_transaction_wal() {
+        let dir = std::env::temp_dir().join(format!(
+            "qm_group_commit_rollback_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        {
+            let engine = NativeSqlEngine::with_data_dir(dir.clone());
+            engine.set_wal_sync_policy("group_commit_sync").unwrap();
+            engine
+                .execute("CREATE TABLE gc_rollback (id INTEGER PRIMARY KEY, v INTEGER)")
+                .unwrap();
+            let syncs_after_create = engine.wal_sync_count();
+            engine.execute("BEGIN").unwrap();
+            engine
+                .execute("INSERT INTO gc_rollback (id, v) VALUES (1, 30)")
+                .unwrap();
+            engine.execute("ROLLBACK").unwrap();
+            assert_eq!(engine.wal_sync_count(), syncs_after_create);
+        }
+        {
+            let engine = NativeSqlEngine::with_data_dir(dir.clone());
+            assert_eq!(
+                sorted_ids_from_sql(&engine, "SELECT id FROM gc_rollback WHERE v = 30"),
+                Vec::<i64>::new()
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn per_commit_sync_returns_error_on_sync_failure() {
+        let dir = std::env::temp_dir().join(format!(
+            "qm_per_commit_sync_fail_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let engine = NativeSqlEngine::with_data_dir(dir.clone());
+        engine.set_wal_sync_policy("per_commit_sync").unwrap();
+        engine
+            .execute("CREATE TABLE sync_fail (id INTEGER PRIMARY KEY, v INTEGER)")
+            .unwrap();
+        let before = engine.wal_sync_count();
+        engine.inject_next_wal_sync_all_failure_for_test();
+        let err = engine
+            .execute("INSERT INTO sync_fail (id, v) VALUES (1, 10)")
+            .unwrap_err();
+        assert!(err.contains("injected WAL sync_all failure"));
+        assert_eq!(engine.wal_sync_count(), before);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn per_commit_sync_data_returns_error_on_sync_data_failure() {
+        let dir = std::env::temp_dir().join(format!(
+            "qm_per_commit_sync_data_fail_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let engine = NativeSqlEngine::with_data_dir(dir.clone());
+        engine.set_wal_sync_policy("per_commit_sync_data").unwrap();
+        engine
+            .execute("CREATE TABLE sync_data_fail (id INTEGER PRIMARY KEY, v INTEGER)")
+            .unwrap();
+        let before = engine.wal_sync_count();
+        engine.inject_next_wal_sync_data_failure_for_test();
+        let err = engine
+            .execute("INSERT INTO sync_data_fail (id, v) VALUES (1, 10)")
+            .unwrap_err();
+        assert!(err.contains("injected WAL sync_data failure"));
+        assert_eq!(engine.wal_sync_count(), before);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn relaxed_os_buffered_returns_error_on_flush_failure() {
+        let dir = std::env::temp_dir().join(format!(
+            "qm_relaxed_flush_fail_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let engine = NativeSqlEngine::with_data_dir(dir.clone());
+        engine.set_wal_sync_policy("relaxed_os_buffered").unwrap();
+        engine
+            .execute("CREATE TABLE relaxed_fail (id INTEGER PRIMARY KEY, v INTEGER)")
+            .unwrap();
+        engine.inject_next_wal_flush_failure_for_test();
+        let err = engine
+            .execute("INSERT INTO relaxed_fail (id, v) VALUES (1, 10)")
+            .unwrap_err();
+        assert!(err.contains("injected WAL flush failure"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn group_commit_sync_propagates_sync_failure_to_all_waiters_and_recovers_later() {
+        use std::sync::{Arc, Barrier};
+        use std::thread;
+
+        let dir = std::env::temp_dir().join(format!(
+            "qm_group_commit_fail_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let engine = NativeSqlEngine::with_data_dir(dir.clone());
+        engine.set_wal_sync_policy("per_commit_sync").unwrap();
+        engine
+            .execute("CREATE TABLE gc_fail (id INTEGER PRIMARY KEY, v INTEGER)")
+            .unwrap();
+        engine.set_wal_sync_policy("group_commit_sync").unwrap();
+        engine.inject_next_wal_sync_all_failure_for_test();
+
+        let workers = 8usize;
+        let barrier = Arc::new(Barrier::new(workers));
+        let mut handles = Vec::new();
+        for id in 0..workers {
+            let session = engine.new_session();
+            let barrier = Arc::clone(&barrier);
+            handles.push(thread::spawn(move || {
+                barrier.wait();
+                session
+                    .wal_append(&format!(
+                        "INSERT INTO gc_fail (id, v) VALUES ({}, {})",
+                        id + 1,
+                        id + 1
+                    ))
+                    .unwrap();
+                session.wal_group_commit_sync()
+            }));
+        }
+        for handle in handles {
+            let result = handle.join().unwrap();
+            assert!(result
+                .unwrap_err()
+                .contains("injected WAL sync_all failure"));
+        }
+
+        let before_success = engine.wal_sync_count();
+        engine
+            .execute("INSERT INTO gc_fail (id, v) VALUES (100, 100)")
+            .unwrap();
+        assert_eq!(engine.wal_sync_count(), before_success + 1);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

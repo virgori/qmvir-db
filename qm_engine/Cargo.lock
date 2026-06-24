@@ -1872,7 +1872,7 @@ dependencies = [
 
 [[package]]
 name = "qm_engine"
-version = "5.4.0"
+version = "5.4.2"
 dependencies = [
  "aes-gcm",
  "ahash 0.8.12",
@@ -1893,6 +1893,7 @@ dependencies = [
  "io-uring",
  "libc",
  "lz4_flex",
+ "memchr",
  "memmap2",
  "num_cpus",
  "parking_lot",

@@ -30,7 +30,7 @@ use std::time::Instant;
 
 // ── Distance metrics (SIMD-accelerated) ─────────────────────────────────
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum DistanceMetric {
     L2,
     Cosine,
@@ -1926,8 +1926,8 @@ impl HnswIndex {
         Some(external_id)
     }
 
-    /// Search for top-k nearest neighbors.
-    pub fn search(&self, query: &[f32], top_k: usize) -> Vec<(u32, f32)> {
+    /// Search for top-k nearest neighbors with an explicit ef_search bound.
+    pub fn search_with_ef(&self, query: &[f32], top_k: usize, ef_search: usize) -> Vec<(u32, f32)> {
         assert_eq!(query.len(), self.dim, "Vector dimension mismatch");
         assert!(
             query.iter().all(|x| x.is_finite()),
@@ -1943,15 +1943,11 @@ impl HnswIndex {
         let entry = self.entry_point.unwrap();
         let mut curr = entry;
 
-        // Descend from top level to level 1
         for lev in (1..=self.max_level).rev() {
             curr = self.greedy_closest(curr, query, lev);
         }
 
-        // Search at level 0 with ef_search
-        let search_ef = self
-            .config
-            .ef_search
+        let search_ef = ef_search
             .max(top_k)
             .saturating_add(self.tombstone_count())
             .min(self.nodes.len().max(top_k));
@@ -1971,6 +1967,17 @@ impl HnswIndex {
         results.sort_by(|a, b| cmp_distance_id(a.1, a.0, b.1, b.0));
         results.truncate(top_k);
         results
+    }
+
+    /// Search for top-k nearest neighbors.
+    pub fn search(&self, query: &[f32], top_k: usize) -> Vec<(u32, f32)> {
+        let ef = self
+            .config
+            .ef_search
+            .max(top_k)
+            .saturating_add(self.tombstone_count())
+            .min(self.nodes.len().max(top_k));
+        self.search_with_ef(query, top_k, ef)
     }
 
     pub fn search_with_stats(
@@ -2058,6 +2065,11 @@ impl HnswIndex {
     /// Number of vectors in the index.
     pub fn len(&self) -> usize {
         self.live_count()
+    }
+
+    /// Export live (external_id, vector) pairs for checkpointing.
+    pub fn live_vectors_snapshot(&self) -> Vec<(u32, Vec<f32>)> {
+        self.live_vectors()
     }
 
     pub fn is_empty(&self) -> bool {

@@ -10,7 +10,7 @@
 use crc32fast::Hasher as CrcHasher;
 use parking_lot::RwLock;
 use std::cmp::Ordering;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicU32, Ordering as AtomicOrd};
 use std::sync::Arc;
 
@@ -371,6 +371,8 @@ pub struct BPlusTree {
     pages: RwLock<BTreeMap<u32, Arc<RwLock<BPlusNode>>>>,
     /// Monotonic page id allocator.
     next_page: AtomicU32,
+    /// O(1) postings for string equality (duplicate-heavy columns like tags).
+    str_postings: RwLock<HashMap<String, Vec<RowId>>>,
 }
 
 impl BPlusTree {
@@ -394,6 +396,7 @@ impl BPlusTree {
             root: RwLock::new(root_id),
             pages: RwLock::new(pages),
             next_page: AtomicU32::new(1),
+            str_postings: RwLock::new(HashMap::new()),
         }
     }
 
@@ -418,7 +421,42 @@ impl BPlusTree {
             root: RwLock::new(root_id),
             pages: RwLock::new(pages),
             next_page: AtomicU32::new(self.next_page.load(AtomicOrd::Acquire)),
+            str_postings: RwLock::new(self.str_postings.read().clone()),
         }
+    }
+
+    fn note_str_insert(&self, key: &str, row_id: RowId) {
+        self.str_postings
+            .write()
+            .entry(key.to_string())
+            .or_default()
+            .push(row_id);
+    }
+
+    fn note_str_remove(&self, key: &str, row_id: RowId) {
+        let mut postings = self.str_postings.write();
+        if let Some(list) = postings.get_mut(key) {
+            list.retain(|id| *id != row_id);
+            if list.is_empty() {
+                postings.remove(key);
+            }
+        }
+    }
+
+    pub fn rebuild_str_postings(&self) {
+        let mut map: HashMap<String, Vec<RowId>> = HashMap::new();
+        let pages = self.pages.read();
+        for node_arc in pages.values() {
+            let node = node_arc.read();
+            if let BPlusNode::Leaf(leaf) = &*node {
+                for entry in &leaf.entries {
+                    if let IndexKey::Str(s) = &entry.key {
+                        map.entry(s.clone()).or_default().push(entry.row_id);
+                    }
+                }
+            }
+        }
+        *self.str_postings.write() = map;
     }
 
     /// Return all leaf entries currently present in this index.
@@ -464,6 +502,12 @@ impl BPlusTree {
 
     /// Find all RowIds matching a borrowed lookup key.
     pub fn search_ref(&self, key: IndexLookupKeyRef<'_>) -> Vec<RowId> {
+        if let IndexLookupKeyRef::Str(s) = key {
+            if let Some(postings) = self.str_postings.read().get(s) {
+                return postings.clone();
+            }
+        }
+
         let mut leaf_id = self.find_leaf_for_ref(key);
 
         // Duplicate keys can span multiple leaves after splits. `find_leaf_for`
@@ -610,16 +654,17 @@ impl BPlusTree {
     /// Insert a (key, row_id) pair. Returns `true` if a split propagated to root.
     /// Uses CAS-like root pointer check to handle concurrent root splits safely.
     pub fn insert(&self, key: IndexKey, row_id: RowId) -> bool {
+        let str_key = match &key {
+            IndexKey::Str(s) => Some(s.clone()),
+            _ => None,
+        };
         let root_id = *self.root.read();
-        match self.insert_into(root_id, key, row_id) {
+        let split = match self.insert_into(root_id, key, row_id) {
             InsertResult::Done => false,
             InsertResult::Split {
                 median,
                 new_page_id,
             } => {
-                // A split propagated all the way to the root.
-                // Acquire root write lock and check if another thread already
-                // changed the root (concurrent root split).
                 let mut root_guard = self.root.write();
                 if *root_guard == root_id {
                     // Root unchanged — create a new root containing both halves.
@@ -649,7 +694,11 @@ impl BPlusTree {
                     true
                 }
             }
+        };
+        if let Some(s) = str_key {
+            self.note_str_insert(&s, row_id);
         }
+        split
     }
 
     fn insert_into(&self, page_id: u32, key: IndexKey, row_id: RowId) -> InsertResult {
@@ -808,6 +857,16 @@ impl BPlusTree {
     /// H-09 FIX: Properly retries when key migrates due to concurrent split.
     /// Follows leaf chain (next_leaf) to find migrated entries.
     pub fn delete(&self, key: &IndexKey, row_id: RowId) -> bool {
+        let removed = self.delete_impl(key, row_id);
+        if removed {
+            if let IndexKey::Str(s) = key {
+                self.note_str_remove(s, row_id);
+            }
+        }
+        removed
+    }
+
+    fn delete_impl(&self, key: &IndexKey, row_id: RowId) -> bool {
         let start_leaf_id = self.find_leaf_for(key);
 
         let mut current = Some(start_leaf_id);
@@ -936,6 +995,7 @@ impl BPlusTree {
 
         if leaf_page_ids.len() == 1 {
             *root_guard = leaf_page_ids[0];
+            self.rebuild_str_postings();
             return;
         }
 
@@ -973,6 +1033,7 @@ impl BPlusTree {
             seps = new_seps;
         }
         *root_guard = child_ids[0];
+        self.rebuild_str_postings();
     }
 
     // ── Stats ───────────────────────────────────────────────────────────
@@ -1084,6 +1145,11 @@ impl BPlusTree {
             root: RwLock::new(root_id),
             pages: RwLock::new(pages),
             next_page: AtomicU32::new(max_id + 1),
+            str_postings: RwLock::new(HashMap::new()),
+        })
+        .map(|tree| {
+            tree.rebuild_str_postings();
+            tree
         })
     }
 
