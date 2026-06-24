@@ -1,7 +1,8 @@
 # QMvir — Giáo trình Hướng dẫn Sử dụng
 ## Từ Cơ bản đến Nâng cao — Tận dụng Tối đa Hiệu năng
 
-> **Phiên bản:** 1.0.0 · **Ngày:** 2026-03-08  
+> **Phiên bản:** 6.0.0 · **Ngày:** 2026-06-24  
+> **Hiệu năng:** xem thêm [QMVIR_PERFORMANCE_GUIDE_VI.md](docs/QMVIR_PERFORMANCE_GUIDE_VI.md)
 > **Yêu cầu:** Python ≥ 3.11 · macOS / Linux · RAM ≥ 2 GB
 
 ---

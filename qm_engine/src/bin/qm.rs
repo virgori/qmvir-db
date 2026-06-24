@@ -75,7 +75,7 @@ fn run_benchtest(profile: &str, json: bool) {
     let mut results: Vec<BenchResult> = Vec::new();
 
     if !json {
-        println!("QMvir Benchmark Suite v5.4.0");
+        println!("QMvir Benchmark Suite v6.0.0");
         println!("Profile: {profile}  Iterations: {iterations}");
         println!("{}", "=".repeat(70));
     }

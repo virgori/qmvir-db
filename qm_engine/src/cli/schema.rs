@@ -129,21 +129,22 @@ pub fn generate_migration_sql(diff: &SchemaDiff, source_b: &NativeSqlEngine) -> 
     sql
 }
 
-fn coltype_sql(ct: &crate::gateway::native_sql::ColType) -> &'static str {
+fn coltype_sql(ct: &crate::gateway::native_sql::ColType) -> String {
     match ct {
-        crate::gateway::native_sql::ColType::Integer => "INT",
-        crate::gateway::native_sql::ColType::Float8 => "FLOAT",
-        crate::gateway::native_sql::ColType::Text => "TEXT",
-        crate::gateway::native_sql::ColType::Boolean => "BOOLEAN",
-        crate::gateway::native_sql::ColType::Timestamp => "TIMESTAMP",
-        crate::gateway::native_sql::ColType::Date => "DATE",
-        crate::gateway::native_sql::ColType::Interval => "INTERVAL",
-        crate::gateway::native_sql::ColType::Json => "JSON",
-        crate::gateway::native_sql::ColType::Jsonb => "JSONB",
-        crate::gateway::native_sql::ColType::Bytea => "BYTEA",
-        crate::gateway::native_sql::ColType::Uuid => "UUID",
-        crate::gateway::native_sql::ColType::Array => "TEXT[]",
-        crate::gateway::native_sql::ColType::Numeric => "NUMERIC",
+        crate::gateway::native_sql::ColType::Integer => "INT".to_string(),
+        crate::gateway::native_sql::ColType::Float8 => "FLOAT".to_string(),
+        crate::gateway::native_sql::ColType::Text => "TEXT".to_string(),
+        crate::gateway::native_sql::ColType::Boolean => "BOOLEAN".to_string(),
+        crate::gateway::native_sql::ColType::Timestamp => "TIMESTAMP".to_string(),
+        crate::gateway::native_sql::ColType::Date => "DATE".to_string(),
+        crate::gateway::native_sql::ColType::Interval => "INTERVAL".to_string(),
+        crate::gateway::native_sql::ColType::Json => "JSON".to_string(),
+        crate::gateway::native_sql::ColType::Jsonb => "JSONB".to_string(),
+        crate::gateway::native_sql::ColType::Bytea => "BYTEA".to_string(),
+        crate::gateway::native_sql::ColType::Uuid => "UUID".to_string(),
+        crate::gateway::native_sql::ColType::Array => "TEXT[]".to_string(),
+        crate::gateway::native_sql::ColType::Numeric => "NUMERIC".to_string(),
+        crate::gateway::native_sql::ColType::Vector(dim) => format!("VECTOR({dim})"),
     }
 }
 

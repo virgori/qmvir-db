@@ -232,6 +232,12 @@ def render_markdown(report: dict[str, Any]) -> str:
             f"- **Mixed workload:** {m.get('throughput_ops_sec', 0):.0f} ops/s "
             f"({m.get('read_ratio', 0.7):.0%} reads)"
         )
+    if summary.get("release_gate"):
+        g = summary["release_gate"]
+        lines.append(
+            f"- **P0 release gate:** {g.get('passed', 0)}/{g.get('total', 0)} passed "
+            f"(ok={g.get('ok', False)})"
+        )
 
     lines.extend(["", "## OLTP vs PostgreSQL (median p50)", "", "| Workload | QM p50 | PG p50 | Winner |", "|---|---:|---:|---|"])
     oltp = report.get("sections", {}).get("oltp_vs_postgres", {})
@@ -260,6 +266,30 @@ def render_markdown(report: dict[str, Any]) -> str:
         qm_s = f"{qm:.3f} ms" if isinstance(qm, (int, float)) else "n/a"
         pg_s = f"{pg:.3f} ms" if isinstance(pg, (int, float)) else "n/a"
         lines.append(f"| {name} | {qm_s} | {pg_s} | {ratio_s} | {winner} |")
+
+    lines.extend(
+        [
+            "",
+            "## P0 Release Gate",
+            "",
+        ]
+    )
+    gate = report.get("sections", {}).get("release_gate_realdata", {})
+    if gate:
+        for name, section in gate.get("sections", {}).items():
+            ok = section.get("ok", section.get("skipped"))
+            status = "PASS" if ok else ("SKIP" if section.get("skipped") else "FAIL")
+            lines.append(f"- **{name}:** {status}")
+        lines.append("")
+        bulk = gate.get("sections", {}).get("bulk_ingest", {})
+        for prof in bulk.get("profiles", []):
+            rps = prof.get("ingest_rows_per_sec", 0)
+            lines.append(
+                f"  - bulk {prof.get('rows_target', '?')}: "
+                f"{rps:.0f} rows/s ingest, index {prof.get('index_build_elapsed_s', 0):.1f}s"
+            )
+    else:
+        lines.append("- (not run)")
 
     lines.extend(
         [

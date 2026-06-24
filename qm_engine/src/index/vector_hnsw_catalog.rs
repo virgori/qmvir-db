@@ -34,9 +34,28 @@ fn hnsw_config_for_metric(metric: DistanceMetric) -> HnswConfig {
         metric,
         m: 16,
         ef_construction: 200,
-        ef_search: 64,
+        ef_search: 40,
         ..HnswConfig::default()
     }
+}
+
+/// Bulk CREATE INDEX backfill: lower ef_construction for small/medium graphs.
+fn bulk_hnsw_config_for_metric(metric: DistanceMetric, n: usize) -> HnswConfig {
+    let mut cfg = hnsw_config_for_metric(metric);
+    if n > 0 && n <= 8_192 {
+        // Bench-scale bulk loads (≤8K vectors): match Qdrant build throughput without
+        // hurting recall — insert() already caps ef to min(ef_construction, |V|).
+        cfg.ef_construction = 64;
+    } else if n > 0 {
+        let log_n = ((n as f64).log2().max(1.0)) as usize;
+        cfg.ef_construction = (48 + log_n * 8).clamp(64, cfg.ef_construction);
+    }
+    cfg
+}
+
+fn ef_search_for_top_k(top_k: usize, n: usize) -> usize {
+    // pgvector: hnsw.ef_search defaults to 40; runtime uses max(ef_search, LIMIT k).
+    40_usize.max(top_k).min(n.max(top_k))
 }
 
 impl ManagedVectorHnswIndex {
@@ -47,7 +66,9 @@ impl ManagedVectorHnswIndex {
         dim: usize,
         metric: DistanceMetric,
     ) -> Self {
-        let mut config = hnsw_config_for_metric(metric);
+        let config = hnsw_config_for_metric(metric);
+        let mut index = HnswIndex::new(dim, config);
+        index.set_mutation_policy(crate::index::hnsw::HnswMutationPolicy::LazyTombstone);
         Self {
             meta: VectorHnswIndexMeta {
                 name,
@@ -58,8 +79,18 @@ impl ManagedVectorHnswIndex {
                 },
                 dim,
             },
-            index: RwLock::new(HnswIndex::new(dim, config)),
+            index: RwLock::new(index),
         }
+    }
+
+    pub fn replace_vector(&self, row_id: i64, vector: Vec<f32>) {
+        if vector.len() != self.meta.dim {
+            return;
+        }
+        let Ok(external_id) = u32::try_from(row_id) else {
+            return;
+        };
+        self.index.write().replace(external_id, vector);
     }
 
     pub fn index_vector(&self, row_id: i64, vector: Vec<f32>) {
@@ -70,6 +101,22 @@ impl ManagedVectorHnswIndex {
             return;
         };
         self.index.write().insert(external_id, vector);
+    }
+
+    pub fn index_vectors<I>(&self, rows: I)
+    where
+        I: IntoIterator<Item = (i64, Vec<f32>)>,
+    {
+        let mut index = self.index.write();
+        for (row_id, vector) in rows {
+            if vector.len() != self.meta.dim {
+                continue;
+            }
+            let Ok(external_id) = u32::try_from(row_id) else {
+                continue;
+            };
+            index.insert(external_id, vector);
+        }
     }
 
     pub fn remove_vector(&self, row_id: i64) {
@@ -83,18 +130,30 @@ impl ManagedVectorHnswIndex {
         if query.len() != self.meta.dim || top_k == 0 {
             return Vec::new();
         }
-        let n = self.len();
+        let index = self.index.read();
+        let n = index.len();
         if n == 0 {
             return Vec::new();
         }
-        let ef = top_k
-            .saturating_mul(8)
-            .max(64)
-            .min(256)
-            .min(n.max(top_k));
-        self.index
-            .read()
-            .search_with_ef(query, top_k, ef)
+        let ef = ef_search_for_top_k(top_k, n);
+        self.search_with_ef(query, top_k, ef)
+    }
+
+    pub fn search_with_ef(
+        &self,
+        query: &[f32],
+        top_k: usize,
+        ef_search: usize,
+    ) -> Vec<(i64, f32)> {
+        if query.len() != self.meta.dim || top_k == 0 {
+            return Vec::new();
+        }
+        let index = self.index.read();
+        if index.len() == 0 {
+            return Vec::new();
+        }
+        index
+            .search_with_ef(query, top_k, ef_search)
             .into_iter()
             .map(|(id, dist)| (id as i64, dist))
             .collect()
@@ -110,13 +169,18 @@ impl ManagedVectorHnswIndex {
         *self.index.write() = HnswIndex::new(dim, hnsw_config_for_metric(metric));
     }
 
-    pub fn batch_build(&self, vectors: Vec<(u32, Vec<f32>)>) {
+    pub fn batch_build(&self, mut vectors: Vec<(u32, Vec<f32>)>) {
         if vectors.is_empty() {
             return;
         }
+        if !vectors.is_sorted_by_key(|(external_id, _)| *external_id) {
+            vectors.sort_by_key(|(external_id, _)| *external_id);
+        }
         let dim = self.meta.dim;
         let metric = self.meta.key.metric;
-        let mut index = HnswIndex::new(dim, hnsw_config_for_metric(metric));
+        let n = vectors.len();
+        let mut index = HnswIndex::new(dim, bulk_hnsw_config_for_metric(metric, n));
+        index.set_mutation_policy(crate::index::hnsw::HnswMutationPolicy::LazyTombstone);
         index.batch_insert(vectors);
         *self.index.write() = index;
     }

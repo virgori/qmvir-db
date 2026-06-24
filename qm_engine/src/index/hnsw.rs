@@ -754,9 +754,13 @@ struct HnswVectorSnapshot {
 }
 
 impl HnswIndex {
+    /// Fixed seed for geometric level assignment — insert order must be sorted by
+    /// external id (`batch_build`) so graphs are reproducible across platforms.
+    const LEVEL_RNG_SEED: u64 = 0x4E4E_5F42_454E_4348;
+
     pub fn new(dim: usize, config: HnswConfig) -> Self {
         let level_mult = 1.0 / (config.m as f64).ln();
-        let level_rng_state = 0x9e37_79b9_7f4a_7c15
+        let level_rng_state = Self::LEVEL_RNG_SEED
             ^ ((dim as u64) << 32)
             ^ ((config.m as u64) << 16)
             ^ config.m0 as u64
@@ -1467,168 +1471,21 @@ impl HnswIndex {
 
     /// Batch insert multiple vectors using Rayon parallelism.
     ///
-    /// Strategy:
-    ///   1. Insert a seed graph sequentially (first √n vectors) to establish connectivity.
-    ///   2. For remaining vectors, parallelize the expensive neighbor search using Rayon,
-    ///      then apply graph mutations sequentially.
+    /// Bulk insert with the same graph semantics as repeated [`Self::insert`].
     ///
-    /// The neighbor search (distance computations) dominates insert cost. By parallelizing
-    /// it across CPU cores while keeping graph writes serial, we get near-linear speedup
-    /// on the compute-bound portion.
+    /// A prior fast path only wired level-0 neighbors from a stale snapshot and skipped
+    /// multi-level greedy descent; that broke ANN recall on CREATE INDEX backfills.
     pub fn batch_insert(&mut self, vectors: Vec<(u32, Vec<f32>)>) {
-        if vectors.is_empty() {
-            return;
-        }
-
         let n = vectors.len();
-        // Seed size: √n for initial graph, min 64 to ensure good connectivity
-        let seed_size = ((n as f64).sqrt() as usize).max(64).min(n);
-
-        // Phase 1: Sequential seed insert (builds initial navigable graph)
-        for (id, vec) in vectors[..seed_size].iter() {
-            self.insert(*id, vec.clone());
+        if n > 0 {
+            self.nodes.reserve(n);
+            self.external_to_internal.reserve(n);
+            self.internal_to_external.reserve(n);
+            self.internal_generation.reserve(n);
+            self.latest_generation.reserve(n);
         }
-
-        if seed_size >= n {
-            return;
-        }
-
-        // Phase 2: Parallel neighbor search + sequential graph update
-        // Process in chunks to periodically refresh the graph state
-        let chunk_size = 512.max(seed_size);
-        let remaining = &vectors[seed_size..];
-
-        for chunk in remaining.chunks(chunk_size) {
-            // Pre-assign levels
-            let levels: Vec<usize> = chunk.iter().map(|_| self.random_level()).collect();
-
-            // Snapshot: grab vectors + neighbors for read-only parallel search
-            // We clone the node vectors into a flat structure for parallel access
-            let snapshot_nodes: Vec<(u32, Vec<f32>)> = self
-                .nodes
-                .iter()
-                .map(|(&id, n)| (id, n.vector.clone()))
-                .collect();
-
-            // Build a parallel-friendly lookup: id → index in snapshot_nodes
-            let id_to_idx: HashMap<u32, usize> = snapshot_nodes
-                .iter()
-                .enumerate()
-                .map(|(i, (id, _))| (*id, i))
-                .collect();
-
-            // For each vector in the chunk, find its neighbors in parallel
-            let config = self.config.clone();
-            let dim = self.dim;
-
-            // Parallel phase: compute neighbor lists for each new vector
-            let neighbor_plans: Vec<_> = chunk
-                .par_iter()
-                .zip(levels.par_iter())
-                .map(|((id, vector), &level)| {
-                    assert_eq!(vector.len(), dim, "Vector dimension mismatch");
-
-                    // Higher-level greedy descent is intentionally skipped for
-                    // buffered inserts; neighbor selection below still uses the
-                    // current snapshot and final graph repair happens on flush.
-
-                    // Search layer 0 for neighbors using brute-force over snapshot
-                    // This is the expensive part we're parallelizing
-                    let ef = config.ef_construction;
-                    let max_n = if level == 0 { config.m0 } else { config.m };
-
-                    // Approximate search: compute distances to all existing nodes
-                    // and take top ef_construction closest
-                    let mut dists: Vec<(u32, f32)> = snapshot_nodes
-                        .iter()
-                        .map(|(nid, nvec)| (*nid, compute_distance(vector, nvec, &config.metric)))
-                        .collect();
-                    dists.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal));
-                    dists.truncate(ef);
-
-                    // Heuristic neighbor selection (inline, since we can't call self methods)
-                    let candidates_for_heuristic: Vec<(u32, f32, usize)> = dists
-                        .iter()
-                        .take(max_n * 2)
-                        .filter_map(|&(nid, dist)| id_to_idx.get(&nid).map(|&idx| (nid, dist, idx)))
-                        .collect();
-
-                    let mut selected: Vec<u32> = Vec::with_capacity(max_n);
-                    for &(cid, cdist, cidx) in &candidates_for_heuristic {
-                        if selected.len() >= max_n {
-                            break;
-                        }
-                        let cvec = &snapshot_nodes[cidx].1;
-                        let mut is_diverse = true;
-                        for &sid in &selected {
-                            if let Some(&sidx) = id_to_idx.get(&sid) {
-                                let svec = &snapshot_nodes[sidx].1;
-                                if compute_distance(cvec, svec, &config.metric) < cdist {
-                                    is_diverse = false;
-                                    break;
-                                }
-                            }
-                        }
-                        if is_diverse {
-                            selected.push(cid);
-                        }
-                    }
-                    // Fill remaining with closest if heuristic was too aggressive
-                    if selected.len() < max_n {
-                        for &(nid, _, _) in &candidates_for_heuristic {
-                            if selected.len() >= max_n {
-                                break;
-                            }
-                            if !selected.contains(&nid) {
-                                selected.push(nid);
-                            }
-                        }
-                    }
-
-                    (*id, vector.clone(), level, selected)
-                })
-                .collect();
-
-            // Sequential phase: apply graph mutations
-            for (id, vector, level, selected) in neighbor_plans {
-                let node = HnswNode {
-                    vector: vector.clone(),
-                    neighbors: vec![Vec::new(); level + 1],
-                };
-                self.nodes.insert(id, node);
-                self.generation_counter = self.generation_counter.saturating_add(1);
-                self.external_to_internal.insert(id, id);
-                self.internal_to_external.insert(id, id);
-                self.internal_generation.insert(id, self.generation_counter);
-                self.latest_generation.insert(id, self.generation_counter);
-                self.next_internal_node_id = self.next_internal_node_id.max(id.saturating_add(1));
-
-                let max_n_l0 = self.config.m0;
-                // Set node's level-0 neighbors
-                if let Some(node) = self.nodes.get_mut(&id) {
-                    if !node.neighbors.is_empty() {
-                        node.neighbors[0] = selected.clone();
-                    }
-                }
-
-                // Add bidirectional connections
-                for &neighbor_id in &selected {
-                    if let Some(neighbor) = self.nodes.get_mut(&neighbor_id) {
-                        if !neighbor.neighbors.is_empty() && !neighbor.neighbors[0].contains(&id) {
-                            neighbor.neighbors[0].push(id);
-                            if neighbor.neighbors[0].len() > max_n_l0 {
-                                let nv = neighbor.vector.clone();
-                                self.shrink_neighbors(neighbor_id, &nv, 0, max_n_l0);
-                            }
-                        }
-                    }
-                }
-
-                if level > self.max_level {
-                    self.max_level = level;
-                    self.entry_point = Some(id);
-                }
-            }
+        for (id, vec) in vectors {
+            self.insert(id, vec);
         }
     }
 
@@ -1949,9 +1806,26 @@ impl HnswIndex {
 
         let search_ef = ef_search
             .max(top_k)
-            .saturating_add(self.tombstone_count())
+            .saturating_add(self.tombstone_count().min(16))
             .min(self.nodes.len().max(top_k));
         let candidates = self.search_layer(curr, query, search_ef, 0);
+
+        if self.tombstone_count() == 0 {
+            let mut results: Vec<(u32, f32)> = candidates
+                .into_iter()
+                .filter_map(|candidate| {
+                    self.internal_to_external
+                        .get(&candidate.id)
+                        .copied()
+                        .map(|external_id| (external_id, candidate.distance))
+                })
+                .collect();
+            if results.len() > 1 {
+                results.sort_by(|a, b| cmp_distance_id(a.1, a.0, b.1, b.0));
+            }
+            results.truncate(top_k);
+            return results;
+        }
 
         let mut seen_external = AHashSet::new();
         let mut results = Vec::new();
@@ -3084,6 +2958,75 @@ mod tests {
             rows.len()
         );
         assert!(!rows.iter().any(|(id, _)| deleted.contains(id)));
+    }
+
+    #[test]
+    fn batch_build_is_deterministic_for_sorted_inserts() {
+        let config = HnswConfig {
+            metric: DistanceMetric::L2,
+            m: 16,
+            m0: 32,
+            ef_search: 80,
+            ef_construction: 120,
+        };
+        let vectors: Vec<(u32, Vec<f32>)> = (0..200u32)
+            .map(|id| {
+                (
+                    id,
+                    (0..8)
+                        .map(|dim| ((id as f32 + 1.0) * (dim as f32 + 0.25)).sin())
+                        .collect(),
+                )
+            })
+            .collect();
+        let query: Vec<f32> = (0..8)
+            .map(|dim| ((dim as f32 + 0.5) * 0.31).cos())
+            .collect();
+
+        let mut a = HnswIndex::new(8, config.clone());
+        a.batch_insert(vectors.clone());
+        let mut b = HnswIndex::new(8, config);
+        b.batch_insert(vectors);
+        let ann_a = a.search(&query, 10);
+        let ann_b = b.search(&query, 10);
+        assert_eq!(
+            ann_a.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+            ann_b.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+            "sorted batch_insert must produce identical graphs"
+        );
+    }
+
+    #[test]
+    fn batch_insert_matches_sequential_insert_recall() {
+        let config = HnswConfig {
+            metric: DistanceMetric::L2,
+            m: 12,
+            m0: 24,
+            ef_search: 80,
+            ef_construction: 120,
+        };
+        let mut vectors = Vec::new();
+        for id in 0..120 {
+            let vector = (0..8)
+                .map(|dim| ((id as f32 + 1.0) * (dim as f32 + 0.5)).sin())
+                .collect::<Vec<_>>();
+            vectors.push((id, vector));
+        }
+        let query = (0..8)
+            .map(|dim| ((dim as f32 + 3.25) * 0.37).cos())
+            .collect::<Vec<_>>();
+
+        let mut batch_idx = HnswIndex::new(8, config.clone());
+        batch_idx.batch_insert(vectors.clone());
+        let exact = exact_top_k(&vectors, &query, &config.metric, 10);
+        let ann = batch_idx.search(&query, 10);
+        let exact_ids: std::collections::HashSet<u32> = exact.iter().map(|(id, _)| *id).collect();
+        let hits = ann.iter().filter(|(id, _)| exact_ids.contains(id)).count();
+        let recall_at_10 = hits as f32 / exact.len() as f32;
+        assert!(
+            recall_at_10 >= 0.8,
+            "batch_insert recall@10={recall_at_10:.3} exact={exact:?} ann={ann:?}"
+        );
     }
 
     #[test]

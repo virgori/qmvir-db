@@ -7,6 +7,7 @@ import argparse
 import json
 import os
 import platform
+import sys
 import statistics
 import time
 from pathlib import Path
@@ -17,6 +18,10 @@ try:
     import psycopg2
 except ImportError as exc:  # pragma: no cover
     raise SystemExit("pip install psycopg2-binary") from exc
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+sys.path.insert(0, str(SCRIPT_DIR))
+from segment_benchmark_lib import attach_deployment  # noqa: E402
 
 
 def percentile(values: list[float], pct: float) -> float:
@@ -335,19 +340,24 @@ def run_search_benchmark(
 
     wins = sum(1 for c in comparisons if c.get("winner") == "QM")
     pg_wins = sum(1 for c in comparisons if c.get("winner") == "PostgreSQL")
-    return {
-        "rows": rows,
-        "environment": {"os": platform.platform(), "python": platform.python_version()},
-        "postgresql_settings": {
-            "server_version": pg_version,
-            "pgvector_installed": pgvector,
+    return attach_deployment(
+        {
+            "rows": rows,
+            "environment": {"os": platform.platform(), "python": platform.python_version()},
+            "postgresql_settings": {
+                "server_version": pg_version,
+                "pgvector_installed": pgvector,
+            },
+            "qm_note": "vector ORDER BY uses exact heap sort unless HNSW index in QM; PG vector uses HNSW when pgvector installed",
+            "comparison": comparisons,
+            "qm_wins": wins,
+            "postgresql_wins": pg_wins,
+            "total": len([c for c in comparisons if not c.get("skipped")]),
+            "competitor": "PostgreSQL",
+            "competitor_key": "postgresql",
         },
-        "qm_note": "vector ORDER BY uses exact heap sort unless HNSW index in QM; PG vector uses HNSW when pgvector installed",
-        "comparison": comparisons,
-        "qm_wins": wins,
-        "postgresql_wins": pg_wins,
-        "total": len([c for c in comparisons if not c.get("skipped")]),
-    }
+        "PostgreSQL",
+    )
 
 
 def main() -> None:

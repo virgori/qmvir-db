@@ -841,6 +841,7 @@ fn qm_type_name(pg_type: &str) -> &'static str {
         ColType::Uuid => "UUID",
         ColType::Array => "TEXT[]",
         ColType::Numeric => "NUMERIC",
+        ColType::Vector(_) => "VECTOR",
     }
 }
 
@@ -868,7 +869,8 @@ fn value_to_sql(value: &str, pg_type: &str) -> Result<String, String> {
         | ColType::Jsonb
         | ColType::Bytea
         | ColType::Uuid
-        | ColType::Array => normalize_text_literal(token),
+        | ColType::Array
+        | ColType::Vector(_) => normalize_text_literal(token),
     }
 }
 
@@ -896,7 +898,8 @@ fn copy_field_to_sql(field: &str, pg_type: &str) -> Result<String, String> {
         | ColType::Jsonb
         | ColType::Bytea
         | ColType::Uuid
-        | ColType::Array => Ok(quote_sql_string(&decoded)),
+        | ColType::Array
+        | ColType::Vector(_) => Ok(quote_sql_string(&decoded)),
     }
 }
 

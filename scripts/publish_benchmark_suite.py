@@ -180,6 +180,9 @@ def main() -> int:
     parser.add_argument("--scale-rows", type=int, nargs="*", default=None, help="e.g. 10000 100000")
     parser.add_argument("--oltp-iterations", type=int, default=None)
     parser.add_argument("--search-iterations", type=int, default=None)
+    parser.add_argument("--skip-release-gate", action="store_true", help="skip P0 bulk/vector/fidelity gates")
+    parser.add_argument("--prev-data-dir", type=Path, default=None, help="N-1 data_dir for cross-version gate")
+    parser.add_argument("--prev-wheel", type=str, default=None, help="prior wheel path (QM_PREV_WHEEL)")
     args = parser.parse_args()
 
     runs = args.runs if args.runs is not None else (1 if args.quick else 5)
@@ -259,6 +262,23 @@ def main() -> int:
         summary["concurrent_oltp"] = extras.get("concurrent_oltp", {})
         summary["mixed_workload"] = extras.get("mixed_workload", {})
 
+        if not args.skip_release_gate:
+            from release_gate_realdata import run_all as run_release_gate  # noqa: E402
+
+            print("[publish] P0 release gate: bulk, vector torture, fidelity, cross-version")
+            gate = run_release_gate(
+                qm_engine,
+                quick=args.quick,
+                prev_data_dir=args.prev_data_dir,
+                prev_wheel=args.prev_wheel or os.environ.get("QM_PREV_WHEEL"),
+            )
+            sections["release_gate_realdata"] = gate
+            summary["release_gate"] = {
+                "passed": gate.get("passed", 0),
+                "total": gate.get("total", 0),
+                "ok": gate.get("ok", False),
+            }
+
     env["max_rss_mb_end"] = max_rss_mb()
     env["peak_rss_mb"] = env["max_rss_mb_end"]
     env["postgres_available"] = postgres
@@ -286,6 +306,8 @@ def main() -> int:
     print(f"wrote {out_md}")
 
     if postgres and summary.get("oltp") and summary["oltp"].get("qm_wins", 0) == 0:
+        return 1
+    if summary.get("release_gate") and not summary["release_gate"].get("ok", True):
         return 1
     return 0
 

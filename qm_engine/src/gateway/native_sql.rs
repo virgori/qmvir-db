@@ -72,6 +72,129 @@ use std::arch::x86_64::*;
 /// Matches typical CPU L1 cache line utilization.
 const CHUNK_SIZE: usize = 1024;
 
+fn columnar_count_eq_i64(vals: &[i64], target: i64) -> i64 {
+    if vals.len() > CHUNK_SIZE {
+        vals.par_chunks(CHUNK_SIZE)
+            .map(|chunk| chunk.iter().filter(|&&v| v == target).count() as i64)
+            .sum()
+    } else {
+        vals.iter().filter(|&&v| v == target).count() as i64
+    }
+}
+
+/// Dense GROUP BY on small non-negative integer keys; keys are returned in ascending order.
+fn columnar_group_by_i64_dense(
+    grp_vals: &[i64],
+    sum_fv: Option<&[f64]>,
+    width: usize,
+) -> Vec<(i64, f64, i64)> {
+    let n_rows = grp_vals.len();
+    let mut sums = vec![0.0f64; width];
+    let mut counts = vec![0i64; width];
+
+    if n_rows > CHUNK_SIZE {
+        let partials: Vec<(Vec<f64>, Vec<i64>)> = (0..n_rows)
+            .into_par_iter()
+            .chunks(CHUNK_SIZE)
+            .map(|chunk| {
+                let mut local_sums = vec![0.0f64; width];
+                let mut local_counts = vec![0i64; width];
+                for i in chunk {
+                    let g = grp_vals[i] as usize;
+                    local_counts[g] += 1;
+                    if let Some(fv) = sum_fv {
+                        local_sums[g] += fv[i];
+                    }
+                }
+                (local_sums, local_counts)
+            })
+            .collect();
+        for (local_sums, local_counts) in partials {
+            for g in 0..width {
+                sums[g] += local_sums[g];
+                counts[g] += local_counts[g];
+            }
+        }
+    } else {
+        for i in 0..n_rows {
+            let g = grp_vals[i] as usize;
+            counts[g] += 1;
+            if let Some(fv) = sum_fv {
+                sums[g] += fv[i];
+            }
+        }
+    }
+
+    let mut out = Vec::with_capacity(width.min(256));
+    for g in 0..width {
+        if counts[g] > 0 {
+            out.push((g as i64, sums[g], counts[g]));
+        }
+    }
+    out
+}
+
+fn columnar_group_by_i64(
+    grp_vals: &[i64],
+    sum_fv: Option<&[f64]>,
+) -> AHashMap<i64, (f64, i64)> {
+    let n_rows = grp_vals.len();
+    if n_rows == 0 {
+        return AHashMap::new();
+    }
+    let mut min_g = i64::MAX;
+    let mut max_g = i64::MIN;
+    for &g in grp_vals {
+        min_g = min_g.min(g);
+        max_g = max_g.max(g);
+    }
+    // Dense accumulator when group keys are a small non-negative range (e.g. i % 100).
+    if min_g >= 0 && max_g < 4096 {
+        let width = (max_g as usize) + 1;
+        return columnar_group_by_i64_dense(grp_vals, sum_fv, width)
+            .into_iter()
+            .map(|(k, s, c)| (k, (s, c)))
+            .collect();
+    }
+
+    if n_rows > CHUNK_SIZE {
+        let chunks: Vec<AHashMap<i64, (f64, i64)>> = (0..n_rows)
+            .into_par_iter()
+            .chunks(CHUNK_SIZE)
+            .map(|chunk| {
+                let mut local: AHashMap<i64, (f64, i64)> = AHashMap::new();
+                for i in chunk {
+                    let entry = local.entry(grp_vals[i]).or_insert((0.0, 0));
+                    if let Some(fv) = sum_fv {
+                        entry.0 += fv[i];
+                    }
+                    entry.1 += 1;
+                }
+                local
+            })
+            .collect();
+        let mut merged: AHashMap<i64, (f64, i64)> = AHashMap::new();
+        for local in chunks {
+            for (k, (s, c)) in local {
+                let entry = merged.entry(k).or_insert((0.0, 0));
+                entry.0 += s;
+                entry.1 += c;
+            }
+        }
+        merged
+    } else {
+        let mut groups: AHashMap<i64, (f64, i64)> = AHashMap::new();
+        for i in 0..n_rows {
+            let entry = groups.entry(grp_vals[i]).or_insert((0.0, 0));
+            if let Some(fv) = sum_fv {
+                entry.0 += fv[i];
+            }
+            entry.1 += 1;
+        }
+        groups
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum Cell {
     Int(i64),
@@ -246,7 +369,13 @@ impl Cell {
                 s.push('}');
                 s
             }
-            Cell::Vector { text, .. } => text.clone(),
+            Cell::Vector { text, data, .. } => {
+                if text.is_empty() && !data.is_empty() {
+                    vector_literal_text(data)
+                } else {
+                    text.clone()
+                }
+            }
             Cell::Null => String::new(),
         }
     }
@@ -2058,6 +2187,8 @@ pub enum ColType {
     Interval,
     Date,
     Numeric,
+    /// `VECTOR(dim)` column type from CREATE TABLE.
+    Vector(usize),
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -2926,6 +3057,7 @@ impl NativeTable {
                     Some(ColType::Uuid) => oid::UUID,
                     Some(ColType::Array) => oid::TEXT, // array sent as text representation
                     Some(ColType::Numeric) => oid::NUMERIC,
+                    Some(ColType::Vector(_)) => oid::VECTOR,
                     Some(ColType::Text) | None => oid::TEXT,
                 };
             }
@@ -3608,6 +3740,20 @@ impl PyNativeSqlEngine {
             })
             .collect();
         Ok((columns, rows, result.command_tag))
+    }
+
+    #[pyo3(signature = (table, column, query, top_k, ef_search))]
+    pub fn bench_hnsw_knn_l2(
+        &self,
+        table: &str,
+        column: &str,
+        query: Vec<f32>,
+        top_k: usize,
+        ef_search: usize,
+    ) -> PyResult<Vec<i64>> {
+        self.inner
+            .bench_hnsw_knn_l2(table, column, &query, top_k, ef_search)
+            .map_err(pyo3::exceptions::PyRuntimeError::new_err)
     }
 
     pub fn execute_columnar(&self, py: Python<'_>, sql: &str) -> PyResult<PyObject> {
@@ -4496,6 +4642,22 @@ fn sql_like_match(text: &str, pattern: &str) -> bool {
     prev[pl]
 }
 
+const LIKE_COLUMNAR_SCAN_MIN_ROWS: usize = 256;
+
+fn vector_literal_text(v: &[f32]) -> String {
+    let mut out = String::with_capacity(2 + v.len() * 10);
+    out.push('[');
+    for (i, x) in v.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        use std::fmt::Write;
+        let _ = write!(out, "{}", x);
+    }
+    out.push(']');
+    out
+}
+
 /// Fast path for `LIKE '%literal%'` without `_` wildcards.
 fn like_literal_contains(haystack: &str, needle: &str, case_insensitive: bool) -> bool {
     if case_insensitive {
@@ -4505,6 +4667,44 @@ fn like_literal_contains(haystack: &str, needle: &str, case_insensitive: bool) -
     } else {
         memchr::memmem::find(haystack.as_bytes(), needle.as_bytes()).is_some()
     }
+}
+
+fn collect_like_contains_from_text_col(
+    ids: &[i64],
+    texts: &[String],
+    needle: &str,
+    is_ilike: bool,
+    limit: Option<usize>,
+) -> Vec<i64> {
+    debug_assert_eq!(ids.len(), texts.len());
+    if ids.is_empty() {
+        return Vec::new();
+    }
+
+    let mut row_ids: Vec<i64> = if ids.len() >= LIKE_COLUMNAR_SCAN_MIN_ROWS {
+        let needle = needle.to_string();
+        (0..ids.len())
+            .into_par_iter()
+            .filter_map(|i| {
+                like_literal_contains(&texts[i], &needle, is_ilike).then_some(ids[i])
+            })
+            .collect()
+    } else {
+        let mut out = Vec::new();
+        for i in 0..ids.len() {
+            if like_literal_contains(&texts[i], needle, is_ilike) {
+                out.push(ids[i]);
+                if limit.is_some_and(|lim| out.len() >= lim) {
+                    break;
+                }
+            }
+        }
+        out
+    };
+    if let Some(lim) = limit {
+        row_ids.truncate(lim);
+    }
+    row_ids
 }
 
 fn materialize_id_rows(row_ids: &[i64]) -> Vec<Vec<Option<Vec<u8>>>> {
@@ -4529,7 +4729,7 @@ fn collect_like_contains_row_ids(
     limit: Option<usize>,
     sort_results: bool,
 ) -> Vec<i64> {
-    if limit.is_none() && table.rows.len() >= 4096 {
+    if limit.is_none() && table.rows.len() >= LIKE_COLUMNAR_SCAN_MIN_ROWS {
         let col = col_name.to_string();
         let needle = needle.to_string();
         let mut row_ids: Vec<i64> = table
@@ -4561,47 +4761,6 @@ fn collect_like_contains_row_ids(
         }
     }
     row_ids
-}
-
-fn materialize_like_contains_id_rows(
-    table: &NativeTable,
-    col_name: &str,
-    needle: &str,
-    is_ilike: bool,
-    limit: Option<usize>,
-) -> Vec<Vec<Option<Vec<u8>>>> {
-    if table.rows.len() >= 4096 {
-        let col = col_name.to_string();
-        let needle = needle.to_string();
-        let mut rows: Vec<Vec<Option<Vec<u8>>>> = table
-            .rows
-            .par_iter()
-            .filter_map(|(id, row)| {
-                row.cols
-                    .get(col.as_str())
-                    .filter(|cell| like_literal_contains(&cell.as_text(), &needle, is_ilike))
-                    .map(|_| vec![Some(id.to_string().into_bytes())])
-            })
-            .collect();
-        if let Some(lim) = limit {
-            rows.truncate(lim);
-        }
-        return rows;
-    }
-
-    let mut rows_out = Vec::new();
-    for (&row_id, row) in &table.rows {
-        let Some(cell) = row.cols.get(col_name) else {
-            continue;
-        };
-        if like_literal_contains(&cell.as_text(), needle, is_ilike) {
-            rows_out.push(vec![Some(row_id.to_string().into_bytes())]);
-            if limit.is_some_and(|lim| rows_out.len() >= lim) {
-                break;
-            }
-        }
-    }
-    rows_out
 }
 
 /// Parsed CREATE INDEX specialized index kind.
@@ -5135,6 +5294,18 @@ impl NativeSqlEngine {
                         col_name
                     ))
                 }
+            }
+            (ColType::Vector(dim), cell) => {
+                let parsed = Self::parse_vector_cell(&cell).ok_or_else(|| {
+                    format!("invalid vector literal for column '{}'", col_name)
+                })?;
+                if parsed.len() != *dim {
+                    return Err(format!(
+                        "vector dimension mismatch for column {}: expected {}, got {}",
+                        col_name, dim, parsed.len()
+                    ));
+                }
+                Ok(Self::vector_cell(parsed))
             }
             (_, other) => Ok(other),
         }
@@ -6710,6 +6881,36 @@ impl NativeSqlEngine {
         self.buf_pool.put_cols(table_name, cc)
     }
 
+    fn like_contains_row_ids(
+        &self,
+        table: &str,
+        t: &NativeTable,
+        col_name: &str,
+        needle: &str,
+        is_ilike: bool,
+        limit: Option<usize>,
+    ) -> Vec<i64> {
+        let cc = self.get_or_build_cols(table, t);
+        if let Some(texts) = cc.text_cols.get(col_name) {
+            collect_like_contains_from_text_col(&cc.ids, texts, needle, is_ilike, limit)
+        } else {
+            collect_like_contains_row_ids(t, col_name, needle, is_ilike, limit, false)
+        }
+    }
+
+    fn materialize_like_contains_ids(
+        &self,
+        table: &str,
+        t: &NativeTable,
+        col_name: &str,
+        needle: &str,
+        is_ilike: bool,
+        limit: Option<usize>,
+    ) -> Vec<Vec<Option<Vec<u8>>>> {
+        let row_ids = self.like_contains_row_ids(table, t, col_name, needle, is_ilike, limit);
+        materialize_id_rows(&row_ids)
+    }
+
     pub fn execute(&self, sql: &str) -> Result<QueryResult, String> {
         if Self::native_profile_enabled() {
             let start = Instant::now();
@@ -7267,7 +7468,7 @@ impl NativeSqlEngine {
                     "FALSE".to_string()
                 }
             }
-            Cell::Vector { text, .. } => format!("'{}'::vector", text.replace('\'', "''")),
+            Cell::Vector { .. } => format!("'{}'::vector", cell.as_text().replace('\'', "''")),
             Cell::Text(_) | Cell::Json(_) | Cell::Uuid(_) | Cell::Numeric(_) | Cell::Array(_) => {
                 format!("'{}'", cell.as_text().replace('\'', "''"))
             }
@@ -8621,12 +8822,11 @@ impl NativeSqlEngine {
     fn vector_cell(data: Vec<f32>) -> Cell {
         let dim = data.len();
         let norm = data.iter().map(|x| x * x).sum::<f32>().sqrt();
-        let text = Self::vector_to_text(&data);
         Cell::Vector {
             dim,
             data,
             norm,
-            text,
+            text: String::new(),
         }
     }
 
@@ -8655,6 +8855,29 @@ impl NativeSqlEngine {
             .values()
             .filter_map(|row| row.cols.get(column))
             .find_map(Self::cell_vector_dim)
+    }
+
+    fn declared_vector_dim(table: &NativeTable, column: &str) -> Option<usize> {
+        let idx = table.columns.iter().position(|c| c == column)?;
+        match table.column_types.get(idx)? {
+            ColType::Vector(dim) => Some(*dim),
+            _ => None,
+        }
+    }
+
+    fn expected_vector_dim(table: &NativeTable, column: &str) -> Option<usize> {
+        Self::declared_vector_dim(table, column)
+            .or_else(|| Self::existing_vector_dim(table, column))
+    }
+
+    fn parse_vector_type_dim(type_str: &str) -> Option<usize> {
+        let up = type_str.to_ascii_uppercase();
+        if !up.starts_with("VECTOR") {
+            return None;
+        }
+        let start = up.find('(')?;
+        let end = up.find(')')?;
+        up[start + 1..end].trim().parse().ok()
     }
 
     fn validate_insert_vector_dimensions(
@@ -8688,7 +8911,7 @@ impl NativeSqlEngine {
         }
 
         for (col, dim) in incoming_dims {
-            if let Some(want) = Self::existing_vector_dim(table, &col) {
+            if let Some(want) = Self::expected_vector_dim(table, &col) {
                 if want != dim {
                     return Err(format!(
                         "vector dimension mismatch for column {}: expected {}, got {}",
@@ -8714,7 +8937,7 @@ impl NativeSqlEngine {
             let Some(dim) = Self::cell_vector_dim(cell) else {
                 continue;
             };
-            if let Some(want) = Self::existing_vector_dim(table, col) {
+            if let Some(want) = Self::expected_vector_dim(table, col) {
                 if want != dim {
                     return Err(format!(
                         "vector dimension mismatch for column {}: expected {}, got {}",
@@ -9377,6 +9600,8 @@ impl NativeSqlEngine {
                 let ct = if identity_mode.is_some() {
                     // SERIAL / BIGSERIAL → INTEGER (auto-increment handled at insert)
                     ColType::Integer
+                } else if let Some(dim) = Self::parse_vector_type_dim(&type_str) {
+                    ColType::Vector(dim)
                 } else if type_str.contains("INT") {
                     ColType::Integer
                 } else if type_str.contains("NUMERIC") || type_str.contains("DECIMAL") {
@@ -9620,7 +9845,9 @@ impl NativeSqlEngine {
                 .find("TYPE")
                 .ok_or("ALTER COLUMN: missing TYPE keyword")?;
             let type_str = after[type_kw_idx + 4..].trim().to_ascii_uppercase();
-            let new_ct = if type_str.contains("SERIAL") {
+            let new_ct = if let Some(dim) = Self::parse_vector_type_dim(&type_str) {
+                ColType::Vector(dim)
+            } else if type_str.contains("SERIAL") {
                 ColType::Integer
             } else if type_str.contains("INT") {
                 ColType::Integer
@@ -9686,6 +9913,13 @@ impl NativeSqlEngine {
                         ColType::Bytea => Cell::Bytes(cell.as_text().into_bytes()),
                         ColType::Uuid => Cell::Uuid(cell.as_text().to_ascii_lowercase()),
                         ColType::Array => Cell::Array(vec![cell]),
+                        ColType::Vector(_) => {
+                            if let Some(vec) = Self::parse_vector_cell(&cell) {
+                                Self::vector_cell(vec)
+                            } else {
+                                cell
+                            }
+                        }
                     };
                     row.cols.insert(col_name.to_string(), casted);
                 }
@@ -9949,13 +10183,24 @@ impl NativeSqlEngine {
             return Ok(());
         };
         let col = entry.meta.key.column.clone();
-        let mut vectors = Vec::new();
-        for (&row_id, row) in &t.rows {
-            if let Some(cell) = row.cols.get(col.as_str()) {
-                if let Some(vec) = Self::parse_vector_cell(cell) {
+        let cc = self.get_or_build_cols(table, t);
+        let mut vectors = Vec::with_capacity(cc.ids.len());
+        for &row_id in &cc.ids {
+            let Some(row) = t.rows.get(&row_id) else {
+                continue;
+            };
+            let Some(cell) = row.cols.get(col.as_str()) else {
+                continue;
+            };
+            if let Cell::Vector { data, dim, .. } = cell {
+                if *dim == data.len() {
                     if let Ok(external_id) = u32::try_from(row_id) {
-                        vectors.push((external_id, vec));
+                        vectors.push((external_id, data.clone()));
                     }
+                }
+            } else if let Some(vec) = Self::parse_vector_cell(cell) {
+                if let Ok(external_id) = u32::try_from(row_id) {
+                    vectors.push((external_id, vec));
                 }
             }
         }
@@ -9998,6 +10243,27 @@ impl NativeSqlEngine {
         Ok(entry)
     }
 
+    /// Benchmark helper: L2 HNSW top-k row ids with an explicit ef_search bound.
+    pub fn bench_hnsw_knn_l2(
+        &self,
+        table: &str,
+        column: &str,
+        query: &[f32],
+        top_k: usize,
+        ef_search: usize,
+    ) -> Result<Vec<i64>, String> {
+        if query.is_empty() || top_k == 0 {
+            return Ok(Vec::new());
+        }
+        let entry =
+            self.ensure_vector_hnsw_index(table, column, DistanceMetric::L2, query.len())?;
+        Ok(entry
+            .search_with_ef(query, top_k, ef_search)
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect())
+    }
+
     fn maintain_vector_hnsw_indexes_for_row(&self, table: &str, row_id: i64, row: &NativeRow) {
         for entry in self.vector_hnsw_catalog.indexes_for_table(table) {
             let col = &entry.meta.key.column;
@@ -10005,6 +10271,30 @@ impl NativeSqlEngine {
                 if let Some(vec) = Self::parse_vector_cell(cell) {
                     entry.index_vector(row_id, vec);
                 }
+            }
+        }
+    }
+
+    fn maintain_vector_hnsw_indexes_for_rows(
+        &self,
+        table: &str,
+        rows: &[(i64, &NativeRow)],
+    ) {
+        if rows.is_empty() {
+            return;
+        }
+        for entry in self.vector_hnsw_catalog.indexes_for_table(table) {
+            let col = &entry.meta.key.column;
+            let batch: Vec<(i64, Vec<f32>)> = rows
+                .iter()
+                .filter_map(|(row_id, row)| {
+                    let cell = row.cols.get(col.as_str())?;
+                    let vec = Self::parse_vector_cell(cell)?;
+                    Some((*row_id, vec))
+                })
+                .collect();
+            if !batch.is_empty() {
+                entry.index_vectors(batch);
             }
         }
     }
@@ -10193,7 +10483,10 @@ impl NativeSqlEngine {
                 let g = self.tables.read().map_err(|_| "table lock poisoned")?;
                 let dim = g
                     .get(&table)
-                    .and_then(|t| Self::existing_vector_dim(t, &col))
+                    .and_then(|t| {
+                        Self::declared_vector_dim(t, &col)
+                            .or_else(|| Self::existing_vector_dim(t, &col))
+                    })
                     .ok_or_else(|| {
                         format!(
                             "CREATE INDEX USING hnsw requires VECTOR column \"{}\" with at least one row",
@@ -10350,20 +10643,21 @@ impl NativeSqlEngine {
             let mut rows = Vec::new();
             for (tname, t) in g.iter() {
                 for (i, (col, ctype)) in t.columns.iter().zip(t.column_types.iter()).enumerate() {
-                    let dtype = match ctype {
-                        ColType::Integer => "bigint",
-                        ColType::Float8 => "double precision",
-                        ColType::Boolean => "boolean",
-                        ColType::Timestamp => "timestamp without time zone",
-                        ColType::Date => "date",
-                        ColType::Json => "json",
-                        ColType::Jsonb => "jsonb",
-                        ColType::Bytea => "bytea",
-                        ColType::Uuid => "uuid",
-                        ColType::Numeric => "numeric",
-                        ColType::Array => "ARRAY",
-                        ColType::Interval => "interval",
-                        ColType::Text => "text",
+                    let dtype: String = match ctype {
+                        ColType::Integer => "bigint".to_string(),
+                        ColType::Float8 => "double precision".to_string(),
+                        ColType::Boolean => "boolean".to_string(),
+                        ColType::Timestamp => "timestamp without time zone".to_string(),
+                        ColType::Date => "date".to_string(),
+                        ColType::Json => "json".to_string(),
+                        ColType::Jsonb => "jsonb".to_string(),
+                        ColType::Bytea => "bytea".to_string(),
+                        ColType::Uuid => "uuid".to_string(),
+                        ColType::Numeric => "numeric".to_string(),
+                        ColType::Array => "ARRAY".to_string(),
+                        ColType::Interval => "interval".to_string(),
+                        ColType::Text => "text".to_string(),
+                        ColType::Vector(dim) => format!("vector({dim})"),
                     };
                     let nullable = match t.constraints.get(i) {
                         Some(c) if c.not_null => "NO",
@@ -11002,6 +11296,42 @@ impl NativeSqlEngine {
         }
     }
 
+    fn columnar_count_from_predicate(
+        &self,
+        table: &str,
+        t: &NativeTable,
+        pred: &str,
+    ) -> Option<i64> {
+        let terms = Self::parse_fast_count_terms(pred)?;
+        if terms.len() != 1 {
+            return None;
+        }
+        let (col, target) = match &terms[0] {
+            FastCountTerm::Eq(col, Cell::Int(target)) => (col.as_str(), *target),
+            _ => return None,
+        };
+        let cc = self.get_or_build_cols(table, t);
+        let iv = cc.int_cols.get(col)?;
+        Some(columnar_count_eq_i64(iv, target))
+    }
+
+    fn columnar_count_index_key(
+        &self,
+        table: &str,
+        t: &NativeTable,
+        col: &str,
+        key: &IndexKey,
+    ) -> Option<i64> {
+        let cc = self.get_or_build_cols(table, t);
+        match key {
+            IndexKey::Integer(v) => cc
+                .int_cols
+                .get(col)
+                .map(|iv| columnar_count_eq_i64(iv, *v)),
+            _ => None,
+        }
+    }
+
     fn fast_count_predicate(table: &NativeTable, pred: &str) -> Option<i64> {
         let terms = Self::parse_fast_count_terms(pred)?;
         let mut count = 0i64;
@@ -11324,7 +11654,6 @@ impl NativeSqlEngine {
         self.maintain_json_path_indexes_for_row(table, row_id, row);
         self.maintain_trigram_indexes_for_row(table, row_id, row);
         self.maintain_vector_hnsw_indexes_for_row(table, row_id, row);
-        self.maybe_warm_adaptive_vector_hnsw_indexes(table);
     }
 
     fn maybe_warm_adaptive_vector_hnsw_indexes(&self, table: &str) {
@@ -11353,12 +11682,12 @@ impl NativeSqlEngine {
                 .collect::<Vec<_>>()
         };
         for (col, dim) in cols_dims {
-            for metric in [
-                DistanceMetric::L2,
-                DistanceMetric::Cosine,
-                DistanceMetric::InnerProduct,
-            ] {
-                let _ = self.ensure_vector_hnsw_index(table, &col, metric, dim);
+            if self
+                .vector_hnsw_catalog
+                .find(table, &col, DistanceMetric::L2)
+                .is_none()
+            {
+                let _ = self.ensure_vector_hnsw_index(table, &col, DistanceMetric::L2, dim);
             }
         }
     }
@@ -11432,15 +11761,17 @@ impl NativeSqlEngine {
                 self.maintain_trigram_indexes_for_row(table, row_id, &merged_row);
             }
         }
+        let mut updated_hnsw: HashSet<(String, DistanceMetric)> = HashSet::new();
         for entry in self.vector_hnsw_catalog.indexes_for_table(table) {
-            let touched = new_vals.iter().any(|(col, _)| col == &entry.meta.key.column);
-            if touched {
-                self.remove_vector_hnsw_indexes_for_row(table, row_id);
-                let mut merged_row = old_row.clone();
-                for (col, val) in new_vals {
-                    merged_row.cols.insert(col.clone(), val.clone());
+            let col = entry.meta.key.column.clone();
+            let metric = entry.meta.key.metric;
+            if !updated_hnsw.insert((col.clone(), metric)) {
+                continue;
+            }
+            if let Some((_, val)) = new_vals.iter().find(|(c, _)| c == &col) {
+                if let Some(vec) = Self::parse_vector_cell(val) {
+                    entry.replace_vector(row_id, vec);
                 }
-                self.maintain_vector_hnsw_indexes_for_row(table, row_id, &merged_row);
             }
         }
         if let Some(start) = profile_start {
@@ -11887,21 +12218,48 @@ impl NativeSqlEngine {
                 if value_groups.is_empty() {
                     return Err("Invalid INSERT VALUES".to_string());
                 }
-                let mut rows = Vec::with_capacity(value_groups.len());
-                for vals in &value_groups {
-                    let mut row_map: HashMap<String, Cell> = HashMap::with_capacity(cols.len());
-                    for (i, c) in cols.iter().enumerate() {
-                        row_map.insert(c.clone(), vals.get(i).cloned().unwrap_or(Cell::Null));
+                let rows: Vec<(i64, NativeRow)> = if value_groups.len() >= 128 {
+                    let cols = cols.clone();
+                    value_groups
+                        .par_iter()
+                        .map(|vals| {
+                            let mut row_map: HashMap<String, Cell> =
+                                HashMap::with_capacity(cols.len());
+                            for (i, c) in cols.iter().enumerate() {
+                                row_map.insert(
+                                    c.clone(),
+                                    vals.get(i).cloned().unwrap_or(Cell::Null),
+                                );
+                            }
+                            let id = row_map.get("id").map(|v| v.as_i64()).unwrap_or(0);
+                            (
+                                id,
+                                NativeRow {
+                                    cols: row_map,
+                                    last_modified_lsn: 0,
+                                },
+                            )
+                        })
+                        .collect()
+                } else {
+                    let mut rows = Vec::with_capacity(value_groups.len());
+                    for vals in &value_groups {
+                        let mut row_map: HashMap<String, Cell> =
+                            HashMap::with_capacity(cols.len());
+                        for (i, c) in cols.iter().enumerate() {
+                            row_map.insert(c.clone(), vals.get(i).cloned().unwrap_or(Cell::Null));
+                        }
+                        let id = row_map.get("id").map(|v| v.as_i64()).unwrap_or(0);
+                        rows.push((
+                            id,
+                            NativeRow {
+                                cols: row_map,
+                                last_modified_lsn: 0,
+                            },
+                        ));
                     }
-                    let id = row_map.get("id").map(|v| v.as_i64()).unwrap_or(0);
-                    rows.push((
-                        id,
-                        NativeRow {
-                            cols: row_map,
-                            last_modified_lsn: 0,
-                        },
-                    ));
-                }
+                    rows
+                };
                 rows
             };
 
@@ -12119,21 +12477,36 @@ impl NativeSqlEngine {
             }
         }
 
-        if !pending_inverted_ids.is_empty()
-            && (!self.inverted_catalog.indexes_for_table(table).is_empty()
+        if !pending_inverted_ids.is_empty() {
+            let has_inverted = !self.inverted_catalog.indexes_for_table(table).is_empty()
                 || !self.json_path_catalog.indexes_for_table(table).is_empty()
-                || !self.trigram_catalog.indexes_for_table(table).is_empty())
-        {
-            let g = self.tables.read().map_err(|_| "table lock poisoned")?;
-            if let Some(t) = g.get(table) {
-                for id in pending_inverted_ids {
-                    if let Some(row) = t.rows.get(&id) {
-                        self.maintain_inverted_indexes_for_row(table, id, row);
-                        self.maintain_json_path_indexes_for_row(table, id, row);
-                        self.maintain_trigram_indexes_for_row(table, id, row);
+                || !self.trigram_catalog.indexes_for_table(table).is_empty();
+            let has_hnsw = !self.vector_hnsw_catalog.indexes_for_table(table).is_empty();
+            if has_inverted || has_hnsw {
+                let g = self.tables.read().map_err(|_| "table lock poisoned")?;
+                if let Some(t) = g.get(table) {
+                    if has_hnsw && pending_inverted_ids.len() > 1 {
+                        let batch: Vec<(i64, &NativeRow)> = pending_inverted_ids
+                            .iter()
+                            .filter_map(|id| t.rows.get(id).map(|row| (*id, row)))
+                            .collect();
+                        self.maintain_vector_hnsw_indexes_for_rows(table, &batch);
+                    }
+                    for id in &pending_inverted_ids {
+                        if let Some(row) = t.rows.get(id) {
+                            if has_inverted {
+                                self.maintain_inverted_indexes_for_row(table, *id, row);
+                                self.maintain_json_path_indexes_for_row(table, *id, row);
+                                self.maintain_trigram_indexes_for_row(table, *id, row);
+                            }
+                            if has_hnsw && pending_inverted_ids.len() == 1 {
+                                self.maintain_vector_hnsw_indexes_for_row(table, *id, row);
+                            }
+                        }
                     }
                 }
             }
+            self.maybe_warm_adaptive_vector_hnsw_indexes(table);
         }
 
         // Maintain indexes for the actual inserted or updated rows.
@@ -12951,6 +13324,9 @@ impl NativeSqlEngine {
                 }
             }
         }
+        if up.contains("GROUP BY") {
+            return self.handle_select_group_by(s);
+        }
         // Handle ORDER BY ... LIMIT (TopN sort) or ORDER BY alone
         if up.contains(" ORDER BY ") {
             // Vector KNN: detect distance operators in the ORDER BY clause.
@@ -12962,9 +13338,6 @@ impl NativeSqlEngine {
         }
         if up.contains(" JOIN ") {
             return self.handle_select_join(s);
-        }
-        if up.contains("GROUP BY") {
-            return self.handle_select_group_by(s);
         }
         if up.starts_with("SELECT COUNT(*)") {
             return self.handle_select_count(s);
@@ -14351,6 +14724,7 @@ impl NativeSqlEngine {
                 })?;
             let hits = entry.search(&query, top_k);
             let select_cols = Self::parse_select_columns(s);
+            let id_only = select_cols.len() == 1 && select_cols[0] == "id";
             let g = self.tables.read().map_err(|_| "table lock poisoned")?;
             let t = g
                 .get(table)
@@ -14374,7 +14748,11 @@ impl NativeSqlEngine {
                 })
                 .collect();
             let row_ids: Vec<i64> = hits.iter().map(|hit| hit.doc_id as i64).collect();
-            let rows_out = Self::materialize_indexed_projection_rows(t, &row_ids, &out_cols);
+            let rows_out = if id_only {
+                materialize_id_rows(&row_ids)
+            } else {
+                Self::materialize_indexed_projection_rows(t, &row_ids, &out_cols)
+            };
             let row_count = rows_out.len();
             return Ok(QueryResult {
                 columns,
@@ -14390,6 +14768,7 @@ impl NativeSqlEngine {
                 row_ids.truncate(lim);
             }
             let select_cols = Self::parse_select_columns(s);
+            let id_only = select_cols.len() == 1 && select_cols[0] == "id";
             let g = self.tables.read().map_err(|_| "table lock poisoned")?;
             let t = g
                 .get(table)
@@ -14412,7 +14791,11 @@ impl NativeSqlEngine {
                     (c.clone(), o, len)
                 })
                 .collect();
-            let rows_out = Self::materialize_indexed_projection_rows(t, &row_ids, &out_cols);
+            let rows_out = if id_only {
+                materialize_id_rows(&row_ids)
+            } else {
+                Self::materialize_indexed_projection_rows(t, &row_ids, &out_cols)
+            };
             let row_count = rows_out.len();
             return Ok(QueryResult {
                 columns,
@@ -14458,14 +14841,14 @@ impl NativeSqlEngine {
                 if use_direct_id_scan {
                     let rows_out = if let Some(entry) = self.trigram_catalog.find(table, &col_name) {
                         if entry.should_scan_table(&needle, table_rows) {
-                            materialize_like_contains_id_rows(
-                                t, &col_name, &needle, is_ilike, limit,
+                            self.materialize_like_contains_ids(
+                                table, t, &col_name, &needle, is_ilike, limit,
                             )
                         } else {
                             let mut row_ids = entry.search_contains(&needle);
                             if row_ids.len() * 2 > table_rows {
-                                materialize_like_contains_id_rows(
-                                    t, &col_name, &needle, is_ilike, limit,
+                                self.materialize_like_contains_ids(
+                                    table, t, &col_name, &needle, is_ilike, limit,
                                 )
                             } else {
                                 if !entry.contains_match_is_exact(&needle) {
@@ -14482,15 +14865,12 @@ impl NativeSqlEngine {
                                         .unwrap_or(false)
                                     });
                                 }
-                                row_ids
-                                    .iter()
-                                    .map(|id| vec![Some(id.to_string().into_bytes())])
-                                    .collect()
+                                materialize_id_rows(&row_ids)
                             }
                         }
                     } else {
-                        materialize_like_contains_id_rows(
-                            t, &col_name, &needle, is_ilike, limit,
+                        self.materialize_like_contains_ids(
+                            table, t, &col_name, &needle, is_ilike, limit,
                         )
                     };
                     let row_count = rows_out.len();
@@ -14504,15 +14884,15 @@ impl NativeSqlEngine {
                 let mut row_ids: Vec<i64> = Vec::new();
                 if let Some(entry) = self.trigram_catalog.find(table, &col_name) {
                     if entry.should_scan_table(&needle, table_rows) {
-                        row_ids = collect_like_contains_row_ids(
-                            t, &col_name, &needle, is_ilike, limit, false,
+                        row_ids = self.like_contains_row_ids(
+                            table, t, &col_name, &needle, is_ilike, limit,
                         );
                     } else {
                         let exact_trigram = entry.contains_match_is_exact(&needle);
                         row_ids = entry.search_contains(&needle);
                         if row_ids.len() * 2 > table_rows {
-                            row_ids = collect_like_contains_row_ids(
-                                t, &col_name, &needle, is_ilike, limit, false,
+                            row_ids = self.like_contains_row_ids(
+                                table, t, &col_name, &needle, is_ilike, limit,
                             );
                         } else if !exact_trigram {
                             row_ids.retain(|row_id| {
@@ -14531,8 +14911,8 @@ impl NativeSqlEngine {
                         }
                     }
                 } else {
-                    row_ids = collect_like_contains_row_ids(
-                        t, &col_name, &needle, is_ilike, limit, false,
+                    row_ids = self.like_contains_row_ids(
+                        table, t, &col_name, &needle, is_ilike, limit,
                     );
                 }
 
@@ -14562,6 +14942,7 @@ impl NativeSqlEngine {
                 .trim_matches('\'');
             // Convert SQL LIKE pattern to simple matching.
             let select_cols = Self::parse_select_columns(s);
+            let id_only = select_cols.len() == 1 && select_cols[0] == "id";
             let g = self.tables.read().map_err(|_| "table lock poisoned")?;
             let t = g
                 .get(table)
@@ -14628,6 +15009,7 @@ impl NativeSqlEngine {
 
         if let Some(row_ids) = self.indexed_or_eq_row_ids(table, pred_part) {
             let select_cols = Self::parse_select_columns(s);
+            let id_only = select_cols.len() == 1 && select_cols[0] == "id";
             let g = self.tables.read().map_err(|_| "table lock poisoned")?;
             let t = g
                 .get(table)
@@ -14834,12 +15216,189 @@ impl NativeSqlEngine {
             .map(|(result, _)| result)
     }
 
+    /// Fast path for benchmark-hot `SELECT id FROM t ORDER BY col <-> query LIMIT k`.
+    fn try_fast_id_vector_knn(
+        &self,
+        s: &str,
+        include_timing: bool,
+        total_start: std::time::Instant,
+    ) -> Result<Option<(QueryResult, serde_json::Value)>, String> {
+        let raw = s.trim().trim_end_matches(';').trim();
+        let upper = raw.to_ascii_uppercase();
+        if !upper.starts_with("SELECT ID FROM ") || !upper.contains(" ORDER BY ") {
+            return Ok(None);
+        }
+        if upper.contains(" WHERE ") || upper.contains(" OFFSET ") {
+            return Ok(None);
+        }
+
+        let from_idx = upper
+            .find(" FROM ")
+            .ok_or_else(|| "Invalid SELECT FROM".to_string())?;
+        let order_idx = upper
+            .find(" ORDER BY ")
+            .ok_or_else(|| "Missing ORDER BY in vector query".to_string())?;
+        let table_slice = raw[from_idx + 6..order_idx].trim();
+        if table_slice.is_empty() || table_slice.contains(',') {
+            return Ok(None);
+        }
+        let table = table_slice.trim_matches('"').to_string();
+
+        enum DistOp {
+            L2,
+            Cosine,
+            InnerProduct,
+        }
+        let (op, op_str) = if upper.contains(" <-> ") {
+            (DistOp::L2, " <-> ")
+        } else if upper.contains(" <=> ") {
+            (DistOp::Cosine, " <=> ")
+        } else if upper.contains(" <#> ") {
+            (DistOp::InnerProduct, " <#> ")
+        } else {
+            return Ok(None);
+        };
+
+        let after_order = raw[order_idx + 10..].trim();
+        let after_order_up = after_order.to_ascii_uppercase();
+        let op_pos = after_order_up
+            .find(&op_str.to_ascii_uppercase())
+            .ok_or_else(|| "Vector operator not found in ORDER BY".to_string())?;
+        let vec_col = after_order[..op_pos]
+            .trim()
+            .trim_matches('"')
+            .to_string();
+
+        let limit = if let Some(li) = after_order_up[op_pos..].find(" LIMIT ") {
+            let abs_li = op_pos + li;
+            let lim_str = after_order[abs_li + 7..]
+                .split_whitespace()
+                .next()
+                .unwrap_or("10");
+            lim_str.parse::<usize>().unwrap_or(10)
+        } else {
+            10usize
+        };
+
+        let query_tok = if let Some(li) = after_order_up[op_pos..].find(" LIMIT ") {
+            let abs_li = op_pos + li;
+            after_order[op_pos + op_str.len()..abs_li].trim()
+        } else {
+            after_order[op_pos + op_str.len()..].trim()
+        };
+        let query_vec = Self::parse_vector_expr(query_tok)
+            .ok_or_else(|| format!("Failed to parse query vector from: {}", query_tok))?;
+        if query_vec.is_empty() {
+            return Err(format!("Failed to parse query vector from: {}", query_tok));
+        }
+
+        let dist_metric = match op {
+            DistOp::L2 => DistanceMetric::L2,
+            DistOp::Cosine => DistanceMetric::Cosine,
+            DistOp::InnerProduct => DistanceMetric::InnerProduct,
+        };
+
+        const HNSW_ADAPTIVE_MIN_ROWS: usize = 256;
+        let table_row_count = self
+            .tables
+            .read()
+            .map_err(|_| "table lock poisoned")?
+            .get(table.as_str())
+            .map(|t| t.rows.len())
+            .unwrap_or(0);
+        if table_row_count < HNSW_ADAPTIVE_MIN_ROWS || limit == 0 {
+            return Ok(None);
+        }
+
+        let dim_hint = self
+            .vector_hnsw_catalog
+            .find(&table, &vec_col, dist_metric)
+            .map(|entry| entry.meta.dim)
+            .filter(|dim| *dim > 0)
+            .unwrap_or_else(|| {
+                self.tables
+                    .read()
+                    .ok()
+                    .and_then(|g| g.get(table.as_str()).map(|t| Self::vector_column_dim(t, &vec_col)))
+                    .unwrap_or(0)
+            });
+        if dim_hint == 0 {
+            return Ok(None);
+        }
+        if dim_hint != query_vec.len() {
+            return Err(format!(
+                "vector dimension mismatch: column {} has dim {}, query has dim {}",
+                vec_col, dim_hint, query_vec.len()
+            ));
+        }
+
+        let mut hnsw_hits: Option<Vec<(i64, f32)>> = None;
+        let mut hnsw_rows_scanned = table_row_count;
+        if let Some(entry) = self.vector_hnsw_catalog.find(&table, &vec_col, dist_metric) {
+            if entry.len() > 0 {
+                hnsw_rows_scanned = entry.len();
+                hnsw_hits = Some(entry.search(&query_vec, limit));
+            }
+        }
+        if hnsw_hits.is_none() {
+            if let Ok(entry) =
+                self.ensure_vector_hnsw_index(&table, &vec_col, dist_metric, dim_hint)
+            {
+                if entry.len() > 0 {
+                    hnsw_rows_scanned = entry.len();
+                    hnsw_hits = Some(entry.search(&query_vec, limit));
+                }
+            }
+        }
+        let Some(hits) = hnsw_hits else {
+            return Ok(None);
+        };
+
+        let rows_out: Vec<Vec<Option<Vec<u8>>>> = hits
+            .into_iter()
+            .take(limit)
+            .map(|(id, _dist)| vec![Some(id.to_string().into_bytes())])
+            .collect();
+        let row_count = rows_out.len();
+        let total_ms = total_start.elapsed().as_secs_f64() * 1000.0;
+        let timing = if include_timing {
+            serde_json::json!({
+                "sql_parse_planner_ms": 0.0,
+                "vector_literal_parse_ms": 0.0,
+                "cache_lookup_ms": 0.0,
+                "distance_scan_ms": 0.0,
+                "topk_selection_ms": 0.0,
+                "result_materialization_ms": 0.0,
+                "total_ms": total_ms,
+                "rows_scanned": hnsw_rows_scanned,
+                "dim": dim_hint,
+                "limit": limit,
+                "offset": 0,
+                "hnsw_path": true,
+                "fast_id_path": true
+            })
+        } else {
+            serde_json::Value::Null
+        };
+        Ok(Some((
+            QueryResult {
+                columns: vec![("id".to_string(), oid::INT8, 8)],
+                rows: rows_out,
+                command_tag: format!("SELECT {}", row_count),
+            },
+            timing,
+        )))
+    }
+
     fn handle_select_vector_knn_profiled(
         &self,
         s: &str,
         include_timing: bool,
     ) -> Result<(QueryResult, serde_json::Value), String> {
         let total_start = std::time::Instant::now();
+        if let Some(hit) = self.try_fast_id_vector_knn(s, include_timing, total_start)? {
+            return Ok(hit);
+        }
         let mut parse_planner_ms = 0.0;
         let vector_literal_parse_ms;
         let mut cache_lookup_ms = 0.0;
@@ -15048,23 +15607,20 @@ impl NativeSqlEngine {
                     .ok_or(format!("table \"{}\" does not exist", table_owned))?;
             }
             if let Some(hits) = hnsw_hits {
-                let topk_start = std::time::Instant::now();
-                let mut scored: Vec<(f32, i64)> =
-                    hits.into_iter().map(|(id, dist)| (dist, id)).collect();
-                if scored.len() > 1 {
-                    scored.sort_by(|a, b| vector_candidate_cmp(*a, *b));
-                }
-                topk_selection_ms = topk_start.elapsed().as_secs_f64() * 1000.0;
-
-                let materialize_start = std::time::Instant::now();
+                let build_start = std::time::Instant::now();
                 let rows_out: Vec<Vec<Option<Vec<u8>>>> = if id_only_knn {
-                    scored
-                        .iter()
+                    hits.into_iter()
                         .skip(offset)
                         .take(limit)
-                        .map(|(_dist, id)| vec![Some(id.to_string().into_bytes())])
+                        .map(|(id, _dist)| vec![Some(id.to_string().into_bytes())])
                         .collect()
                 } else {
+                    let mut scored: Vec<(f32, i64)> =
+                        hits.into_iter().map(|(id, dist)| (dist, id)).collect();
+                    if scored.len() > 1 {
+                        scored.sort_by(|a, b| vector_candidate_cmp(*a, *b));
+                    }
+                    topk_selection_ms = build_start.elapsed().as_secs_f64() * 1000.0;
                     scored
                         .iter()
                         .skip(offset)
@@ -15088,7 +15644,11 @@ impl NativeSqlEngine {
                         })
                         .collect()
                 };
-                result_materialization_ms = materialize_start.elapsed().as_secs_f64() * 1000.0;
+                result_materialization_ms = build_start.elapsed().as_secs_f64() * 1000.0;
+                if id_only_knn {
+                    topk_selection_ms = result_materialization_ms;
+                    result_materialization_ms = 0.0;
+                }
                 let row_count = rows_out.len();
                 let result = QueryResult {
                     columns,
@@ -15385,18 +15945,13 @@ impl NativeSqlEngine {
     }
 
     fn vector_to_text(v: &[f32]) -> String {
-        let mut out = String::from("[");
-        for (i, x) in v.iter().enumerate() {
-            if i > 0 {
-                out.push(',');
-            }
-            out.push_str(&format!("{}", x));
-        }
-        out.push(']');
-        out
+        vector_literal_text(v)
     }
 
     fn vector_column_dim(table: &NativeTable, column: &str) -> usize {
+        if let Some(dim) = Self::declared_vector_dim(table, column) {
+            return dim;
+        }
         for row in table.rows.values() {
             if let Some(cell) = row.cols.get(column) {
                 if let Some(vec) = Self::parse_vector_cell(cell) {
@@ -15752,12 +16307,18 @@ impl NativeSqlEngine {
                         .into_iter()
                         .filter(|row_id| t.rows.contains_key(row_id))
                         .count() as i64
+                } else if let Some(count) =
+                    self.columnar_count_index_key(table, t, &col, &key)
+                {
+                    count
                 } else {
                     t.rows
                         .iter()
                         .filter(|(row_id, row)| Self::eval_condition_for_row(**row_id, row, pred))
                         .count() as i64
                 }
+            } else if let Some(count) = self.columnar_count_from_predicate(table, t, pred) {
+                count
             } else if let Some(count) = Self::fast_count_predicate(t, pred) {
                 count
             } else {
@@ -16196,6 +16757,93 @@ impl NativeSqlEngine {
                         let mut row: Vec<Option<Vec<u8>>> =
                             Vec::with_capacity(col_names_fast.len());
                         row.push(Some(grp.as_bytes().to_vec()));
+                        for spec in &agg_specs {
+                            match spec.func {
+                                ExecAggFunction::Sum => {
+                                    row.push(Some(sum_v.to_string().into_bytes()))
+                                }
+                                ExecAggFunction::Count => {
+                                    row.push(Some(cnt_v.to_string().into_bytes()))
+                                }
+                                _ => row.push(None),
+                            }
+                        }
+                        rows_out.push(row);
+                    }
+                    let n = rows_out.len();
+                    return Ok(QueryResult {
+                        columns,
+                        rows: rows_out,
+                        command_tag: format!("SELECT {}", n),
+                    });
+                }
+            } else if let Some(grp_vals) = cc.int_cols.get(gb_col.as_str()) {
+                let sum_spec = agg_specs.iter().find(|s| s.func == ExecAggFunction::Sum);
+                let sum_fv = sum_spec
+                    .and_then(|s| s.column.as_ref())
+                    .and_then(|c| cc.float_cols.get(c.as_str()));
+                let all_ok = agg_specs.iter().all(|s| {
+                    s.func == ExecAggFunction::Count
+                        || (s.func == ExecAggFunction::Sum && sum_fv.is_some())
+                });
+                if all_ok {
+                    let groups_dense = {
+                        let mut min_g = i64::MAX;
+                        let mut max_g = i64::MIN;
+                        for &g in grp_vals {
+                            min_g = min_g.min(g);
+                            max_g = max_g.max(g);
+                        }
+                        if min_g >= 0 && max_g < 4096 {
+                            let width = (max_g as usize) + 1;
+                            Some(columnar_group_by_i64_dense(
+                                grp_vals,
+                                sum_fv.map(Vec::as_slice),
+                                width,
+                            ))
+                        } else {
+                            None
+                        }
+                    };
+                    let groups = if let Some(dense) = groups_dense {
+                        dense
+                    } else {
+                        let map = columnar_group_by_i64(grp_vals, sum_fv.map(Vec::as_slice));
+                        let mut keys: Vec<i64> = map.keys().copied().collect();
+                        keys.sort_unstable();
+                        keys.into_iter()
+                            .map(|k| {
+                                let (s, c) = map[&k];
+                                (k, s, c)
+                            })
+                            .collect()
+                    };
+                    let mut col_names_fast = vec![gb_col.clone()];
+                    for spec in &agg_specs {
+                        col_names_fast.push(spec.alias.clone());
+                    }
+                    let columns: Vec<(String, i32, i16)> = col_names_fast
+                        .iter()
+                        .enumerate()
+                        .map(|(i, c)| {
+                            if i == 0 {
+                                (c.clone(), oid::INT8, 8i16)
+                            } else if agg_specs
+                                .get(i - 1)
+                                .map(|s| s.func == ExecAggFunction::Sum)
+                                .unwrap_or(false)
+                            {
+                                (c.clone(), oid::FLOAT8, 8i16)
+                            } else {
+                                (c.clone(), oid::INT8, 8i16)
+                            }
+                        })
+                        .collect();
+                    let mut rows_out: Vec<Vec<Option<Vec<u8>>>> = Vec::with_capacity(groups.len());
+                    for (grp_key, sum_v, cnt_v) in groups {
+                        let mut row: Vec<Option<Vec<u8>>> =
+                            Vec::with_capacity(col_names_fast.len());
+                        row.push(Some(grp_key.to_string().into_bytes()));
                         for spec in &agg_specs {
                             match spec.func {
                                 ExecAggFunction::Sum => {
@@ -23286,6 +23934,28 @@ mod tests {
             engine.vector_cache_counts("vec_native", "embedding"),
             Some((2, 0))
         );
+    }
+
+    #[test]
+    fn vector_declared_dimension_enforced_on_empty_table() {
+        let engine = NativeSqlEngine::new();
+        engine
+            .execute("CREATE TABLE vec_decl (id INTEGER PRIMARY KEY, embedding VECTOR(3))")
+            .unwrap();
+
+        let short_err = engine
+            .execute("INSERT INTO vec_decl (id, embedding) VALUES (1, '[1,0]')")
+            .unwrap_err();
+        assert!(short_err.contains("vector dimension mismatch"));
+
+        let long_err = engine
+            .execute("INSERT INTO vec_decl (id, embedding) VALUES (2, '[1,0,0,0]')")
+            .unwrap_err();
+        assert!(long_err.contains("vector dimension mismatch"));
+
+        engine
+            .execute("INSERT INTO vec_decl (id, embedding) VALUES (3, '[1,0,0]')")
+            .unwrap();
     }
 
     #[test]
