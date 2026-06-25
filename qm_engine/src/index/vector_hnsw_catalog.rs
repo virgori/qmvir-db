@@ -48,7 +48,9 @@ fn bulk_hnsw_config_for_metric(metric: DistanceMetric, n: usize) -> HnswConfig {
         cfg.ef_construction = 64;
     } else if n > 0 {
         let log_n = ((n as f64).log2().max(1.0)) as usize;
-        cfg.ef_construction = (48 + log_n * 8).clamp(64, cfg.ef_construction);
+        // Large backfills: cap ef below online default (200) for build throughput;
+        // search still uses ef_search ≥ 40 (pgvector-compatible).
+        cfg.ef_construction = (40 + log_n * 5).clamp(48, 128);
     }
     cfg
 }

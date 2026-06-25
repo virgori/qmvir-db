@@ -32,7 +32,11 @@ pub mod types;
 pub mod web;
 
 // Re-exports
-pub use cluster::{ConsistentHashRing, ReplicaSet, ReplicationConfig, ShardManager};
+pub use cluster::{
+    cluster_router_env_enabled, ClusterRuntime, ConsistentHashRing, MetaCluster, NodeClient,
+    QmRouter, ReplicaSet, ReplicationConfig, RoutePlan, ShardGroupCatalog, ShardGroupKind,
+    ShardManager, TransportServer, TwoPhaseCoordinator, TxnPhase, WalEntry, WorkloadClass,
+};
 pub use executor::{ColumnBatch, ExecutionResult, VectorExecutor};
 pub use gateway::{ConnectionConfig, NativeSqlEngine, PostgresGateway};
 pub use hub_engine::HubEngine;
@@ -64,9 +68,13 @@ fn qm_engine(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<storage::PyStorageEngine>()?;
     m.add_class::<storage::PyTransaction>()?;
 
-    // Cluster routing
+    // Cluster routing + HA primitives (transport, 2PC, WAL streaming)
     m.add_class::<cluster::shard::PyShardRing>()?;
     m.add_class::<cluster::shard::PyShardManager>()?;
+    m.add_class::<cluster::transport::PyNodeTransport>()?;
+    m.add_class::<cluster::two_phase_commit::PyDistributedCoordinator>()?;
+    m.add_class::<storage::wal_streaming::PyWalSender>()?;
+    m.add_class::<storage::wal_streaming::PyWalReceiver>()?;
 
     // Index
     m.add_class::<index::PyIndexManager>()?;

@@ -189,3 +189,29 @@ class TestRestore:
         result = qm_engine.backup_restore(new_engine, backup_path)
         assert result["tables_restored"] == 2
         assert result["total_rows"] == 150
+
+
+class TestVectorBackup:
+    def test_vector_column_roundtrip(self, tmp_path):
+        """VECTOR columns survive .qmvb backup → restore with correct schema."""
+        engine = qm_engine.NativeSqlEngine()
+        engine.execute("CREATE TABLE docs (id INTEGER, embedding VECTOR(4))")
+        engine.execute(
+            "INSERT INTO docs (id, embedding) VALUES (1, '[0.1,0.2,0.3,0.4]')"
+        )
+        path = str(tmp_path / "vec.qmvb")
+        qm_engine.backup(engine, path, compression="lz4")
+
+        restored = qm_engine.NativeSqlEngine()
+        result = qm_engine.backup_restore(restored, path, drop_existing=True)
+        assert result["tables_restored"] == 1
+        assert result["total_rows"] == 1
+
+        info = qm_engine.backup_info(path)
+        assert info["format_version"] == 1
+
+        cols, rows, _ = restored.execute(
+            "SELECT id, embedding FROM docs ORDER BY id"
+        )
+        assert len(rows) == 1
+        assert rows[0][0] == "1"

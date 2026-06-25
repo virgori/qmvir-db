@@ -113,7 +113,7 @@ impl<'a> BackupEngine<'a> {
             let types: Vec<String> = table
                 .column_types
                 .iter()
-                .map(|ct| format!("{:?}", ct))
+                .map(crate::backup::format::col_type_to_manifest)
                 .collect();
 
             table_entries.push(TableManifestEntry {

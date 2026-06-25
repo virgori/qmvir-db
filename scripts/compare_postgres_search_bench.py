@@ -100,8 +100,12 @@ def setup_postgres(dsn: str, dim: int, pgvector: bool, rows: int) -> Any:
     cur.execute("CREATE INDEX pg_search_bench_tags ON pg_search_bench (tags)")
     if pgvector:
         cur.execute(
-            "CREATE INDEX pg_search_bench_embedding_hnsw ON pg_search_bench "
+            "CREATE INDEX pg_search_bench_embedding_hnsw_l2 ON pg_search_bench "
             "USING hnsw (embedding vector_l2_ops)"
+        )
+        cur.execute(
+            "CREATE INDEX pg_search_bench_embedding_hnsw_cosine ON pg_search_bench "
+            "USING hnsw (embedding vector_cosine_ops)"
         )
     cur.execute(
         "CREATE INDEX pg_search_bench_fts ON pg_search_bench "
@@ -171,11 +175,14 @@ def seed_qm_tables(qm_engine: Any, dim: int, rows: int) -> tuple[Any, Any, str]:
         for i in range(start, end):
             literal = "[" + ",".join(f"{((i + j) % 17) / 17.0:.4f}" for j in range(dim)) + "]"
             vec.execute(f"INSERT INTO vec_bench (id, embedding) VALUES ({i}, '{literal}')")
+    # Match pgvector: separate L2 and cosine HNSW indexes (fair head-to-head).
     vec.execute(
-        "CREATE INDEX idx_vec_bench_embedding ON vec_bench (embedding) USING hnsw"
+        "CREATE INDEX idx_vec_bench_embedding_l2 ON vec_bench (embedding) "
+        "USING hnsw (embedding vector_l2_ops)"
     )
     vec.execute(
-        "CREATE INDEX idx_vec_bench_embedding_hnsw ON vec_bench (embedding) USING hnsw"
+        "CREATE INDEX idx_vec_bench_embedding_cosine ON vec_bench (embedding) "
+        "USING hnsw (embedding vector_cosine_ops)"
     )
     query = "[" + ",".join(f"{0.1 + j * 0.01:.4f}" for j in range(dim)) + "]"
     return qm, vec, query

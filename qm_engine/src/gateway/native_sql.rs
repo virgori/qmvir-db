@@ -2422,9 +2422,9 @@ impl WalSyncPolicy {
     }
 }
 
-const GROUP_COMMIT_DEFAULT_WINDOW_US: u64 = 250;
-const GROUP_COMMIT_DEFAULT_MAX_BATCH: u64 = 64;
-const WAL_BUF_CAPACITY: usize = 64 * 1024;
+const GROUP_COMMIT_DEFAULT_WINDOW_US: u64 = 150;
+const GROUP_COMMIT_DEFAULT_MAX_BATCH: u64 = 128;
+const WAL_BUF_CAPACITY: usize = 256 * 1024;
 
 type WalWriterHandle = BufWriter<fs::File>;
 
@@ -10178,34 +10178,56 @@ impl NativeSqlEngine {
         entry: &crate::index::ManagedVectorHnswIndex,
         table: &str,
     ) -> Result<(), String> {
-        let g = self.tables.read().map_err(|_| "table lock poisoned")?;
-        let Some(t) = g.get(table) else {
-            return Ok(());
-        };
         let col = entry.meta.key.column.clone();
-        let cc = self.get_or_build_cols(table, t);
-        let mut vectors = Vec::with_capacity(cc.ids.len());
-        for &row_id in &cc.ids {
-            let Some(row) = t.rows.get(&row_id) else {
-                continue;
+        let row_ids: Vec<i64> = {
+            let g = self.tables.read().map_err(|_| "table lock poisoned")?;
+            let Some(t) = g.get(table) else {
+                return Ok(());
             };
-            let Some(cell) = row.cols.get(col.as_str()) else {
-                continue;
+            self.get_or_build_cols(table, t).ids.clone()
+        };
+        let mut vectors = Vec::with_capacity(row_ids.len());
+        {
+            let mut g = self.tables.write().map_err(|_| "table lock poisoned")?;
+            let Some(t) = g.get_mut(table) else {
+                return Ok(());
             };
-            if let Cell::Vector { data, dim, .. } = cell {
-                if *dim == data.len() {
+            for row_id in row_ids {
+                let Some(row) = t.rows.get_mut(&row_id) else {
+                    continue;
+                };
+                let Some(cell) = row.cols.get_mut(col.as_str()) else {
+                    continue;
+                };
+                if let Some(vec) = Self::take_vector_cell(cell) {
                     if let Ok(external_id) = u32::try_from(row_id) {
-                        vectors.push((external_id, data.clone()));
+                        vectors.push((external_id, vec));
                     }
-                }
-            } else if let Some(vec) = Self::parse_vector_cell(cell) {
-                if let Ok(external_id) = u32::try_from(row_id) {
-                    vectors.push((external_id, vec));
                 }
             }
         }
         entry.batch_build(vectors);
         Ok(())
+    }
+
+    /// Move vector payload into HNSW backfill; keep SQL `text` for lazy re-materialization.
+    fn take_vector_cell(cell: &mut Cell) -> Option<Vec<f32>> {
+        match cell {
+            Cell::Vector {
+                data,
+                dim,
+                text,
+                norm,
+            } if !data.is_empty() && *dim == data.len() => {
+                let taken = std::mem::take(data);
+                if text.is_empty() {
+                    *text = vector_literal_text(&taken);
+                }
+                *norm = 0.0;
+                Some(taken)
+            }
+            _ => Self::parse_vector_cell(cell),
+        }
     }
 
     fn ensure_vector_hnsw_index(
@@ -10480,19 +10502,20 @@ impl NativeSqlEngine {
                 self.backfill_trigram_index(&entry, &table)?;
             }
             CreateIndexKind::Hnsw(metric) => {
-                let g = self.tables.read().map_err(|_| "table lock poisoned")?;
-                let dim = g
-                    .get(&table)
-                    .and_then(|t| {
-                        Self::declared_vector_dim(t, &col)
-                            .or_else(|| Self::existing_vector_dim(t, &col))
-                    })
-                    .ok_or_else(|| {
-                        format!(
-                            "CREATE INDEX USING hnsw requires VECTOR column \"{}\" with at least one row",
-                            col
-                        )
-                    })?;
+                let dim = {
+                    let g = self.tables.read().map_err(|_| "table lock poisoned")?;
+                    g.get(&table)
+                        .and_then(|t| {
+                            Self::declared_vector_dim(t, &col)
+                                .or_else(|| Self::existing_vector_dim(t, &col))
+                        })
+                        .ok_or_else(|| {
+                            format!(
+                                "CREATE INDEX USING hnsw requires VECTOR column \"{}\" with at least one row",
+                                col
+                            )
+                        })?
+                };
                 let entry = self.vector_hnsw_catalog.create_index(
                     name,
                     table.clone(),
@@ -12218,7 +12241,7 @@ impl NativeSqlEngine {
                 if value_groups.is_empty() {
                     return Err("Invalid INSERT VALUES".to_string());
                 }
-                let rows: Vec<(i64, NativeRow)> = if value_groups.len() >= 128 {
+                let rows: Vec<(i64, NativeRow)> = if value_groups.len() >= 32 {
                     let cols = cols.clone();
                     value_groups
                         .par_iter()
@@ -12626,11 +12649,11 @@ impl NativeSqlEngine {
     /// Parse multi-row VALUES clause: (v1,v2),(v3,v4),...
     /// Returns a vector of value groups.
     fn parse_multi_value_groups(values_part: &str) -> Vec<Vec<Cell>> {
-        let mut groups = Vec::new();
         let trimmed = values_part.trim().trim_end_matches(';');
         let mut depth = 0;
         let mut start = 0;
         let mut in_quote = false;
+        let mut group_contents: Vec<String> = Vec::new();
 
         let bytes = trimmed.as_bytes();
         for i in 0..bytes.len() {
@@ -12645,16 +12668,24 @@ impl NativeSqlEngine {
                 b')' if !in_quote => {
                     depth -= 1;
                     if depth == 0 {
-                        let content = &trimmed[start..i];
-                        let vals = Self::split_values_quoted(content);
-                        groups.push(vals);
+                        group_contents.push(trimmed[start..i].to_string());
                     }
                 }
                 _ => {}
             }
         }
 
-        groups
+        if group_contents.len() >= 32 {
+            group_contents
+                .par_iter()
+                .map(|content| Self::split_values_quoted(content))
+                .collect()
+        } else {
+            group_contents
+                .iter()
+                .map(|content| Self::split_values_quoted(content))
+                .collect()
+        }
     }
 
     /// Split comma-separated values respecting single-quoted strings.
@@ -15971,10 +16002,20 @@ impl NativeSqlEngine {
     fn vector_cell_parts(cell: &Cell) -> Option<(Vec<f32>, f32, bool)> {
         match cell {
             Cell::Vector {
-                data, norm, dim, ..
+                data,
+                norm,
+                dim,
+                text,
             } => {
-                if *dim == data.len() {
+                if !data.is_empty() && *dim == data.len() {
                     Some((data.clone(), *norm, true))
+                } else if !text.is_empty() {
+                    let vec = Self::parse_vector_expr(text)?;
+                    if *dim != 0 && *dim != vec.len() {
+                        return None;
+                    }
+                    let n = vec.iter().map(|x| x * x).sum::<f32>().sqrt();
+                    Some((vec, n, false))
                 } else {
                     None
                 }

@@ -267,6 +267,14 @@ impl TransportServer {
         }
     }
 
+    /// Handle one inbound transport connection (ping, forward, WAL, 2PC).
+    pub async fn serve_connection(
+        stream: TcpStream,
+        engine: Arc<crate::gateway::native_sql::NativeSqlEngine>,
+    ) -> io::Result<()> {
+        Self::handle_conn(stream, engine).await
+    }
+
     async fn handle_conn(
         mut stream: TcpStream,
         engine: Arc<crate::gateway::native_sql::NativeSqlEngine>,

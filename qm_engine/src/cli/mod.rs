@@ -3,6 +3,7 @@
 pub mod backup_cmd;
 pub mod check;
 pub mod dump;
+pub mod guide;
 pub mod i18n;
 pub mod inspect;
 pub mod schema;
@@ -15,8 +16,8 @@ use std::path::PathBuf;
 #[derive(Parser)]
 #[command(
     name = "qm",
-    version = "5.4.0",
-    about = "QMvir Database Engine CLI — v5.4.0",
+    version = env!("CARGO_PKG_VERSION"),
+    about = "QMvir Database Engine CLI",
     long_about = "QMvir — Hybrid AI-Native Database Engine (Rust)\n\
         OLTP + OLAP + Full-Text Search + Vector Search + Cache\n\
         PostgreSQL wire protocol — compatible with psql, JDBC, all PG clients\n\n\
@@ -50,6 +51,7 @@ use std::path::PathBuf;
         BACKUP:\n  \
           qm backup -o data.qmvb --compress zstd\n  \
           qm restore -i data.qmvb\n  \
+          qm guide notes                         # usage guide & caveats\n  \
           qm encrypt data.qmvb -p secret\n\n\
         Docs: https://github.com/virgori/qmvir-releases",
     after_help = "EXAMPLES:\n  \
@@ -57,6 +59,8 @@ use std::path::PathBuf;
           qm start --foreground --admin-password pw  # Foreground mode\n  \
           qm --data-dir ./mydb sql \"SELECT * FROM users\"\n  \
           qm benchtest --profile quick --json\n  \
+          qm guide quickstart\n  \
+          qm guide notes\n  \
           qm backup -o backup.qmvb --compress zstd\n  \
           qm inspect --tables\n  \
           qm stat --json\n\n\
@@ -251,6 +255,14 @@ pub enum Commands {
         /// JSON output
         #[arg(long)]
         json: bool,
+    },
+
+    /// Built-in usage guide and important notes
+    #[command(alias = "help")]
+    Guide {
+        /// Topic: all | quickstart | backup | studio | cli | notes
+        #[arg(default_value = "all")]
+        topic: String,
     },
 
     /// Build info

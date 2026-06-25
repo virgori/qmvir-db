@@ -1,6 +1,6 @@
 [package]
 name = "qm_engine"
-version = "6.0.0"
+version = "6.1.1"
 edition = "2021"
 description = "QMvir High-Performance Database Engine - Rust Core"
 autobins = false
@@ -174,3 +174,11 @@ path = "tests/release_crash_recovery.rs"
 [[test]]
 name = "release_crash_kill_recovery"
 path = "tests/release_crash_kill_recovery.rs"
+
+[[test]]
+name = "cluster_ha_smoke"
+path = "tests/cluster_ha_smoke.rs"
+
+[[test]]
+name = "single_node_cluster_isolation"
+path = "tests/single_node_cluster_isolation.rs"

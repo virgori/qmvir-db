@@ -1,9 +1,10 @@
 # QMvir — Usage Guide
 
-**Version:** v4.3.1  
+**Version:** v6.0.0  
 **Language:** Rust — standalone binary, no Python/Java required  
 **Protocol:** PostgreSQL wire protocol — compatible with `psql`, JDBC, any PG client  
-**Default CLI language:** English (`--lang en`). Also supports: `vi`, `zht`, `zh`
+**Default CLI language:** English (`--lang en`). Also supports: `vi`, `zht`, `zh`  
+**Performance tuning:** see [QMVIR_PERFORMANCE_GUIDE_VI.md](docs/QMVIR_PERFORMANCE_GUIDE_VI.md) (Vietnamese; OLAP/vector/search/WAL benchmarks)
 
 ---
 
@@ -42,25 +43,25 @@ Postinstall automatically downloads the correct binary for your platform (~7–8
 
 ```bash
 # Linux x86-64
-curl -LO https://github.com/virgori/qmvir-releases/releases/download/v4.3.1/qm-linux-x86_64
+curl -LO https://github.com/virgori/qmvir-releases/releases/download/v6.0.0/qm-linux-x86_64
 chmod +x qm-linux-x86_64
 sudo mv qm-linux-x86_64 /usr/local/bin/qm
 
 # Linux ARM64
-curl -LO https://github.com/virgori/qmvir-releases/releases/download/v4.3.1/qm-linux-aarch64
+curl -LO https://github.com/virgori/qmvir-releases/releases/download/v6.0.0/qm-linux-aarch64
 chmod +x qm-linux-aarch64
 sudo mv qm-linux-aarch64 /usr/local/bin/qm
 
 # macOS Apple Silicon
-curl -LO https://github.com/virgori/qmvir-releases/releases/download/v4.3.1/qm-macos-arm64
+curl -LO https://github.com/virgori/qmvir-releases/releases/download/v6.0.0/qm-macos-arm64
 chmod +x qm-macos-arm64
 sudo mv qm-macos-arm64 /usr/local/bin/qm
 
 # Windows x86-64
-curl -LO https://github.com/virgori/qmvir-releases/releases/download/v4.3.1/qm-windows-x86_64.exe
+curl -LO https://github.com/virgori/qmvir-releases/releases/download/v6.0.0/qm-windows-x86_64.exe
 
 # Windows ARM64
-curl -LO https://github.com/virgori/qmvir-releases/releases/download/v4.3.1/qm-windows-aarch64.exe
+curl -LO https://github.com/virgori/qmvir-releases/releases/download/v6.0.0/qm-windows-aarch64.exe
 ```
 
 ### Build from source
@@ -76,7 +77,7 @@ cargo build --release --no-default-features --bin qm
 
 ```bash
 qm version
-# QMvir v4.3.1
+# QMvir v6.0.0
 # Engine: qm_engine (Rust)
 # Build: release
 ```
@@ -576,6 +577,82 @@ qm --data-dir ./mydb dump -f sql -t users --stdout
 qm --data-dir ./mydb dump -f parquet -t events -o events.parquet
 ```
 
+### 8.7 Checkpoint (on-disk snapshot)
+
+`checkpoint` flushes in-memory table state and search/vector indexes to the data directory and truncates the WAL. Use before filesystem-level copies or after bulk loads.
+
+```bash
+# Force checkpoint (QMvir-exclusive CLI — not available in psql)
+qm --data-dir ./mydb checkpoint
+```
+
+**When to use:**
+
+| Goal | Command |
+|------|---------|
+| Portable offline copy | `qm backup -o file.qmvb` (recommended) |
+| Fast local durability flush | `qm checkpoint` |
+| Upgrade engine, keep data dir | Stop server → upgrade binary → `qm start` (data dir unchanged) |
+| Upgrade engine, portable file | `qm backup` on old version → `qm restore` on new version |
+
+### 8.8 `.qmvb` format compatibility (v1)
+
+QMvir **6.0+** writes `.qmvb` / `.qmdiff` with **format version 1**:
+
+| Property | Detail |
+|----------|--------|
+| Magic | `QMVB` (64-byte header + JSON manifest + compressed row chunks + CRC32/HMAC footer) |
+| Column types | Stable manifest tokens: `INTEGER`, `TEXT`, `VECTOR:128`, … (legacy `Debug` strings still readable) |
+| Row payload | Bincode-serialized cells (vectors, JSON, BYTEA preserved bit-exact) |
+| Forward compat | Backups from **6.0.x** remain restorable on **future 6.x** engines that support v1 |
+| Newer file on old engine | `qm restore` fails with a clear message: *upgrade QMvir to restore this file* |
+
+**Recommended upgrade workflow:**
+
+```bash
+# 1. On running 6.0.x
+qm --data-dir ./prod backup -o prod_v6.qmvb --compress zstd
+qm verify prod_v6.qmvb --info
+
+# 2. Install new engine (6.1+, npm/pip/binary)
+qm --data-dir ./prod_new restore -i prod_v6.qmvb --drop-existing
+
+# 3. Smoke test
+qm --data-dir ./prod_new sql "SELECT COUNT(*) FROM users"
+```
+
+### 8.9 Import PostgreSQL `pg_dump` (QMvir-exclusive)
+
+`restore` auto-detects `.sql` / `.pgsql` files and imports `CREATE TABLE`, `COPY`, and `INSERT` (including `VECTOR` columns):
+
+```bash
+pg_dump -Fc is not supported — use plain SQL:
+pg_dump -Fp mydb > mydb.sql
+qm --data-dir ./mydb restore -i mydb.sql --drop-existing
+```
+
+### 8.10 QMvir-exclusive CLI commands (not in PostgreSQL)
+
+These commands exist only in the `qm` binary (not via `psql`):
+
+| Command | Purpose |
+|---------|---------|
+| `qm backup` | Native `.qmvb` logical backup |
+| `qm restore` | Restore `.qmvb`, `.qmdiff`, or `pg_dump` SQL |
+| `qm diff-backup` | LSN-based differential backup |
+| `qm verify` | CRC32/HMAC integrity check |
+| `qm predict` | Dry-run size/duration estimate |
+| `qm encrypt` / `qm decrypt` | AES-256-GCM at-rest encryption |
+| `qm checkpoint` | Flush tables + indexes, truncate WAL |
+| `qm dump` | Export table to csv/jsonl/sql/parquet |
+| `qm schema export` | DDL export |
+| `qm schema diff` | Compare two data directories |
+| `qm schema migrate` | Apply migration SQL |
+| `qm benchtest` | Built-in benchmark suite |
+| `qm inspect` / `qm stat` / `qm check` | Engine introspection |
+
+Global flags: `--data-dir` (all data commands), `--lang en|vi|zht|zh`.
+
 ---
 
 ## 9. Web Dashboard & REST API
@@ -746,7 +823,13 @@ WAL ensures crash recovery — all changes are written to WAL before being appli
 qm --data-dir ./mydb checkpoint
 ```
 
-**Group Commit** (v4.2.0): batches multiple writes before fsync and can improve throughput. Treat it as a throughput mode, not as equivalent to PostgreSQL `synchronous_commit=on` when writes are acknowledged before fsync.
+**Group Commit** (6.0): engine-native `group_commit_sync` batches fsync across concurrent writers. Set via Python API:
+
+```python
+engine.set_wal_sync_policy("group_commit_sync")  # alias: "group_commit"
+```
+
+Policies: `per_commit_sync`, `group_commit_sync`, `relaxed_os_buffered`. See the performance guide §8 for benchmark scripts (`compare_postgres_group_commit.py`, `native_sql_write_profile.py`).
 
 **io_uring** (Linux 5.1+): Zero-syscall I/O via submission queue. Automatic fallback to `pwrite64` if kernel does not support it.
 
@@ -974,6 +1057,15 @@ $ qm benchtest
 ╚══════════════════════════════════════════════════════════════╝
 ```
 
+### 15.4 Segment benchmarks (vs DuckDB, Qdrant, PostgreSQL)
+
+```bash
+python scripts/run_segment_benchmark_suite.py
+bash scripts/run_quizzman_docker_fair_bench.sh   # fair all-container mode
+```
+
+See [QMVIR_PERFORMANCE_GUIDE_VI.md](docs/QMVIR_PERFORMANCE_GUIDE_VI.md) for workload patterns, HNSW tuning, and WAL policies.
+
 ---
 
 ## 16. CLI Reference
@@ -1002,6 +1094,7 @@ COMMANDS:
   checkpoint      Force WAL flush
   schema          Schema diff / export / migrate
   benchtest       Run built-in benchmark suite
+  guide           Usage guide & important notes (alias: help)
   version         Show version
 ```
 
@@ -1042,18 +1135,80 @@ qm backup [OPTIONS]
   --pitr                     Include WAL for point-in-time recovery
 ```
 
+### guide
+
+```
+qm guide [TOPIC]           # alias: qm help
+  TOPIC: all | quickstart | backup | studio | cli | notes
+```
+
+Built-in offline guide — no network required. Respects `--lang en|vi|zht|zh`.
+
+```bash
+qm guide                   # overview + essential commands
+qm guide quickstart        # install, start, psql, first SQL
+qm guide backup            # .qmvb, restore, encrypt, dump, upgrade path
+qm guide studio            # QMvir Studio desktop + qm_web dashboard
+qm guide cli               # QMvir-exclusive commands (not in psql)
+qm guide notes             # caveats before production
+qm --lang vi guide notes
+```
+
 ### dump
 
 ```
 qm dump [OPTIONS]
-  -f, --format <FMT>         Format: csv | jsonl | sql | parquet
-  -t, --table <TABLE>        Table to export
+  -f, --format <FMT>         Format: csv | jsonl | sql | parquet (default: sql)
+  -t, --table <TABLE>        Table to export (all tables if omitted)
   -o, --output <FILE>        Output file
-  --stdout                   Write to stdout
+  --stdout                   Write to stdout (sql/csv/jsonl only)
+```
+
+### restore
+
+```
+qm restore [OPTIONS]
+  -i, --input <FILE>         .qmvb, .qmdiff, or pg_dump .sql/.pgsql
+  --drop-existing            Drop tables before restore
+  --tables <T1,T2,...>       Restore only listed tables
+```
+
+### verify
+
+```
+qm verify <FILE> [--info]    Integrity check; --info prints manifest metadata
+```
+
+### checkpoint
+
+```
+qm checkpoint                Flush data dir snapshot + truncate WAL
+```
+
+### diff-backup
+
+```
+qm diff-backup [OPTIONS]
+  -b, --base <FILE>          Base .qmvb backup
+  -o, --output <FILE>        Output .qmdiff
+  --compress <ALGO>          none | lz4 | zstd
+```
+
+### encrypt / decrypt
+
+```
+qm encrypt <FILE> -p <PASSWORD>     Password or QM_ENCRYPT_KEY env
+qm decrypt <FILE> -o <OUT> -p <PW>
+```
+
+### schema
+
+```
+qm schema export             Export CREATE TABLE DDL
+qm schema diff <DIR_A> <DIR_B> [--output migration.sql]
+qm schema migrate <FILE> [--dry-run]
 ```
 
 ---
 
-*QM Engine v4.3.1 — 137K lines Rust, 353 tests, 5 platforms*  
-*Performance: full-text 153× PG17, bitmap 462×, WAL 327×, HNSW 30× scalar*  
-*Linux production: io_uring WAL, AVX-512F SIMD, O_DIRECT, madvise, fdatasync*
+*QM Engine v6.0.0 — Native SQL OLAP/vector/search performance release*

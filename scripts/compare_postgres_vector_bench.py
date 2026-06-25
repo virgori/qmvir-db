@@ -103,7 +103,9 @@ def run_vector_benchmark(
     conn.close()
 
     conn, pg_cur, query = setup_postgres(dsn, dim, rows)
+    print(f"[vector] postgres setup done rows={rows}", flush=True)
     qm, _, next_qm_id = setup_qm(qm_engine, dim, rows)
+    print(f"[vector] qm setup done rows={rows}", flush=True)
     next_pg_id = rows + 100_000
     update_qm_id = rows // 2
     update_pg_id = rows // 2
@@ -280,6 +282,8 @@ def run_vector_benchmark(
         competitor_search=pg_search_ids,
         ks=(10, 50),
     )
+    if os.environ.get("QM_VECTOR_SKIP_RECALL", "").strip() in ("1", "true", "TRUE"):
+        recall_suite = []
 
     wins = sum(1 for c in comparisons if c.get("winner") == "QM")
     pg_wins = sum(1 for c in comparisons if c.get("winner") == "PostgreSQL")

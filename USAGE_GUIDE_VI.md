@@ -17,7 +17,7 @@
 **Phần B — Trung cấp**
 4. [Vector Search — Tìm kiếm ngữ nghĩa](#chương-4-vector-search--tìm-kiếm-ngữ-nghĩa)
 5. [Media Management — Quản lý Blob](#chương-5-media-management--quản-lý-blob)
-6. [Checkpoint & Recovery](#chương-6-checkpoint--recovery)
+6. [Checkpoint & Recovery](#chương-6-checkpoint--recovery) *(gồm backup §6.5)*
 7. [Giám sát hệ thống](#chương-7-giám-sát-hệ-thống)
 
 **Phần C — Nâng cao**
@@ -72,10 +72,9 @@ qmvir version
 Kết quả mong đợi:
 
 ```
-QM Database v1.0.0
-  Engine:  v2.0.0-hub
-  Kernel:  v1.0.0
-  Python:  3.13.7
+QMvir v6.0.0
+Engine: qm_engine (Rust)
+Build: release
 ```
 
 ### 1.3 Khởi động Daemon
@@ -153,11 +152,11 @@ qmvir sql --daemon off -u admin -p admin
 > Bạn có thể chạy lệnh này ở **bất kì thư mục nào** bằng đường dẫn tuyệt đối:
 
 ```bash
-/Users/gengyang/Desktop/AI/.venv/bin/qmvir --data-dir /tmp/qm_data sql -u admin -p admin
+qmvir --data-dir /tmp/qm_data sql -u admin -p admin
 ```
 
 ```
-QMvir SQL Shell v1.0.0
+QMvir SQL Shell v6.0.0
 Type /h for help, /q to quit.
 Connected as: admin (ADMIN)
 
@@ -452,6 +451,23 @@ qmvir start --checkpoint-interval 60
 qmvir start --data-dir /ssd/qm_data
 ```
 
+### 6.5 Backup & Restore
+
+```bash
+# Tạo backup (.qmvb)
+qm backup -o /data/backup.qmvb --data-dir ./data
+
+# Kiểm tra tính toàn vẹn
+qm verify /data/backup.qmvb
+
+# Khôi phục
+qm restore -i /data/backup.qmvb --data-dir ./data_restored --drop-existing
+```
+
+Python API: `qm_engine.backup()`, `qm_engine.backup_verify()`, `qm_engine.backup_restore()`.
+
+Chi tiết hiệu năng backup/vector: [QMVIR_PERFORMANCE_GUIDE_VI.md](docs/QMVIR_PERFORMANCE_GUIDE_VI.md) mục 6.
+
 ---
 
 ## Chương 7. Giám sát hệ thống
@@ -532,6 +548,8 @@ checkpoint    | enabled | gateway
 ---
 
 ## Chương 8. Tối ưu hiệu năng SQL
+
+> **Giáo trình hiệu năng 6.0:** OLAP columnar, HNSW bulk build, FTS/LIKE, WAL group-commit — xem [QMVIR_PERFORMANCE_GUIDE_VI.md](docs/QMVIR_PERFORMANCE_GUIDE_VI.md).
 
 ### 8.1 Dùng cú pháp rút gọn
 
@@ -696,67 +714,47 @@ Khi bật process isolation, daemon tự động:
 
 ## Chương 11. Benchmark & Phân tích Bottleneck
 
-### 11.1 Chạy Benchmark nhanh
+### 11.1 Benchmark tích hợp (`qm benchtest`)
 
 ```bash
-# Chạy tất cả 5 benchmark
-qmvir bench
+# Nhanh (~10 giây, 17 thành phần engine)
+qm benchtest
 
-# Chỉ chạy benchmark cụ thể
-qmvir bench --only ring
-qmvir bench --only vector
-qmvir bench --only gateway
-qmvir bench --only checkpoint
-qmvir bench --only parse
+# Profile lớn hơn
+qm benchtest --profile standard
 
-# Xuất JSON report
-qmvir bench --json bench_report.json
+# JSON cho CI
+qm benchtest --json
 ```
 
-### 11.2 Kết quả Benchmark mẫu
+### 11.2 Benchmark so sánh đối thủ (segment suite)
 
+```bash
+# OLAP vs DuckDB, vector vs Qdrant, search vs PostgreSQL
+python scripts/run_segment_benchmark_suite.py
+
+# Fair Docker (publish-ready)
+bash scripts/run_quizzman_docker_fair_bench.sh
 ```
-==========================================================================================
-  QM Database — Performance Benchmark Report
-==========================================================================================
-  ring_buffer_publish_collect                 245.31   K ops/s       203.8ms  p50=3.2µs  p99=12.1µs
-  gateway_select_tps                           18.72   K ops/s       534.2ms  p50=48.5µs p99=125.3µs
-  checkpoint_full_write                         0.89   K ops/s        22.5ms  p50=1050µs p99=1380µs
-  vector_search_1000                            1.23   K ops/s        40.7ms  p50=750µs  p99=1200µs
-  sql_parse_lalr                               35.41   K ops/s       282.4ms  p50=25.1µs p99=45.8µs
-==========================================================================================
-```
+
+Chi tiết script và checklist: [QMVIR_PERFORMANCE_GUIDE_VI.md](docs/QMVIR_PERFORMANCE_GUIDE_VI.md) mục 7 và 10.
 
 ### 11.3 Đọc kết quả — Xác định Bottleneck
 
 | Benchmark | Chỉ số tốt | Chỉ số cần cải thiện |
 |-----------|-----------|---------------------|
-| Ring Buffer | > 200K ops/s | < 50K ops/s → tăng slot_count |
-| Gateway TPS | > 15K TPS | < 5K TPS → CPU bottleneck |
-| Checkpoint | p99 < 2ms | p99 > 10ms → SSD chậm |
-| Vector Search (1K) | p99 < 2ms | p99 > 5ms → tăng RAM cho HNSW |
-| SQL Parse | > 30K stmts/s | < 10K → grammar phức tạp |
+| Ring Buffer IPC | > 2M msgs/s | < 500K → tăng slot_count |
+| HNSW Search | p99 < 2ms @10K | p99 > 5ms → tăng `ef_search` hoặc RAM |
+| SQL INSERT batch | > 10K rows/s | < 1K → dùng multivalue INSERT |
+| OLAP GROUP BY | < 10ms @1M | > 50ms → kiểm tra index / int column |
 
-### 11.4 Automated Benchmark (Chu kỳ đầy đủ)
-
-```bash
-# Tự động: start server → benchmark → stop server → JSON report
-python tools/auto_bench.py
-
-# Không cần server (benchmark tạo engine tạm)
-python tools/auto_bench.py --no-server
-
-# Chỉ đo vector
-python tools/auto_bench.py --only vector --json vector_results.json
-```
-
-### 11.5 Phân tích Bottleneck qua Dashboard
+### 11.4 Quan sát qua Dashboard
 
 Mở hai terminal:
 
 **Terminal 1** — Chạy benchmark:
 ```bash
-python tools/auto_bench.py --no-server --only ring
+qm benchtest --profile quick
 ```
 
 **Terminal 2** — Quan sát dashboard:
@@ -776,7 +774,7 @@ Theo dõi:
 ### 12.1 Build Image
 
 ```bash
-docker build -t qmvir:1.0.0 .
+docker build -t qmvir:6.0.0 .
 ```
 
 ### 12.2 Chạy Container
@@ -787,7 +785,7 @@ docker run -d \
   -p 5433:5433 \
   -v qmvir_data:/data/qm \
   -e QM_ADMIN_PASSWORD=your_secure_password \
-  qmvir:1.0.0
+  qmvir:6.0.0
 ```
 
 ### 12.3 Kiểm tra Health
@@ -800,7 +798,7 @@ docker inspect --format='{{.State.Health.Status}}' qmvir-prod
 ### 12.4 Benchmark trong Docker (cô lập)
 
 ```bash
-docker exec qmvir-prod qmvir bench --json /data/qm/bench_report.json
+docker exec qmvir-prod qm benchtest --json
 
 # Lấy report ra host
 docker cp qmvir-prod:/data/qm/bench_report.json ./bench_report.json
@@ -1051,4 +1049,4 @@ qmvir start --port 5434
 
 ---
 
-*Kết thúc Giáo trình QMvir v1.0.0 — Từ Cơ bản đến Nâng cao*
+*Kết thúc Giáo trình QMvir v6.0.0 — Từ Cơ bản đến Nâng cao*

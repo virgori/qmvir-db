@@ -14,6 +14,8 @@ pub mod snapshot;
 mod transaction;
 pub mod uring_wal;
 mod wal;
+#[cfg(feature = "python")]
+pub mod wal_streaming;
 
 #[cfg(feature = "python")]
 pub use cache::PyWTinyLfuCache;

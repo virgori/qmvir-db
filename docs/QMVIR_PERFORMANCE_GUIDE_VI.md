@@ -64,8 +64,13 @@ Kết quả mục tiêu @1M rows: **5/5 workloads thắng DuckDB** (group_by_sum
 ```python
 import qm_engine
 
+DIM = 32
+
+def vec_literal(i: int, dim: int = DIM) -> str:
+    return "[" + ",".join(f"{((i + j) % 17) / 17.0:.6f}" for j in range(dim)) + "]"
+
 qm = qm_engine.NativeSqlEngine()
-qm.execute("CREATE TABLE docs (id INTEGER PRIMARY KEY, embedding VECTOR(32))")
+qm.execute(f"CREATE TABLE docs (id INTEGER PRIMARY KEY, embedding VECTOR({DIM}))")
 
 # 1) Bulk insert (multivalue)
 values = ",".join(f"({i}, '{vec_literal(i)}')" for i in range(2000))
@@ -169,7 +174,7 @@ qm_engine.backup_restore(fresh, "/data/backup.qmvb", drop_existing=True)
 
 ```bash
 qm backup -o /data/backup.qmvb --data-dir ./data
-qm backup verify /data/backup.qmvb
+qm verify /data/backup.qmvb
 qm restore -i /data/backup.qmvb --data-dir ./data_restored
 
 # Dump (SQL / CSV / JSONL)
@@ -208,17 +213,37 @@ Artifacts: `/tmp/qm_qdrant_docker_*.json`, `/tmp/qm_duckdb_docker_*.json`
 
 ## 8. WAL & durable writes (OLTP)
 
-Cho workload ghi bền vững:
+Chính sách sync (gọi qua Python API sau khi mở engine persistent):
+
+| Policy | Ý nghĩa |
+|--------|---------|
+| `per_commit_sync` / `per_commit` | fsync mỗi COMMIT — an toàn nhất, chậm nhất |
+| `group_commit_sync` / `group_commit` | group commit engine-native — cân bằng throughput/durability |
+| `per_commit_sync_data` | sync data, không sync metadata dir |
+| `relaxed_os_buffered` | OS buffer — bench/calibration only |
+| `append_only_profile` | profile mode, không đảm bảo durability |
 
 ```python
 qm = qm_engine.NativeSqlEngine()
-qm.set_wal_sync_policy("group_commit")  # hoặc qua env QM_WAL_SYNC_POLICY
+qm.set_wal_sync_policy("group_commit_sync")  # alias: "group_commit"
 ```
+
+> Chưa có biến môi trường `QM_WAL_SYNC_POLICY` — phải gọi `set_wal_sync_policy()` trong code.
 
 Benchmark durable writes:
 
 ```bash
-python scripts/compare_postgres_native_sql.py --profile write
+# QM-only profiler (per-commit / relaxed)
+python scripts/native_sql_write_profile.py --output /tmp/qm_write_profile.json
+
+# So sánh group-commit với PostgreSQL (concurrent writers)
+python scripts/compare_postgres_group_commit.py --output /tmp/qm_pg_group_commit.json
+
+# So sánh tổng hợp với PostgreSQL (persistent WAL)
+python scripts/compare_postgres_native_sql.py \
+  --qm-mode persistent-wal \
+  --qm-sync-policy group-commit \
+  --sync-every-n 64
 ```
 
 ---
@@ -243,6 +268,8 @@ python scripts/compare_postgres_native_sql.py --profile write
 | `scripts/run_quizzman_docker_fair_bench.sh` | Fair all-container suite |
 | `scripts/vector_recall_bench.py` | Recall@10/50/100 |
 | `scripts/run_segment_benchmark_suite.py` | Tổng hợp segment |
+| `scripts/native_sql_write_profile.py` | Profile ghi durable (QM-only) |
+| `scripts/compare_postgres_group_commit.py` | Group-commit vs PostgreSQL |
 
 ---
 

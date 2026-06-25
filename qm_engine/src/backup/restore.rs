@@ -89,6 +89,7 @@ impl<'a> RestoreEngine<'a> {
             .try_into()
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "Invalid header size"))?;
         let header = BackupHeader::from_bytes(&header_bytes)?;
+        validate_backup_format_version(header.format_version)?;
         let compression = header.compression;
 
         // Parse manifest.
@@ -135,14 +136,7 @@ impl<'a> RestoreEngine<'a> {
             let column_types: Vec<ColType> = entry
                 .types
                 .iter()
-                .map(|t| {
-                    match t.as_str() {
-                        "Integer" => ColType::Integer,
-                        "Float8" => ColType::Float8,
-                        "Text" => ColType::Text,
-                        _ => ColType::Text, // fallback
-                    }
-                })
+                .map(|t| col_type_from_manifest(t))
                 .collect();
 
             // Deserialize all chunks for this table.
@@ -257,6 +251,7 @@ impl<'a> RestoreEngine<'a> {
             .try_into()
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "Invalid header size"))?;
         let header = BackupHeader::from_bytes(&header_bytes)?;
+        validate_backup_format_version(header.format_version)?;
 
         if header.backup_type != crate::backup::BackupType::Differential {
             return Err(io::Error::new(
@@ -311,11 +306,7 @@ impl<'a> RestoreEngine<'a> {
             let column_types: Vec<ColType> = entry
                 .types
                 .iter()
-                .map(|t| match t.as_str() {
-                    "Integer" => ColType::Integer,
-                    "Float8" => ColType::Float8,
-                    _ => ColType::Text,
-                })
+                .map(|t| col_type_from_manifest(t))
                 .collect();
 
             // Deserialize changed rows.
@@ -486,10 +477,75 @@ fn read_u32_le<R: Read>(r: &mut R) -> io::Result<u32> {
 
 #[cfg(test)]
 mod tests {
-    use super::{RestoreConfig, RestoreEngine};
-    use crate::gateway::native_sql::Cell;
+    use super::{col_type_from_manifest, col_type_to_manifest, validate_backup_format_version, *};
+    use crate::backup::backup::{BackupConfig, BackupEngine};
+    use crate::backup::Compression;
+    use crate::gateway::native_sql::{Cell, ColType};
     use crate::gateway::NativeSqlEngine;
     use tempfile::tempdir;
+
+    #[test]
+    fn col_type_manifest_roundtrip() {
+        let samples = [
+            (ColType::Integer, "INTEGER"),
+            (ColType::Vector(128), "VECTOR:128"),
+            (ColType::Jsonb, "JSONB"),
+        ];
+        for (ct, expected) in samples {
+            assert_eq!(col_type_to_manifest(&ct), expected);
+            assert_eq!(col_type_from_manifest(expected), ct);
+        }
+        assert_eq!(col_type_from_manifest("Vector(32)"), ColType::Vector(32));
+    }
+
+    #[test]
+    fn rejects_newer_backup_format_version() {
+        assert!(validate_backup_format_version(0).is_err());
+        assert!(validate_backup_format_version(FORMAT_VERSION + 1).is_err());
+        assert!(validate_backup_format_version(FORMAT_VERSION).is_ok());
+    }
+
+    #[test]
+    fn qmvb_vector_columns_roundtrip() {
+        let engine = NativeSqlEngine::new();
+        engine
+            .execute("CREATE TABLE docs (id INTEGER, embedding VECTOR(3))")
+            .unwrap();
+        engine
+            .execute("INSERT INTO docs (id, embedding) VALUES (1, '[0.1,0.2,0.3]')")
+            .unwrap();
+
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("vec.qmvb");
+        let config = BackupConfig {
+            tables: None,
+            compression: Compression::Lz4,
+            include_wal: false,
+            output: path.clone(),
+        };
+        BackupEngine::new(&engine).run(&config).unwrap();
+
+        let mut restored = NativeSqlEngine::new();
+        let restore_cfg = RestoreConfig {
+            source: path,
+            tables: None,
+            drop_existing: true,
+        };
+        let result = RestoreEngine::new(&mut restored)
+            .restore_qmvb(&restore_cfg)
+            .unwrap();
+        assert_eq!(result.tables_restored, 1);
+        assert_eq!(result.total_rows, 1);
+
+        let tables = restored.tables.read().unwrap();
+        let docs = tables.get("docs").unwrap();
+        assert_eq!(docs.column_types[1], ColType::Vector(3));
+        let row = docs.rows.get(&1).unwrap();
+        assert!(matches!(
+            row.cols.get("embedding"),
+            Some(Cell::Vector { .. })
+        ));
+    }
 
     #[test]
     fn restore_pgdump_imports_copy_and_insert_rows() {

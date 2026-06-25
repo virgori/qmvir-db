@@ -6,6 +6,7 @@
 //! Footer CRC32 covers everything from byte 0 to just before the footer.
 
 use crate::backup::{BackupType, Compression};
+use crate::gateway::native_sql::ColType;
 use serde::{Deserialize, Serialize};
 use std::io::{self, Cursor, Read, Write};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -16,8 +17,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 pub const BACKUP_MAGIC: u64 = 0x514D_5642_0000_0001;
 /// Footer magic: "QMEND!" — marks valid EOF.
 pub const FOOTER_MAGIC: u32 = 0x514D_454E;
-/// Current format version.
+/// Current format version. Bump only with a backward-compatible reader or migration path.
 pub const FORMAT_VERSION: u32 = 1;
+
+/// Highest `.qmvb` format version this engine can restore.
+pub const MAX_SUPPORTED_FORMAT_VERSION: u32 = FORMAT_VERSION;
 
 // ── Header ───────────────────────────────────────────────────────────
 
@@ -123,6 +127,98 @@ impl BackupHeader {
             total_rows,
             original_size,
         })
+    }
+}
+
+/// Reject backups produced by a newer engine (format version we do not understand yet).
+pub fn validate_backup_format_version(version: u32) -> io::Result<()> {
+    if version == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid backup format version 0",
+        ));
+    }
+    if version > MAX_SUPPORTED_FORMAT_VERSION {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "backup format v{version} is newer than this engine (supports up to v{MAX_SUPPORTED_FORMAT_VERSION}); upgrade QMvir to restore this file"
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// Stable manifest encoding for column types (forward-compatible across engine versions).
+pub fn col_type_to_manifest(ct: &ColType) -> String {
+    match ct {
+        ColType::Integer => "INTEGER".into(),
+        ColType::Float8 => "FLOAT8".into(),
+        ColType::Text => "TEXT".into(),
+        ColType::Boolean => "BOOLEAN".into(),
+        ColType::Timestamp => "TIMESTAMP".into(),
+        ColType::Json => "JSON".into(),
+        ColType::Jsonb => "JSONB".into(),
+        ColType::Bytea => "BYTEA".into(),
+        ColType::Uuid => "UUID".into(),
+        ColType::Array => "ARRAY".into(),
+        ColType::Interval => "INTERVAL".into(),
+        ColType::Date => "DATE".into(),
+        ColType::Numeric => "NUMERIC".into(),
+        ColType::Vector(dim) => format!("VECTOR:{dim}"),
+    }
+}
+
+/// Parse manifest column type — accepts stable tokens and legacy `Debug` strings.
+pub fn col_type_from_manifest(s: &str) -> ColType {
+    let trimmed = s.trim();
+    let up = trimmed.to_ascii_uppercase();
+    if let Some(dim) = up.strip_prefix("VECTOR:") {
+        if let Ok(dim) = dim.parse::<usize>() {
+            return ColType::Vector(dim);
+        }
+    }
+    if up.starts_with("VECTOR(") && up.ends_with(')') {
+        if let Ok(dim) = up["VECTOR(".len()..up.len() - 1].parse::<usize>() {
+            return ColType::Vector(dim);
+        }
+    }
+    match up.as_str() {
+        "INTEGER" | "INT" | "BIGINT" => ColType::Integer,
+        "FLOAT8" | "FLOAT" | "DOUBLE" | "REAL" => ColType::Float8,
+        "TEXT" | "VARCHAR" => ColType::Text,
+        "BOOLEAN" | "BOOL" => ColType::Boolean,
+        "TIMESTAMP" | "TIMESTAMPTZ" => ColType::Timestamp,
+        "JSON" => ColType::Json,
+        "JSONB" => ColType::Jsonb,
+        "BYTEA" => ColType::Bytea,
+        "UUID" => ColType::Uuid,
+        "ARRAY" => ColType::Array,
+        "INTERVAL" => ColType::Interval,
+        "DATE" => ColType::Date,
+        "NUMERIC" | "DECIMAL" => ColType::Numeric,
+        _ => match trimmed {
+            "Integer" => ColType::Integer,
+            "Float8" => ColType::Float8,
+            "Text" => ColType::Text,
+            "Boolean" => ColType::Boolean,
+            "Timestamp" => ColType::Timestamp,
+            "Json" => ColType::Json,
+            "Jsonb" => ColType::Jsonb,
+            "Bytea" => ColType::Bytea,
+            "Uuid" => ColType::Uuid,
+            "Array" => ColType::Array,
+            "Interval" => ColType::Interval,
+            "Date" => ColType::Date,
+            "Numeric" => ColType::Numeric,
+            other if other.starts_with("Vector(") && other.ends_with(')') => {
+                let dim = other["Vector(".len()..other.len() - 1]
+                    .parse()
+                    .unwrap_or(0);
+                ColType::Vector(dim)
+            }
+            _ => ColType::Text,
+        },
     }
 }
 
@@ -257,6 +353,7 @@ fn r_u64<R: Read>(r: &mut R) -> io::Result<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::gateway::native_sql::ColType;
 
     #[test]
     fn header_roundtrip() {
@@ -296,7 +393,7 @@ mod tests {
             tables: vec![TableManifestEntry {
                 name: "users".into(),
                 columns: vec!["id".into(), "name".into()],
-                types: vec!["Integer".into(), "Text".into()],
+                types: vec!["INTEGER".into(), "TEXT".into()],
                 row_count: 100,
                 chunk_count: 1,
                 data_offset: 0,
@@ -316,5 +413,12 @@ mod tests {
         let mut bytes = [0u8; BackupHeader::SIZE];
         bytes[0..8].copy_from_slice(&0xBAD_CAFE_u64.to_le_bytes());
         assert!(BackupHeader::from_bytes(&bytes).is_err());
+    }
+
+    #[test]
+    fn col_type_manifest_legacy_and_stable() {
+        assert_eq!(col_type_from_manifest("INTEGER"), ColType::Integer);
+        assert_eq!(col_type_from_manifest("Vector(64)"), ColType::Vector(64));
+        assert_eq!(col_type_to_manifest(&ColType::Vector(64)), "VECTOR:64");
     }
 }

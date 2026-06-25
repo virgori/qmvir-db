@@ -6,11 +6,13 @@ export POSTGRES_DSN="${POSTGRES_DSN:-postgresql://qm_bench:qm_bench@localhost:54
 export PIP_BREAK_SYSTEM_PACKAGES=1
 sudo -u postgres psql -d qm_bench -c 'CREATE EXTENSION IF NOT EXISTS vector;' 2>/dev/null || true
 pip3 install -q --break-system-packages maturin psycopg2-binary 2>/dev/null || true
-(cd qm_engine && cargo clean -q)
-python3 -m maturin build --release --out /tmp/qm_linux_wheels 2>&1 | tail -5
-WHEEL=$(ls -t /tmp/qm_linux_wheels/qmvir-*.whl /tmp/qm_linux_wheels/qm_engine-*.whl 2>/dev/null | head -1)
-echo "installing $WHEEL"
-pip3 install -q --break-system-packages --force-reinstall "$WHEEL"
+if [[ "${SKIP_BUILD:-0}" != "1" ]]; then
+  [[ "${CARGO_CLEAN:-0}" == "1" ]] && (cd qm_engine && cargo clean -q)
+  python3 -m maturin build --release --out /tmp/qm_linux_wheels 2>&1 | tail -5
+  WHEEL=$(ls -t /tmp/qm_linux_wheels/qm_engine-*.whl /tmp/qm_linux_wheels/qmvir-*.whl 2>/dev/null | head -1)
+  echo "installing $WHEEL"
+  pip3 install -q --break-system-packages --force-reinstall "$WHEEL"
+fi
 python3 -c 'import qm_engine; print("qm_engine:", qm_engine.__file__)'
 
 for ROWS in 10000 100000; do

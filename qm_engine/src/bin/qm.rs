@@ -33,7 +33,7 @@ fn smart_error(lang: &Lang, e: &str) {
         eprintln!("  {} CREATE TABLE <name> (...);", lang.msg("hint_try", ""));
         eprintln!("  {} qm inspect --tables", lang.msg("hint_list", ""));
     } else if eu.contains("SYNTAX") || eu.contains("PARSE") {
-        eprintln!("  {} qm help", lang.msg("hint_syntax", ""));
+        eprintln!("  {} qm guide quickstart", lang.msg("hint_syntax", ""));
     } else if eu.contains("PERMISSION") || eu.contains("AUTH") || eu.contains("DENIED") {
         eprintln!("  {} --admin-password <pw>", lang.msg("hint_auth", ""));
     } else if eu.contains("CONNECT") || eu.contains("REFUSED") {
@@ -595,6 +595,11 @@ fn main() {
                     "release"
                 }
             );
+            println!("Guide:  qm guide [quickstart|backup|studio|cli|notes]");
+        }
+
+        Commands::Guide { topic } => {
+            qm_engine::cli::guide::run_guide(&lang, &topic);
         }
 
         Commands::Benchtest { profile, json } => {
