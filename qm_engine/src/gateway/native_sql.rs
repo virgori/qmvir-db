@@ -4984,6 +4984,13 @@ impl NativeSqlEngine {
             .fetch_add(1, Ordering::SeqCst);
     }
 
+    #[cfg(test)]
+    fn clear_wal_fault_injection_for_test(&self) {
+        self.wal_faults.fail_next_flush.store(0, Ordering::SeqCst);
+        self.wal_faults.fail_next_sync_all.store(0, Ordering::SeqCst);
+        self.wal_faults.fail_next_sync_data.store(0, Ordering::SeqCst);
+    }
+
     fn maybe_fail_wal_flush_for_test(&self) -> Result<(), String> {
         #[cfg(test)]
         {
@@ -20652,6 +20659,7 @@ mod tests {
                 .contains("injected WAL sync_all failure"));
         }
 
+        engine.clear_wal_fault_injection_for_test();
         let before_success = engine.wal_sync_count();
         engine
             .execute("INSERT INTO gc_fail (id, v) VALUES (100, 100)")
