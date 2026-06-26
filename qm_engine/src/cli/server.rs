@@ -7,7 +7,7 @@
 //! - Enforces password change away from the default
 
 use crate::gateway::native_sql::NativeSqlEngine;
-use crate::gateway::{AuthQueryHandler, ConnectionConfig, QueryHandler, Server};
+use crate::gateway::{ConnectionConfig, Server};
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -238,7 +238,7 @@ pub fn run_start(
     }
 
     // Build engine.
-    let engine = NativeSqlEngine::with_data_dir(data_dir.clone());
+    let engine = Arc::new(NativeSqlEngine::with_data_dir(data_dir.clone()));
 
     // SEC-02: Override default admin password.
     if let Some(ref pw) = admin_password {
@@ -259,6 +259,16 @@ pub fn run_start(
         std::process::exit(1);
     }
 
+    // Tokio runtime (shared by pgwire + optional cluster transport).
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(num_cpus::get().max(4))
+        .enable_all()
+        .build()
+        .expect("failed to create tokio runtime");
+
+    let attach = crate::cluster::prepare_gateway_cluster(engine.clone(), &rt);
+    let (handler, authed_handler) = crate::cluster::routed_query_handlers(&attach, engine.clone());
+
     // Build config.
     let config = ConnectionConfig {
         host: host.to_string(),
@@ -270,11 +280,7 @@ pub fn run_start(
 
     // Create query handlers.
     let auth_mgr = engine.auth.clone();
-    let engine2 = engine.clone();
     let engine_for_shutdown = engine.clone();
-    let handler: QueryHandler = Arc::new(move |sql: String| engine.execute(&sql));
-    let authed_handler: AuthQueryHandler =
-        Arc::new(move |sql: String, user: String| engine2.execute_as(&sql, &user));
 
     let server = Arc::new(Server::new_with_auth(
         config.clone(),
@@ -296,12 +302,6 @@ pub fn run_start(
     });
 
     // Run the server (blocking on tokio runtime).
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(num_cpus::get().max(4))
-        .enable_all()
-        .build()
-        .expect("failed to create tokio runtime");
-
     rt.block_on(async { server.run().await })
         .unwrap_or_else(|e| eprintln!("server error: {}", e));
 

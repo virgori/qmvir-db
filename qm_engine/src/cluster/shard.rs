@@ -94,6 +94,11 @@ impl ConsistentHashRing {
         }
     }
 
+    /// Return a key guaranteed to route to `shard_id` (first vnode position).
+    pub fn sample_key_for_shard(&self, shard_id: ShardId) -> Option<u64> {
+        self.shard_vnodes.get(&shard_id)?.first().copied()
+    }
+
     /// Find shard for a vector ID.
     pub fn shard_for_id(&self, id: i64) -> Option<ShardId> {
         let key = hash_key(id);

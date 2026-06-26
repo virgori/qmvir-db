@@ -330,6 +330,7 @@ impl MetricsRegistry {
         out.push_str(&self.query_latency.format());
         out.push_str(&self.insert_latency.format());
         out.push_str(&self.wal_sync_latency.format());
+        out.push_str(&crate::cluster::render_cluster_metrics());
         out
     }
 }

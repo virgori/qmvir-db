@@ -40,3 +40,6 @@ jobs:
 
       - name: Benchmark smoke gate
         run: python scripts/release_benchmark_native_sql.py --quick --build-mode ci --feature-flags default
+
+      - name: Enterprise HA gate
+        run: bash scripts/enterprise_ha_gate.sh

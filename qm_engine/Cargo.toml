@@ -55,6 +55,12 @@ rust_decimal = { version = "1", features = ["serde-with-str"] }
 # CRC for WAL integrity  
 crc32fast = "1.4"
 
+# Inter-node TLS (Phase H, optional)
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+tokio-rustls = "0.26"
+rustls-pemfile = "2"
+webpki-roots = "0.26"
+
 # Password hashing for auth
 sha2 = "0.10"
 hex = "0.4"
@@ -90,6 +96,7 @@ io-uring = "0.6"
 libc = "0.2"
 
 [dev-dependencies]
+rcgen = "0.13"
 tempfile = "3"
 criterion = { version = "0.5", features = ["html_reports"] }
 
@@ -178,6 +185,14 @@ path = "tests/release_crash_kill_recovery.rs"
 [[test]]
 name = "cluster_ha_smoke"
 path = "tests/cluster_ha_smoke.rs"
+
+[[test]]
+name = "cluster_gateway_forward"
+path = "tests/cluster_gateway_forward.rs"
+
+[[test]]
+name = "cluster_certify_live"
+path = "tests/cluster_certify_live.rs"
 
 [[test]]
 name = "single_node_cluster_isolation"

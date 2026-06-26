@@ -116,6 +116,52 @@ impl ShardGroupCatalog {
     pub fn kinds(&self) -> impl Iterator<Item = ShardGroupKind> + '_ {
         self.by_kind.keys().copied()
     }
+
+    /// Promote standby when a shard primary fails (all workload groups).
+    pub fn failover_shard(
+        &mut self,
+        shard_id: ShardId,
+        failed_primary: SocketAddr,
+        new_primary: SocketAddr,
+    ) {
+        for g in self.groups.values_mut() {
+            for ep in &mut g.endpoints {
+                if ep.shard_id == shard_id && ep.primary == failed_primary {
+                    ep.replicas.retain(|r| *r != new_primary);
+                    if !ep.replicas.contains(&failed_primary) {
+                        ep.replicas.push(failed_primary);
+                    }
+                    ep.primary = new_primary;
+                }
+            }
+        }
+    }
+
+    pub fn join_shard(
+        &mut self,
+        shard_id: ShardId,
+        primary: SocketAddr,
+        replicas: Vec<SocketAddr>,
+    ) {
+        for g in self.groups.values_mut() {
+            if let Some(ep) = g.endpoints.iter_mut().find(|e| e.shard_id == shard_id) {
+                ep.primary = primary;
+                ep.replicas = replicas.clone();
+            } else {
+                g.endpoints.push(ShardEndpoint {
+                    shard_id,
+                    primary,
+                    replicas: replicas.clone(),
+                });
+            }
+        }
+    }
+
+    pub fn leave_shard(&mut self, shard_id: ShardId) {
+        for g in self.groups.values_mut() {
+            g.endpoints.retain(|e| e.shard_id != shard_id);
+        }
+    }
 }
 
 /// Thread-safe view used by QM Router on data nodes.

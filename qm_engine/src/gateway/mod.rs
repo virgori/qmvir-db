@@ -350,15 +350,18 @@ impl PyPostgresGateway {
             return Ok(());
         }
 
-        let native = match data_dir {
+        let native = Arc::new(match data_dir {
             Some(ref d) => NativeSqlEngine::with_data_dir(std::path::PathBuf::from(d)),
             None => NativeSqlEngine::new(),
-        };
+        });
         let auth_mgr = native.auth.clone();
-        let native2 = native.clone();
-        let handler: QueryHandler = Arc::new(move |sql: String| native.execute(&sql));
-        let authed_handler: connection::AuthQueryHandler =
-            Arc::new(move |sql: String, user: String| native2.execute_as(&sql, &user));
+
+        let attach = crate::cluster::prepare_gateway_cluster(
+            native.clone(),
+            self.inner.runtime.as_ref(),
+        );
+        let (handler, authed_handler) =
+            crate::cluster::routed_query_handlers(&attach, native.clone());
 
         let server = Arc::new(Server::new_with_auth(
             self.inner.config.clone(),

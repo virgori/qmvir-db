@@ -632,5 +632,53 @@ fn main() {
         Commands::Status => {
             qm_engine::cli::server::run_status(&cli.data_dir);
         }
+
+        Commands::Cluster { action } => match action {
+            qm_engine::cli::ClusterAction::Status => {
+                qm_engine::cli::cluster::run_status();
+            }
+            qm_engine::cli::ClusterAction::Health => {
+                qm_engine::cli::cluster::run_health();
+            }
+            qm_engine::cli::ClusterAction::Readiness => {
+                qm_engine::cli::cluster::run_readiness();
+            }
+            qm_engine::cli::ClusterAction::Join {
+                shard_id,
+                primary,
+                replicas,
+            } => {
+                let primary_addr: std::net::SocketAddr = primary
+                    .parse()
+                    .unwrap_or_else(|_| {
+                        eprintln!("invalid primary address: {primary}");
+                        std::process::exit(1);
+                    });
+                let replica_addrs: Vec<std::net::SocketAddr> = replicas
+                    .iter()
+                    .filter_map(|s| {
+                        s.parse().map_err(|_| {
+                            eprintln!("invalid replica address: {s}");
+                        }).ok()
+                    })
+                    .collect();
+                qm_engine::cli::cluster::run_join(shard_id, primary_addr, replica_addrs);
+            }
+            qm_engine::cli::ClusterAction::Leave { shard_id } => {
+                qm_engine::cli::cluster::run_leave(shard_id);
+            }
+            qm_engine::cli::ClusterAction::Lag => {
+                qm_engine::cli::cluster::run_lag();
+            }
+            qm_engine::cli::ClusterAction::Metrics => {
+                qm_engine::cli::cluster::run_metrics();
+            }
+            qm_engine::cli::ClusterAction::Certify => {
+                let code = qm_engine::cli::cluster::run_certify(true);
+                if code != 0 {
+                    std::process::exit(code);
+                }
+            }
+        },
     }
 }

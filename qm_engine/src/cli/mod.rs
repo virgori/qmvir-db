@@ -2,6 +2,7 @@
 
 pub mod backup_cmd;
 pub mod check;
+pub mod cluster;
 pub mod dump;
 pub mod guide;
 pub mod i18n;
@@ -258,7 +259,6 @@ pub enum Commands {
     },
 
     /// Built-in usage guide and important notes
-    #[command(alias = "help")]
     Guide {
         /// Topic: all | quickstart | backup | studio | cli | notes
         #[arg(default_value = "all")]
@@ -302,6 +302,42 @@ pub enum Commands {
 
     /// Show status of a running QMvir server
     Status,
+
+    /// Cluster HA status (env-driven topology)
+    Cluster {
+        #[command(subcommand)]
+        action: ClusterAction,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum ClusterAction {
+    /// Show cluster config and shard group summary
+    Status,
+    /// Ping shard / WAL peers (live)
+    Health,
+    /// Enterprise HA readiness scorecard
+    Readiness,
+    /// Register shard primary on cluster peers
+    Join {
+        #[arg(long)]
+        shard_id: u32,
+        #[arg(long)]
+        primary: String,
+        #[arg(long, value_delimiter = ',')]
+        replicas: Vec<String>,
+    },
+    /// Remove a shard from cluster peers
+    Leave {
+        #[arg(long)]
+        shard_id: u32,
+    },
+    /// Show WAL replication lag (LSN)
+    Lag,
+    /// Export cluster HA Prometheus metrics
+    Metrics,
+    /// Enterprise HA certification gate (exit 1 if not certified)
+    Certify,
 }
 
 #[derive(Subcommand)]

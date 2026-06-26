@@ -42,6 +42,8 @@ pub struct RoutePlan {
     pub group_id: u32,
     pub shard_id: ShardId,
     pub primary: Option<SocketAddr>,
+    #[serde(default)]
+    pub replicas: Vec<SocketAddr>,
     pub shard_key: u64,
 }
 
@@ -110,11 +112,18 @@ impl QmRouter {
             .get_shard(shard_key)
             .ok_or_else(|| format!("empty hash ring for group {}", group.group_id))?;
         let primary = group.primary_for_shard(shard_id);
+        let replicas = group
+            .endpoints
+            .iter()
+            .find(|e| e.shard_id == shard_id)
+            .map(|e| e.replicas.clone())
+            .unwrap_or_default();
         Ok(RoutePlan {
             workload,
             group_id: group.group_id,
             shard_id,
             primary,
+            replicas,
             shard_key,
         })
     }

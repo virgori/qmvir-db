@@ -84,6 +84,14 @@ impl ClusterRuntime {
     pub fn replace_catalog(&self, catalog: ShardGroupCatalog) {
         *self.router.write() = Some(QmRouter::new(catalog));
     }
+
+    /// Snapshot catalog for DDL fan-out / admin (cold path).
+    pub fn router_snapshot(&self) -> Option<ShardGroupCatalog> {
+        if !self.is_active() {
+            return None;
+        }
+        self.router.read().as_ref().map(|r| r.catalog().clone())
+    }
 }
 
 /// Gateway helper: env alone is never enough to route off-node.

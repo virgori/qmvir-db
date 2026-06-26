@@ -96,6 +96,8 @@ pub struct TwoPhaseCoordinator {
     /// (node_id, peer_address)
     participants: Vec<(u32, SocketAddr)>,
     runtime: Arc<tokio::runtime::Runtime>,
+    local_participant: Option<Arc<TwoPhaseParticipant>>,
+    local_node_id: Option<u32>,
 }
 
 impl TwoPhaseCoordinator {
@@ -109,7 +111,20 @@ impl TwoPhaseCoordinator {
             next_txn_id: std::sync::atomic::AtomicU64::new(1),
             participants,
             runtime: Arc::new(runtime),
+            local_participant: None,
+            local_node_id: None,
         }
+    }
+
+    pub fn with_local(
+        participants: Vec<(u32, SocketAddr)>,
+        local_participant: Arc<TwoPhaseParticipant>,
+        local_node_id: u32,
+    ) -> Self {
+        let mut coord = Self::new(participants);
+        coord.local_participant = Some(local_participant);
+        coord.local_node_id = Some(local_node_id);
+        coord
     }
 
     /// Begin a new distributed transaction. Returns the transaction ID.
@@ -152,30 +167,48 @@ impl TwoPhaseCoordinator {
 
         // Build futures: one PREPARE per participant that has ops.
         let txns_ref = &self.txns;
+        let local_node_id = self.local_node_id;
+        let local_participant = self.local_participant.clone();
         self.runtime.block_on(async move {
             let mut all_yes = true;
             for (node_id, node_ops) in ops {
-                let addr = participant_addr
-                    .get(&node_id)
-                    .ok_or_else(|| format!("No address for node {}", node_id))?;
-                let client = NodeClient::new(node_id, *addr);
-                // M-05: Wrap prepare with timeout to prevent indefinite blocking.
-                let vote = match tokio::time::timeout(
-                    Duration::from_secs(30),
-                    client.send_prepare(txn_id, node_ops),
-                ).await {
-                    Ok(result) => result.unwrap_or(false),
-                    Err(_) => {
-                        tracing::warn!("2PC prepare timeout for node {} in txn {}", node_id, txn_id);
-                        false
+                let vote = if local_node_id == Some(node_id) {
+                    local_participant
+                        .as_ref()
+                        .map(|p| p.prepare(txn_id, node_ops))
+                        .unwrap_or(false)
+                } else {
+                    let addr = participant_addr
+                        .get(&node_id)
+                        .ok_or_else(|| format!("No address for node {}", node_id))?;
+                    let client = NodeClient::new(node_id, *addr);
+                    match tokio::time::timeout(
+                        Duration::from_secs(30),
+                        client.send_prepare(txn_id, node_ops),
+                    )
+                    .await
+                    {
+                        Ok(result) => result.unwrap_or(false),
+                        Err(_) => {
+                            tracing::warn!(
+                                "2PC prepare timeout for node {} in txn {}",
+                                node_id,
+                                txn_id
+                            );
+                            false
+                        }
                     }
                 };
                 if !vote {
                     all_yes = false;
                 }
-                txns_ref.lock().unwrap()
+                txns_ref
+                    .lock()
+                    .unwrap()
                     .get_mut(&txn_id)
-                    .map(|t| { t.votes.insert(node_id, vote); });
+                    .map(|t| {
+                        t.votes.insert(node_id, vote);
+                    });
             }
 
             txns_ref.lock().unwrap()
@@ -227,9 +260,19 @@ impl TwoPhaseCoordinator {
         };
 
         let txns_ref = &self.txns;
+        let local_node_id = self.local_node_id;
+        let local_participant = self.local_participant.clone();
         self.runtime.block_on(async move {
             for node_id in node_ids {
-                if let Some(&addr) = participant_addr.get(&node_id) {
+                if local_node_id == Some(node_id) {
+                    if let Some(p) = local_participant.as_ref() {
+                        if commit {
+                            let _ = p.commit(txn_id);
+                        } else {
+                            p.abort(txn_id);
+                        }
+                    }
+                } else if let Some(&addr) = participant_addr.get(&node_id) {
                     let client = NodeClient::new(node_id, addr);
                     let _ = client.send_commit_or_abort(txn_id, commit).await;
                 }

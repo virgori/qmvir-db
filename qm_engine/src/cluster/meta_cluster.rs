@@ -10,10 +10,11 @@
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use super::shard_group::{ShardGroup, ShardGroupCatalog, ShardGroupKind};
+use super::shard_group::{ShardEndpoint, ShardGroup, ShardGroupCatalog, ShardGroupKind};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RaftRole {
@@ -365,6 +366,52 @@ impl MetaCluster {
                 ShardGroupKind::Analytics => 4,
             };
             let group = ShardGroup::new(group_id, kind, shards_per_group);
+            self.propose_on_leader(leader_id, MetaCommand::UpsertShardGroup { group });
+        }
+        true
+    }
+
+    /// Bootstrap shard groups with concrete primary endpoints (single-node or dev cluster).
+    pub fn bootstrap_default_groups_with_transport(
+        &self,
+        leader_id: u32,
+        shards_per_group: u32,
+        host: IpAddr,
+        transport_port: u16,
+    ) -> bool {
+        let primary = SocketAddr::new(host, transport_port);
+        let registry = super::node_registry::ShardEndpointRegistry::with_default_primary(primary);
+        self.bootstrap_default_groups_with_registry(leader_id, shards_per_group, &registry)
+    }
+
+    /// Bootstrap shard groups using per-shard endpoint registry (multi-node).
+    pub fn bootstrap_default_groups_with_registry(
+        &self,
+        leader_id: u32,
+        shards_per_group: u32,
+        registry: &super::node_registry::ShardEndpointRegistry,
+    ) -> bool {
+        if !self.elect_leader(leader_id) {
+            return false;
+        }
+        for kind in ShardGroupKind::all() {
+            let group_id = match kind {
+                ShardGroupKind::Oltp => 1,
+                ShardGroupKind::Vector => 2,
+                ShardGroupKind::Search => 3,
+                ShardGroupKind::Analytics => 4,
+            };
+            let mut group = ShardGroup::new(group_id, kind, shards_per_group);
+            for shard_id in 0..shards_per_group {
+                let Some(primary) = registry.primary_for_shard(shard_id) else {
+                    continue;
+                };
+                group.endpoints.push(ShardEndpoint {
+                    shard_id,
+                    primary,
+                    replicas: registry.replicas_for_shard(shard_id),
+                });
+            }
             self.propose_on_leader(leader_id, MetaCommand::UpsertShardGroup { group });
         }
         true

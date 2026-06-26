@@ -324,7 +324,13 @@ impl Connection {
                     let result = if let Some(c) = cached {
                         Ok(c)
                     } else {
-                        self.dispatch_query(&query)
+                        Self::run_query_blocking(
+                            self.query_handler.clone(),
+                            self.authed_handler.clone(),
+                            self.user.to_string(),
+                            query,
+                        )
+                        .await
                     };
                     match result {
                         Ok(result) => {
@@ -523,8 +529,15 @@ impl Connection {
             return Ok(());
         }
 
-        // Call the query handler (with or without auth context).
-        match self.dispatch_query(sql_trimmed) {
+        // Call the query handler off the async runtime (cluster forward uses blocking I/O).
+        match Self::run_query_blocking(
+            self.query_handler.clone(),
+            self.authed_handler.clone(),
+            self.user.to_string(),
+            sql_trimmed.to_string(),
+        )
+        .await
+        {
             Ok(result) => {
                 // Send row description if we have columns
                 if !result.columns.is_empty() {
@@ -551,7 +564,25 @@ impl Connection {
         Ok(())
     }
 
-    /// Dispatch a query through the authed handler if available, else plain handler.
+    /// Run a query on the blocking thread pool (safe for cluster TCP forward).
+    async fn run_query_blocking(
+        handler: QueryHandler,
+        authed: Option<AuthQueryHandler>,
+        user: String,
+        sql: String,
+    ) -> Result<QueryResult, String> {
+        tokio::task::spawn_blocking(move || {
+            if let Some(ref h) = authed {
+                h(sql, user)
+            } else {
+                handler(sql)
+            }
+        })
+        .await
+        .map_err(|e| format!("query worker failed: {e}"))?
+    }
+
+    /// Synchronous dispatch (non-async callers only).
     fn dispatch_query(&self, sql: &str) -> Result<QueryResult, String> {
         if let Some(ref h) = self.authed_handler {
             h(sql.to_string(), self.user.to_string())
