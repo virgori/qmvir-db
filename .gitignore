@@ -17,6 +17,7 @@ venv/
 .env.*
 !.env.example
 !**/.env.example
+.cluster-tls-dev/
 
 # Build artifacts
 dist/
