@@ -185,6 +185,7 @@ mod tests {
 
     #[test]
     fn cross_shard_2pc_commits_on_two_nodes() {
+        let _net = crate::cluster::test_sync::NETWORK.lock();
         let rt = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(4)
             .enable_all()

@@ -400,14 +400,26 @@ impl NodeClient {
         }
     }
 
-    /// Send a 2PC COMMIT or ABORT to a participant.
+    /// Send a 2PC COMMIT or ABORT to a participant and wait for acknowledgement.
     pub async fn send_commit_or_abort(&self, txn_id: u64, commit: bool) -> io::Result<()> {
         let msg_type = if commit { MSG_COMMIT_REQ } else { MSG_ABORT_REQ };
         let payload = bincode::serialize(&CommitAbortMsg { txn_id })
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
         let mut stream = TcpStream::connect(self.addr).await?;
         NodeFrame::new(msg_type, payload).write_to(&mut stream).await?;
-        Ok(())
+        let resp = NodeFrame::read_from(&mut stream).await?;
+        match resp.msg_type {
+            MSG_PONG => Ok(()),
+            MSG_PREPARE_ABORT if commit => Err(io::Error::new(
+                io::ErrorKind::Other,
+                format!("2PC commit for txn {txn_id} rejected"),
+            )),
+            MSG_PREPARE_ABORT => Ok(()),
+            other => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("Unexpected 2PC commit response: {:#x}", other),
+            )),
+        }
     }
 }
 

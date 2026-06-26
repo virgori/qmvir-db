@@ -56,6 +56,7 @@ mod tests {
 
     #[test]
     fn sync_wal_rpo_zero_after_primary_write() {
+        let _net = crate::cluster::test_sync::NETWORK.lock();
         let rt = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .enable_all()
@@ -100,6 +101,7 @@ mod tests {
 
     #[test]
     fn failover_reroute_after_primary_partition() {
+        let _net = crate::cluster::test_sync::NETWORK.lock();
         let rt = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .enable_all()
@@ -168,6 +170,7 @@ mod tests {
 
     #[test]
     fn fencing_rejects_stale_epoch_after_bump() {
+        let _net = crate::cluster::test_sync::NETWORK.lock();
         let cur = super::super::fencing::current_epoch();
         super::super::fencing::bump_epoch();
         assert!(!super::super::fencing::accept_epoch(cur, true));

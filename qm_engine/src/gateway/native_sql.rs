@@ -4967,21 +4967,21 @@ impl NativeSqlEngine {
 
     #[cfg(test)]
     fn inject_next_wal_flush_failure_for_test(&self) {
-        self.wal_faults.fail_next_flush.store(1, Ordering::SeqCst);
+        self.wal_faults.fail_next_flush.fetch_add(1, Ordering::SeqCst);
     }
 
     #[cfg(test)]
     fn inject_next_wal_sync_all_failure_for_test(&self) {
         self.wal_faults
             .fail_next_sync_all
-            .store(1, Ordering::SeqCst);
+            .fetch_add(1, Ordering::SeqCst);
     }
 
     #[cfg(test)]
     fn inject_next_wal_sync_data_failure_for_test(&self) {
         self.wal_faults
             .fail_next_sync_data
-            .store(1, Ordering::SeqCst);
+            .fetch_add(1, Ordering::SeqCst);
     }
 
     fn maybe_fail_wal_flush_for_test(&self) -> Result<(), String> {
@@ -6080,10 +6080,15 @@ impl NativeSqlEngine {
             if Self::wal_trace_enabled() {
                 self.wal_trace.sync_calls.fetch_add(1, Ordering::Relaxed);
             }
-        } else if profile_enabled {
-            self.native_profile
-                .sync_data_count
-                .fetch_add(1, Ordering::Relaxed);
+        } else {
+            // O_DSYNC path: bytes are durable on write, but test fault injection must
+            // still run at the per-commit sync hook.
+            self.maybe_fail_wal_sync_all_for_test()?;
+            if profile_enabled {
+                self.native_profile
+                    .sync_data_count
+                    .fetch_add(1, Ordering::Relaxed);
+            }
         }
         self.wal_sync_count.fetch_add(1, Ordering::Relaxed);
         Ok(())
@@ -6132,6 +6137,7 @@ impl NativeSqlEngine {
         }
         let open_datasync = self.wal_open_datasync.load(Ordering::Relaxed);
         if open_datasync {
+            self.maybe_fail_wal_sync_data_for_test()?;
             if profile_enabled {
                 self.native_profile
                     .sync_data_count
@@ -20616,9 +20622,12 @@ mod tests {
             .execute("CREATE TABLE gc_fail (id INTEGER PRIMARY KEY, v INTEGER)")
             .unwrap();
         engine.set_wal_sync_policy("group_commit_sync").unwrap();
-        engine.inject_next_wal_sync_all_failure_for_test();
 
         let workers = 8usize;
+        for _ in 0..workers {
+            engine.inject_next_wal_sync_all_failure_for_test();
+        }
+
         let barrier = Arc::new(Barrier::new(workers));
         let mut handles = Vec::new();
         for id in 0..workers {
