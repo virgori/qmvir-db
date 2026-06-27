@@ -274,7 +274,14 @@ impl TwoPhaseCoordinator {
                     }
                 } else if let Some(&addr) = participant_addr.get(&node_id) {
                     let client = NodeClient::new(node_id, addr);
-                    let _ = client.send_commit_or_abort(txn_id, commit).await;
+                    if let Err(e) = client.send_commit_or_abort(txn_id, commit).await {
+                        return Err(format!(
+                            "2PC {} to node {} ({}) failed: {e}",
+                            if commit { "commit" } else { "abort" },
+                            node_id,
+                            addr
+                        ));
+                    }
                 }
             }
             txns_ref.lock().unwrap()

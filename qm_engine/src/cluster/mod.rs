@@ -36,6 +36,14 @@ pub mod wal_apply;
 pub mod wal_buffer;
 pub mod wal_replication;
 
+#[cfg(test)]
+pub(crate) mod test_sync {
+    use parking_lot::Mutex;
+
+    /// Serialize in-process TCP cluster integration tests under parallel `cargo test`.
+    pub static NETWORK: Mutex<()> = Mutex::new(());
+}
+
 pub use config::ClusterNodeConfig;
 pub use cross_shard::{
     execute_distributed_batch, is_distributed_batch, parse_distributed_batch, participant_map,

@@ -408,6 +408,7 @@ mod tests {
 
     #[test]
     fn two_node_shard_registry_routes_insert_to_peer() {
+        let _net = crate::cluster::test_sync::NETWORK.lock();
         use super::super::meta_cluster::MetaCluster;
         use super::super::node_registry::{find_shard_key_for_shard, ShardEndpointRegistry};
 
@@ -477,6 +478,7 @@ mod tests {
 
     #[test]
     fn ddl_fanout_creates_on_both_nodes() {
+        let _net = crate::cluster::test_sync::NETWORK.lock();
         use super::super::meta_cluster::MetaCluster;
         use super::super::node_registry::ShardEndpointRegistry;
 
@@ -519,6 +521,7 @@ mod tests {
 
     #[test]
     fn wal_replication_ships_local_dml_to_standby() {
+        let _net = crate::cluster::test_sync::NETWORK.lock();
         use super::super::meta_cluster::MetaCluster;
         use super::super::node_registry::{find_shard_key_for_shard, ShardEndpointRegistry};
 
@@ -567,6 +570,7 @@ mod tests {
 
     #[test]
     fn wal_replication_skips_duplicate_lsn_on_retry() {
+        let _net = crate::cluster::test_sync::NETWORK.lock();
         use super::super::meta_cluster::MetaCluster;
         use super::super::node_registry::{find_shard_key_for_shard, ShardEndpointRegistry};
         use super::super::transport::NodeClient;
