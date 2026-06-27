@@ -13,7 +13,11 @@ pub fn current_epoch() -> u64 {
     CLUSTER_EPOCH.load(Ordering::Acquire)
 }
 
-pub fn bump_epoch() -> u64 {
+    pub fn set_epoch(epoch: u64) {
+        CLUSTER_EPOCH.store(epoch, Ordering::Release);
+    }
+
+    pub fn bump_epoch() -> u64 {
     CLUSTER_EPOCH.fetch_add(1, Ordering::AcqRel) + 1
 }
 

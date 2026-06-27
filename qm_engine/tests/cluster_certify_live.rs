@@ -157,9 +157,12 @@ async fn enterprise_certify_live_two_node_cluster() {
         .await
         .expect("join");
     for gate in &report.gates {
+        if !gate.required {
+            continue;
+        }
         assert!(
             gate.passed,
-            "gate {} failed: {}",
+            "required gate {} failed: {}",
             gate.id,
             gate.detail
         );

@@ -58,7 +58,11 @@ fn peer_up(addr: SocketAddr, timeout: Duration) -> bool {
 }
 
 /// Probe shard primaries; promote standby when primary is down.
-pub fn check_and_failover(runtime: &ClusterRuntime, cfg: &ClusterNodeConfig) -> usize {
+pub fn check_and_failover(
+    runtime: &ClusterRuntime,
+    cfg: &ClusterNodeConfig,
+    data_dir: Option<&std::path::Path>,
+) -> usize {
     if !cfg.failover_enabled || !runtime.is_active() {
         return 0;
     }
@@ -89,10 +93,26 @@ pub fn check_and_failover(runtime: &ClusterRuntime, cfg: &ClusterNodeConfig) -> 
             continue;
         };
 
-        let updated = apply_failover_to_catalog(&catalog, ep.shard_id, primary, standby);
-        runtime.replace_catalog(updated);
+        if cfg.stonith_enabled {
+            if super::stonith::promote_with_fence(
+                cfg,
+                runtime,
+                data_dir,
+                ep.shard_id,
+                primary,
+                standby,
+            )
+            .is_err()
+            {
+                cluster_metrics::inc_failover_skipped();
+                continue;
+            }
+        } else {
+            let updated = apply_failover_to_catalog(&catalog, ep.shard_id, primary, standby);
+            runtime.replace_catalog(updated);
+            super::fencing::bump_epoch();
+        }
         promotions += 1;
-        super::fencing::bump_epoch();
         cluster_metrics::inc_failover();
         tracing::warn!(
             "failover: promoted shard {} {primary} -> {standby}",
@@ -107,6 +127,7 @@ pub fn check_and_failover(runtime: &ClusterRuntime, cfg: &ClusterNodeConfig) -> 
 pub fn spawn_failover_loop(
     runtime: Arc<ClusterRuntime>,
     cfg: ClusterNodeConfig,
+    data_dir: Option<std::path::PathBuf>,
     tokio: &tokio::runtime::Runtime,
 ) {
     if !cfg.failover_enabled {
@@ -116,7 +137,7 @@ pub fn spawn_failover_loop(
     tokio.spawn(async move {
         loop {
             tokio::time::sleep(interval).await;
-            let _ = check_and_failover(&runtime, &cfg);
+            let _ = check_and_failover(&runtime, &cfg, data_dir.as_deref());
         }
     });
 }

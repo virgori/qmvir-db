@@ -195,5 +195,9 @@ name = "cluster_certify_live"
 path = "tests/cluster_certify_live.rs"
 
 [[test]]
+name = "cluster_full_enterprise"
+path = "tests/cluster_full_enterprise.rs"
+
+[[test]]
 name = "single_node_cluster_isolation"
 path = "tests/single_node_cluster_isolation.rs"

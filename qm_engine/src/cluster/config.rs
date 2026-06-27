@@ -5,6 +5,8 @@
 use std::env;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
+use super::replica::ConsistencyLevel;
+
 /// Parsed HA settings for a data node. Default: disabled.
 #[derive(Debug, Clone)]
 pub struct ClusterNodeConfig {
@@ -17,16 +19,25 @@ pub struct ClusterNodeConfig {
     pub bind_host: IpAddr,
     /// Ship DML to QM_CLUSTER_WAL_PEERS after local primary write.
     pub wal_replicate: bool,
-    /// Block until all WAL peers ack (stronger durability).
+    /// Block until WAL peers ack (stronger durability).
     pub wal_sync: bool,
     pub wal_peers: Vec<SocketAddr>,
+    /// Enable durable + ring WAL catch-up on standby heal.
+    pub wal_catchup_enabled: bool,
+    /// Write ack policy for WAL replication (majority vs all).
+    pub write_quorum: ConsistencyLevel,
     /// Enable `QM DISTRIBUTED` cross-shard 2PC batches.
     pub two_pc_enabled: bool,
+    /// PG wire BEGIN/COMMIT distributed txn (requires 2PC).
+    pub pg_distributed_enabled: bool,
     /// Background health probe + automatic primary promotion.
     pub failover_enabled: bool,
     pub failover_interval_secs: u64,
     /// Write fencing — reject stale primary writes after promote.
     pub fencing_enabled: bool,
+    /// STONITH primary lease before accepting writes / after promote.
+    pub stonith_enabled: bool,
+    pub stonith_lease_secs: u64,
     /// Shared secret for forwarded auth user attestation (optional).
     pub forward_secret: Option<String>,
 }
@@ -44,10 +55,15 @@ impl Default for ClusterNodeConfig {
             wal_replicate: false,
             wal_sync: false,
             wal_peers: Vec::new(),
+            wal_catchup_enabled: false,
+            write_quorum: ConsistencyLevel::Quorum,
             two_pc_enabled: false,
+            pg_distributed_enabled: false,
             failover_enabled: false,
             failover_interval_secs: 5,
             fencing_enabled: false,
+            stonith_enabled: false,
+            stonith_lease_secs: 30,
             forward_secret: None,
         }
     }
@@ -117,10 +133,18 @@ impl ClusterNodeConfig {
         }
 
         cfg.two_pc_enabled = env_flag("QM_CLUSTER_2PC");
+        cfg.pg_distributed_enabled = env_flag("QM_CLUSTER_PG_DISTRIBUTED");
+        cfg.wal_catchup_enabled = env_flag("QM_CLUSTER_WAL_CATCHUP") || cfg.wal_replicate;
+        if env_flag("QM_CLUSTER_WRITE_QUORUM") {
+            cfg.write_quorum = ConsistencyLevel::Quorum;
+        } else if env_flag("QM_CLUSTER_WRITE_ALL") {
+            cfg.write_quorum = ConsistencyLevel::All;
+        }
         cfg.failover_enabled = env_flag("QM_CLUSTER_FAILOVER");
         cfg.failover_interval_secs = parse_u32("QM_CLUSTER_FAILOVER_INTERVAL_SECS", 5) as u64;
-        cfg.fencing_enabled = env_flag("QM_CLUSTER_FENCING")
-            || cfg.failover_enabled;
+        cfg.fencing_enabled = env_flag("QM_CLUSTER_FENCING") || cfg.failover_enabled;
+        cfg.stonith_enabled = env_flag("QM_CLUSTER_STONITH");
+        cfg.stonith_lease_secs = parse_u32("QM_CLUSTER_STONITH_LEASE_SECS", 30) as u64;
         cfg.forward_secret = env::var("QM_CLUSTER_FORWARD_SECRET").ok();
 
         cfg

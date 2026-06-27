@@ -325,6 +325,7 @@ impl Connection {
                         Ok(c)
                     } else {
                         Self::run_query_blocking(
+                            self.id,
                             self.query_handler.clone(),
                             self.authed_handler.clone(),
                             self.user.to_string(),
@@ -531,6 +532,7 @@ impl Connection {
 
         // Call the query handler off the async runtime (cluster forward uses blocking I/O).
         match Self::run_query_blocking(
+            self.id,
             self.query_handler.clone(),
             self.authed_handler.clone(),
             self.user.to_string(),
@@ -566,17 +568,21 @@ impl Connection {
 
     /// Run a query on the blocking thread pool (safe for cluster TCP forward).
     async fn run_query_blocking(
+        conn_id: u64,
         handler: QueryHandler,
         authed: Option<AuthQueryHandler>,
         user: String,
         sql: String,
     ) -> Result<QueryResult, String> {
         tokio::task::spawn_blocking(move || {
-            if let Some(ref h) = authed {
+            crate::cluster::set_connection_id(conn_id);
+            let result = if let Some(ref h) = authed {
                 h(sql, user)
             } else {
                 handler(sql)
-            }
+            };
+            crate::cluster::clear_connection_id();
+            result
         })
         .await
         .map_err(|e| format!("query worker failed: {e}"))?

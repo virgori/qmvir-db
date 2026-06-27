@@ -20,7 +20,9 @@ pub mod fencing;
 pub mod gateway_bridge;
 pub mod meta_cluster;
 pub mod meta_network;
+pub mod meta_raft_network;
 pub mod node_registry;
+pub mod pg_distributed;
 pub mod readiness;
 pub mod replica;
 pub mod router;
@@ -28,12 +30,14 @@ pub mod runtime;
 pub mod shard;
 pub mod shard_group;
 pub mod shard_key;
+pub mod stonith;
 pub mod tls_config;
 pub mod topology;
 pub mod transport;
 pub mod two_phase_commit;
 pub mod wal_apply;
 pub mod wal_buffer;
+pub mod wal_catchup;
 pub mod wal_replication;
 
 #[cfg(test)]
@@ -51,7 +55,14 @@ pub use cross_shard::{
 pub use ddl_fanout::{is_cluster_ddl, unique_primary_endpoints};
 pub use certify::{evaluate_certification, CertificationGate, CertificationReport};
 pub use fencing::{accept_epoch, bump_epoch, current_epoch};
-pub use meta_network::{meta_network_configured, replicate_meta_entries, MetaAppendMsg};
+pub use meta_raft_network::{
+    bootstrap_catalog_with_network, init_local_meta, networked_meta_ready, propose_with_quorum,
+};
+pub use pg_distributed::{
+    clear_connection_id, execute_pg_routed, pg_distributed_enabled, set_connection_id,
+};
+pub use stonith::{promote_with_fence, require_write_lease, stonith_enabled};
+pub use wal_catchup::{collect_catchup_entries, heal_standby_from_primary};
 pub use failover::{
     apply_failover_to_catalog, check_and_failover, forward_targets, spawn_failover_loop,
 };
@@ -69,7 +80,13 @@ pub use node_registry::{
 pub use replica::{ReplicaSet, ReplicaState, ReplicationConfig};
 pub use wal_apply::{apply_wal_entry, verify_wal_checksum, WalApplyTracker};
 pub use wal_replication::{is_replicable_dml, replicate_after_local_write};
-pub use meta_cluster::{MetaCluster, MetaCommand, MetaRaftNode, RaftRole};
+pub use meta_network::{
+    meta_network_configured, replicate_meta_entries, MetaAppendMsg,
+};
+pub use meta_cluster::{
+    AppendEntriesRequest, AppendEntriesResponse, MetaCluster, MetaCommand, MetaLogEntry,
+    MetaRaftNode, RaftRole, VoteRequest, VoteResponse,
+};
 pub use readiness::{
     collect_peer_addrs, enterprise_tier, evaluate_enterprise_readiness, probe_peers,
     readiness_score_percent, PeerProbe, ReadinessCheck, ReadinessLevel,

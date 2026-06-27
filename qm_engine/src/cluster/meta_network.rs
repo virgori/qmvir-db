@@ -43,6 +43,9 @@ pub fn apply_meta_entries(entries: &[MetaLogEntry]) -> ShardGroupCatalog {
         if let MetaCommand::UpsertShardGroup { group } = &entry.command {
             catalog.upsert_group(group.clone());
         }
+        if let MetaCommand::FencePrimary { epoch, .. } = &entry.command {
+            super::fencing::set_epoch(*epoch);
+        }
     }
     catalog
 }

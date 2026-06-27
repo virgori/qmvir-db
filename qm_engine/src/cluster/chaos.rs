@@ -133,7 +133,7 @@ mod tests {
         };
 
         let start = Instant::now();
-        let promoted = check_and_failover(&runtime, &cfg);
+        let promoted = check_and_failover(&runtime, &cfg, None);
         let rto_ms = start.elapsed().as_millis();
 
         assert!(promoted >= 1, "expected failover promotion");
