@@ -29,6 +29,11 @@ pub enum MetaCommand {
     UpsertShardGroup {
         group: ShardGroup,
     },
+    FencePrimary {
+        shard_id: u32,
+        new_primary: SocketAddr,
+        epoch: u64,
+    },
     Noop,
 }
 
@@ -103,10 +108,21 @@ impl MetaRaftNode {
         self.log.last().map(|e| e.term).unwrap_or(0)
     }
 
+    pub fn log_len(&self) -> u64 {
+        self.last_log_index()
+    }
+
+    pub fn tail_log_term(&self) -> u64 {
+        self.last_log_term()
+    }
+
     fn apply_entry(&mut self, entry: &MetaLogEntry) {
         match &entry.command {
             MetaCommand::UpsertShardGroup { group } => {
                 self.catalog.upsert_group(group.clone());
+            }
+            MetaCommand::FencePrimary { epoch, .. } => {
+                super::fencing::set_epoch(*epoch);
             }
             MetaCommand::Noop => {}
         }

@@ -179,23 +179,66 @@ pub fn evaluate_enterprise_readiness(cfg: &ClusterNodeConfig) -> Vec<ReadinessCh
         } else {
             ReadinessLevel::Fail
         },
-        detail: if cfg.two_pc_enabled {
-            "QM DISTRIBUTED batches — not full PG BEGIN/COMMIT wire".into()
+        detail: if cfg.two_pc_enabled && cfg.pg_distributed_enabled {
+            "PG BEGIN/COMMIT + QM DISTRIBUTED 2PC".into()
+        } else if cfg.two_pc_enabled {
+            "QM DISTRIBUTED batches — enable QM_CLUSTER_PG_DISTRIBUTED=1 for PG wire".into()
         } else {
             "Set QM_CLUSTER_2PC=1 for distributed batches".into()
         },
     });
 
     checks.push(ReadinessCheck {
-        id: "meta_consensus",
-        title: "Networked meta Raft / quorum catalog",
-        level: if super::meta_network::meta_network_configured() {
+        id: "write_quorum",
+        title: "WAL write quorum (majority acks)",
+        level: if cfg.wal_sync && cfg.wal_replicate {
+            ReadinessLevel::Pass
+        } else {
+            ReadinessLevel::Partial
+        },
+        detail: format!("write_quorum={:?}", cfg.write_quorum),
+    });
+
+    checks.push(ReadinessCheck {
+        id: "stonith",
+        title: "STONITH primary lease + meta fence",
+        level: if cfg.stonith_enabled {
             ReadinessLevel::Pass
         } else {
             ReadinessLevel::Fail
         },
-        detail: if super::meta_network::meta_network_configured() {
-            "QM_CLUSTER_META_PEERS networked append".into()
+        detail: if cfg.stonith_enabled {
+            "QM_CLUSTER_STONITH=1 + cluster_primary.lease".into()
+        } else {
+            "Set QM_CLUSTER_STONITH=1".into()
+        },
+    });
+
+    checks.push(ReadinessCheck {
+        id: "pg_distributed",
+        title: "PG wire distributed transactions",
+        level: if super::pg_distributed::pg_distributed_enabled(cfg) {
+            ReadinessLevel::Pass
+        } else {
+            ReadinessLevel::Partial
+        },
+        detail: "QM_CLUSTER_PG_DISTRIBUTED=1".into(),
+    });
+
+    checks.push(ReadinessCheck {
+        id: "meta_consensus",
+        title: "Networked meta Raft / quorum catalog",
+        level: if super::meta_raft_network::networked_meta_ready(cfg) {
+            ReadinessLevel::Pass
+        } else if super::meta_network::meta_network_configured() {
+            ReadinessLevel::Partial
+        } else {
+            ReadinessLevel::Fail
+        },
+        detail: if super::meta_raft_network::networked_meta_ready(cfg) {
+            "MSG_RAFT_* quorum election + append".into()
+        } else if super::meta_network::meta_network_configured() {
+            "QM_CLUSTER_META_PEERS set (legacy append only)".into()
         } else {
             "Set QM_CLUSTER_META_PEERS for networked catalog".into()
         },
@@ -238,7 +281,7 @@ pub fn evaluate_enterprise_readiness(cfg: &ClusterNodeConfig) -> Vec<ReadinessCh
         id: "wal_catchup",
         title: "WAL gap catch-up buffer",
         level: ReadinessLevel::Pass,
-        detail: "MSG_WAL_CATCHUP_REQ ring buffer (4096 entries)".into(),
+        detail: "MSG_WAL_CATCHUP_REQ ring + native_sql.wal durable tail".into(),
     });
 
     checks.push(ReadinessCheck {
@@ -292,7 +335,8 @@ pub fn readiness_score_percent(checks: &[ReadinessCheck]) -> u8 {
 
 pub fn enterprise_tier(score: u8) -> &'static str {
     match score {
-        95..=100 => "enterprise-certified",
+        100 => "production-multi-dc-full",
+        95..=99 => "enterprise-certified",
         85..=94 => "enterprise-ready",
         65..=84 => "production-staging",
         40..=64 => "dev-cluster",

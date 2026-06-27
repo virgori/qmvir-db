@@ -6,6 +6,7 @@
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use tokio::runtime::Runtime;
 
@@ -35,27 +36,40 @@ pub fn cluster_runtime_from_config(cfg: &ClusterNodeConfig) -> Option<Arc<Cluste
         return None;
     }
     let transport_port = cfg.transport_port?;
-    let cluster = MetaCluster::new(&[cfg.meta_leader_id]);
 
-    if let Some(mut registry) = ShardEndpointRegistry::from_env() {
-        if let Some(local) = cfg.local_addr {
-            registry.ensure_default_primary(local);
+    let catalog = if super::meta_raft_network::networked_meta_ready(cfg) {
+        super::meta_raft_network::init_local_meta(cfg.node_id);
+        if let Some(mut registry) = ShardEndpointRegistry::from_env() {
+            if let Some(local) = cfg.local_addr {
+                registry.ensure_default_primary(local);
+            }
+            if !super::meta_raft_network::bootstrap_catalog_with_network(cfg, &registry) {
+                return None;
+            }
         }
-        cluster.bootstrap_default_groups_with_registry(
-            cfg.meta_leader_id,
-            cfg.shards_per_group,
-            &registry,
-        );
+        super::meta_raft_network::catalog_snapshot()
     } else {
-        cluster.bootstrap_default_groups_with_transport(
-            cfg.meta_leader_id,
-            cfg.shards_per_group,
-            cfg.bind_host,
-            transport_port,
-        );
-    }
+        let cluster = MetaCluster::new(&[cfg.meta_leader_id]);
+        if let Some(mut registry) = ShardEndpointRegistry::from_env() {
+            if let Some(local) = cfg.local_addr {
+                registry.ensure_default_primary(local);
+            }
+            cluster.bootstrap_default_groups_with_registry(
+                cfg.meta_leader_id,
+                cfg.shards_per_group,
+                &registry,
+            );
+        } else {
+            cluster.bootstrap_default_groups_with_transport(
+                cfg.meta_leader_id,
+                cfg.shards_per_group,
+                cfg.bind_host,
+                transport_port,
+            );
+        }
+        cluster.catalog_on(cfg.meta_leader_id)?
+    };
 
-    let catalog = cluster.catalog_on(cfg.meta_leader_id)?;
     let rt = ClusterRuntime::with_catalog(catalog);
     rt.enable();
     Some(rt)
@@ -82,8 +96,17 @@ pub fn prepare_gateway_cluster(
     }
 
     if cfg.failover_enabled && runtime.is_active() {
-        failover::spawn_failover_loop(runtime.clone(), cfg.clone(), tokio);
+        failover::spawn_failover_loop(
+            runtime.clone(),
+            cfg.clone(),
+            engine.data_dir.clone(),
+            tokio,
+        );
         tracing::info!("cluster failover health loop enabled");
+    }
+
+    if cfg.wal_catchup_enabled && cfg.wal_replicate && !cfg.wal_peers.is_empty() {
+        spawn_standby_heal_loop(engine.clone(), cfg.clone(), tokio);
     }
 
     ClusterGatewayAttach {
@@ -118,17 +141,57 @@ pub fn routed_query_handlers(
     let eng = engine.clone();
     let cfg = attach.config.clone();
     let handler: QueryHandler = Arc::new(move |sql: String| {
-        execute_routed(&rt, &cfg, &eng, local_addr, &sql)
+        super::pg_distributed::execute_pg_routed(
+            &rt,
+            &cfg,
+            &eng,
+            local_addr,
+            &sql,
+            || execute_routed_inner(&rt, &cfg, &eng, local_addr, &sql),
+        )
     });
 
     let rt2 = attach.runtime.clone();
     let eng2 = engine;
     let cfg2 = attach.config.clone();
     let authed: AuthQueryHandler = Arc::new(move |sql: String, user: String| {
-        execute_routed_as(&rt2, &cfg2, &eng2, local_addr, &sql, &user)
+        super::pg_distributed::execute_pg_routed(
+            &rt2,
+            &cfg2,
+            &eng2,
+            local_addr,
+            &sql,
+            || execute_routed_as_inner(&rt2, &cfg2, &eng2, local_addr, &sql, &user),
+        )
     });
 
     (handler, authed)
+}
+
+fn spawn_standby_heal_loop(
+    engine: Arc<NativeSqlEngine>,
+    cfg: ClusterNodeConfig,
+    tokio: &Runtime,
+) {
+    use super::wal_apply::WalApplyTracker;
+    let tracker = Arc::new(WalApplyTracker::new());
+    let interval = Duration::from_secs(10);
+    tokio.spawn(async move {
+        loop {
+            tokio::time::sleep(interval).await;
+            let eng = engine.clone();
+            let c = cfg.clone();
+            let tr = Arc::clone(&tracker);
+            let _ = tokio::task::spawn_blocking(move || {
+                let _ = super::wal_catchup::heal_standby_from_primary(
+                    &c,
+                    eng.data_dir.as_deref(),
+                    |entry| super::wal_apply::apply_wal_entry(&tr, &eng, entry).map(|_| ()),
+                );
+            })
+            .await;
+        }
+    });
 }
 
 fn forward_result_to_query_result(
@@ -155,6 +218,16 @@ fn forward_result_to_query_result(
 
 /// Gateway execution path: local engine or forward to routed primary.
 pub fn execute_routed(
+    runtime: &ClusterRuntime,
+    cfg: &ClusterNodeConfig,
+    local_engine: &Arc<NativeSqlEngine>,
+    local_addr: Option<SocketAddr>,
+    sql: &str,
+) -> Result<QueryResult, String> {
+    execute_routed_inner(runtime, cfg, local_engine, local_addr, sql)
+}
+
+fn execute_routed_inner(
     runtime: &ClusterRuntime,
     cfg: &ClusterNodeConfig,
     local_engine: &Arc<NativeSqlEngine>,
@@ -203,6 +276,7 @@ fn execute_local_primary(
     local_engine: &Arc<NativeSqlEngine>,
     sql: &str,
 ) -> Result<QueryResult, String> {
+    super::stonith::require_write_lease(local_engine.data_dir.as_deref(), cfg)?;
     let result = local_engine.execute(sql)?;
     super::wal_replication::replicate_after_local_write(cfg, sql)?;
     Ok(result)
@@ -284,6 +358,17 @@ fn is_idempotent_ddl_conflict(sql: &str, err: &str) -> bool {
 
 /// Authenticated path — propagates user to remote primaries/replicas.
 pub fn execute_routed_as(
+    runtime: &ClusterRuntime,
+    cfg: &ClusterNodeConfig,
+    local_engine: &Arc<NativeSqlEngine>,
+    local_addr: Option<SocketAddr>,
+    sql: &str,
+    user: &str,
+) -> Result<QueryResult, String> {
+    execute_routed_as_inner(runtime, cfg, local_engine, local_addr, sql, user)
+}
+
+fn execute_routed_as_inner(
     runtime: &ClusterRuntime,
     cfg: &ClusterNodeConfig,
     local_engine: &Arc<NativeSqlEngine>,

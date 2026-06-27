@@ -27,8 +27,11 @@ cargo test -q --no-default-features --test cluster_certify_live -- --test-thread
 echo "=== [5/6] Enterprise certify CLI (live 2-node processes) ==="
 bash "$ROOT/scripts/run_cluster_certify_live.sh"
 
-echo "=== [6/6] Failover soak drill (live cluster) ==="
+echo "=== [6/7] Failover soak drill (live cluster) ==="
 bash "$ROOT/scripts/cluster_failover_soak.sh" --quick
+
+echo "=== [7/7] Production multi-DC soak (quick) ==="
+bash "$ROOT/scripts/cluster_production_soak.sh" --quick
 
 echo ""
 echo "=== Enterprise HA env checklist (all required for certify) ==="
@@ -44,6 +47,10 @@ export QM_CLUSTER_WAL_PEERS=127.0.0.1:55442
 export QM_CLUSTER_FAILOVER=1
 export QM_CLUSTER_FENCING=1
 export QM_CLUSTER_2PC=1
+export QM_CLUSTER_PG_DISTRIBUTED=1
+export QM_CLUSTER_STONITH=1
+export QM_CLUSTER_WRITE_QUORUM=1
+export QM_CLUSTER_WAL_CATCHUP=1
 export QM_CLUSTER_META_PEERS=127.0.0.1:55442
 export QM_CLUSTER_TLS_CERT=/path/to/cert.pem
 export QM_CLUSTER_TLS_KEY=/path/to/key.pem

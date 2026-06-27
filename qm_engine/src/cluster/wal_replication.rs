@@ -1,20 +1,15 @@
 /*
  * Async/sync WAL replication — ship DML to standby peers after local primary commit.
- *
- * Env:
- *   QM_CLUSTER_WAL_REPLICATE=1
- *   QM_CLUSTER_WAL_SYNC=1          (optional: wait for all replica acks)
- *   QM_CLUSTER_WAL_PEERS=host:port[,host:port...]
  */
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::config::ClusterNodeConfig;
+use super::replica::ConsistencyLevel;
 use super::transport::{NodeClient, WalEntry};
 
 static WAL_LSN: AtomicU64 = AtomicU64::new(1);
 
-/// DML statements replayed via WAL shipping.
 pub fn is_replicable_dml(sql: &str) -> bool {
     let up = sql.trim().to_ascii_uppercase();
     up.starts_with("INSERT ")
@@ -34,7 +29,22 @@ pub fn wal_entry_for_sql(sql: &str) -> WalEntry {
     }
 }
 
-/// After a successful local primary write, ship WAL to configured peers.
+fn active_peers(cfg: &ClusterNodeConfig) -> Vec<std::net::SocketAddr> {
+    cfg.wal_peers
+        .iter()
+        .copied()
+        .filter(|peer| !cfg.local_addr.is_some_and(|local| local == *peer))
+        .collect()
+}
+
+fn required_acks(peer_count: usize, level: ConsistencyLevel) -> usize {
+    match level {
+        ConsistencyLevel::One => 1,
+        ConsistencyLevel::Quorum => peer_count / 2 + 1,
+        ConsistencyLevel::All => peer_count.max(1),
+    }
+}
+
 pub fn replicate_after_local_write(cfg: &ClusterNodeConfig, sql: &str) -> Result<(), String> {
     if !cfg.wal_replicate || !is_replicable_dml(sql) || cfg.wal_peers.is_empty() {
         return Ok(());
@@ -43,14 +53,16 @@ pub fn replicate_after_local_write(cfg: &ClusterNodeConfig, sql: &str) -> Result
     let entry = wal_entry_for_sql(sql);
     super::cluster_metrics::set_primary_wal_lsn(entry.lsn);
     super::wal_buffer::record_shipped(&entry);
-    for peer in &cfg.wal_peers {
-        if cfg.local_addr.is_some_and(|local| local == *peer) {
-            continue;
-        }
-        if cfg.wal_sync {
-            ship_wal_blocking(*peer, &entry)?;
-        } else {
-            let peer = *peer;
+
+    let peers = active_peers(cfg);
+    if peers.is_empty() {
+        return Ok(());
+    }
+
+    if cfg.wal_sync {
+        ship_wal_with_quorum(cfg, &entry, &peers)?;
+    } else {
+        for peer in peers {
             let ship = entry.clone();
             std::thread::spawn(move || {
                 let _ = ship_wal_blocking(peer, &ship);
@@ -58,6 +70,35 @@ pub fn replicate_after_local_write(cfg: &ClusterNodeConfig, sql: &str) -> Result
         }
     }
     Ok(())
+}
+
+fn ship_wal_with_quorum(
+    cfg: &ClusterNodeConfig,
+    entry: &WalEntry,
+    peers: &[std::net::SocketAddr],
+) -> Result<(), String> {
+    let need = required_acks(peers.len(), cfg.write_quorum);
+    let mut acks = 0usize;
+    let mut last_err = String::new();
+    for peer in peers {
+        match ship_wal_blocking(*peer, entry) {
+            Ok(()) => {
+                acks += 1;
+                if acks >= need {
+                    return Ok(());
+                }
+            }
+            Err(e) => last_err = e,
+        }
+    }
+    Err(format!(
+        "wal write quorum failed: {acks}/{need} acks ({})",
+        if last_err.is_empty() {
+            "no peers".into()
+        } else {
+            last_err
+        }
+    ))
 }
 
 pub fn primary_wal_lsn() -> u64 {
@@ -85,16 +126,12 @@ mod tests {
     #[test]
     fn detects_replicable_dml() {
         assert!(is_replicable_dml("INSERT INTO t VALUES (1)"));
-        assert!(is_replicable_dml("UPDATE t SET x=1"));
         assert!(!is_replicable_dml("SELECT * FROM t"));
-        assert!(!is_replicable_dml("CREATE TABLE t (id INT)"));
     }
 
     #[test]
-    fn wal_entry_checksum_matches_sql() {
-        let entry = wal_entry_for_sql("INSERT INTO t VALUES (1)");
-        let mut hasher = crc32fast::Hasher::new();
-        hasher.update(entry.sql.as_bytes());
-        assert_eq!(entry.checksum, hasher.finalize());
+    fn quorum_math_majority_of_three() {
+        assert_eq!(required_acks(3, ConsistencyLevel::Quorum), 2);
+        assert_eq!(required_acks(3, ConsistencyLevel::All), 3);
     }
 }

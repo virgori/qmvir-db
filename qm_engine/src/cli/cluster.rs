@@ -164,10 +164,15 @@ pub fn run_readiness() {
         );
     }
 
-    println!("\nEnterprise gap (remaining hardening):");
-    println!("  • Networked meta Raft quorum (multi-process control plane)");
-    println!("  • Split-brain fencing / STONITH");
+    println!("\nProduction multi-DC (full enterprise) status:");
+    println!("  • Networked meta Raft quorum — MSG_RAFT_* over transport");
+    println!("  • STONITH primary lease — QM_CLUSTER_STONITH=1");
+    println!("  • WAL write quorum + durable catch-up");
+    println!("  • PG BEGIN/COMMIT distributed txn — QM_CLUSTER_PG_DISTRIBUTED=1");
+    println!("\nOptional hardening:");
     println!("  • Full mTLS client-auth between all nodes");
+    println!("  • Cross-DC witness / region-aware routing");
+    println!("  • Long production soak — scripts/cluster_production_soak.sh");
 }
 
 /// Register a shard primary (+ optional replicas) on all configured peers.

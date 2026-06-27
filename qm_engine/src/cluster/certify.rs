@@ -115,6 +115,41 @@ pub fn evaluate_certification(cfg: &ClusterNodeConfig) -> CertificationReport {
         },
     ));
 
+    gates.push(gate(
+        "meta_raft_quorum",
+        "Networked meta Raft quorum",
+        super::meta_raft_network::networked_meta_ready(cfg),
+        "QM_CLUSTER_META_PEERS + MSG_RAFT_*".into(),
+    ));
+
+    gates.push(gate(
+        "stonith_lease",
+        "STONITH primary lease fencing",
+        cfg.stonith_enabled,
+        "QM_CLUSTER_STONITH=1".into(),
+    ));
+
+    gates.push(gate(
+        "write_quorum",
+        "WAL write quorum replication",
+        cfg.wal_sync && cfg.wal_replicate,
+        format!("write_quorum={:?}", cfg.write_quorum),
+    ));
+
+    gates.push(gate(
+        "pg_distributed_txn",
+        "PG wire BEGIN/COMMIT distributed txn",
+        super::pg_distributed::pg_distributed_enabled(cfg),
+        "QM_CLUSTER_PG_DISTRIBUTED=1".into(),
+    ));
+
+    gates.push(gate(
+        "durable_wal_catchup",
+        "Durable WAL segment catch-up",
+        cfg.wal_catchup_enabled,
+        "QM_CLUSTER_WAL_CATCHUP=1".into(),
+    ));
+
     let peers = collect_peer_addrs(cfg);
     let probes = if peers.is_empty() {
         Vec::new()
@@ -161,10 +196,10 @@ pub fn evaluate_certification(cfg: &ClusterNodeConfig) -> CertificationReport {
 
     let marketing_claims = if enterprise_certified {
         vec![
-            "Multi-node HA with automatic failover",
-            "RPO≈0 with sync WAL replication",
-            "Cross-shard atomic QM DISTRIBUTED batches",
-            "Enterprise inter-node TLS",
+            "Production multi-DC HA with networked meta Raft quorum",
+            "STONITH primary lease + epoch fencing",
+            "RPO≈0 with sync WAL write-quorum replication",
+            "Durable WAL catch-up + PG distributed transactions",
         ]
     } else {
         vec![]

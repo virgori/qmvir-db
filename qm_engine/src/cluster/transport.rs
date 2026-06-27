@@ -54,6 +54,10 @@ pub const MSG_WAL_CATCHUP_REQ: u8 = 0x43;
 pub const MSG_WAL_CATCHUP_RESP: u8 = 0x44;
 pub const MSG_META_APPEND: u8    = 0x50;
 pub const MSG_META_ACK: u8       = 0x51;
+pub const MSG_RAFT_VOTE_REQ: u8  = 0x60;
+pub const MSG_RAFT_VOTE_RESP: u8 = 0x61;
+pub const MSG_RAFT_APPEND_REQ: u8 = 0x62;
+pub const MSG_RAFT_APPEND_RESP: u8 = 0x63;
 
 /// Forward a SQL query to a remote node, tagged with a transaction ID.
 #[derive(Debug, Serialize, Deserialize)]
@@ -345,6 +349,70 @@ impl NodeClient {
             ));
         }
         Ok(())
+    }
+
+    pub fn send_raft_vote_blocking(
+        &self,
+        req: &super::meta_cluster::VoteRequest,
+    ) -> io::Result<super::meta_cluster::VoteResponse> {
+        let payload = bincode::serialize(req)
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+        let tls = ClusterTlsConfig::from_env();
+        let mut stream =
+            tls_config::connect_blocking(self.addr, &tls, Duration::from_secs(10))?;
+        NodeFrame::new(MSG_RAFT_VOTE_REQ, payload).write_to_io(&mut stream)?;
+        let resp = NodeFrame::read_from_io(&mut stream)?;
+        if resp.msg_type != MSG_RAFT_VOTE_RESP {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "expected raft vote resp",
+            ));
+        }
+        bincode::deserialize(&resp.payload)
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))
+    }
+
+    pub fn send_raft_append_blocking(
+        &self,
+        req: &super::meta_cluster::AppendEntriesRequest,
+    ) -> io::Result<super::meta_cluster::AppendEntriesResponse> {
+        let payload = bincode::serialize(req)
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+        let tls = ClusterTlsConfig::from_env();
+        let mut stream =
+            tls_config::connect_blocking(self.addr, &tls, Duration::from_secs(10))?;
+        NodeFrame::new(MSG_RAFT_APPEND_REQ, payload).write_to_io(&mut stream)?;
+        let resp = NodeFrame::read_from_io(&mut stream)?;
+        if resp.msg_type != MSG_RAFT_APPEND_RESP {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "expected raft append resp",
+            ));
+        }
+        bincode::deserialize(&resp.payload)
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))
+    }
+
+    pub fn request_wal_catchup_blocking(&self, from_lsn: u64) -> io::Result<Vec<WalEntry>> {
+        #[derive(Serialize)]
+        struct WalCatchupReq {
+            from_lsn: u64,
+        }
+        let payload = bincode::serialize(&WalCatchupReq { from_lsn })
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+        let tls = ClusterTlsConfig::from_env();
+        let mut stream =
+            tls_config::connect_blocking(self.addr, &tls, Duration::from_secs(30))?;
+        NodeFrame::new(MSG_WAL_CATCHUP_REQ, payload).write_to_io(&mut stream)?;
+        let resp = NodeFrame::read_from_io(&mut stream)?;
+        if resp.msg_type != MSG_WAL_CATCHUP_RESP {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "expected wal catchup resp",
+            ));
+        }
+        bincode::deserialize(&resp.payload)
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))
     }
 
     /// Ship a WAL entry to a replica and wait for ack.
@@ -687,10 +755,39 @@ impl TransportServer {
                     }
                     let req: WalCatchupReq = bincode::deserialize(&frame.payload)
                         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
-                    let entries = wal_buffer::entries_after_lsn(req.from_lsn);
+                    let entries = super::wal_catchup::collect_catchup_entries(
+                        engine.data_dir.as_deref(),
+                        req.from_lsn,
+                    );
                     let payload = bincode::serialize(&entries)
                         .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
                     NodeFrame::new(MSG_WAL_CATCHUP_RESP, payload)
+                        .write_to(&mut stream)
+                        .await?;
+                }
+
+                MSG_RAFT_VOTE_REQ => {
+                    let req: super::meta_cluster::VoteRequest =
+                        bincode::deserialize(&frame.payload).map_err(|e| {
+                            io::Error::new(io::ErrorKind::InvalidData, e.to_string())
+                        })?;
+                    let resp = super::meta_raft_network::handle_vote_request(req);
+                    let payload = bincode::serialize(&resp)
+                        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+                    NodeFrame::new(MSG_RAFT_VOTE_RESP, payload)
+                        .write_to(&mut stream)
+                        .await?;
+                }
+
+                MSG_RAFT_APPEND_REQ => {
+                    let req: super::meta_cluster::AppendEntriesRequest =
+                        bincode::deserialize(&frame.payload).map_err(|e| {
+                            io::Error::new(io::ErrorKind::InvalidData, e.to_string())
+                        })?;
+                    let resp = super::meta_raft_network::handle_append_entries(req);
+                    let payload = bincode::serialize(&resp)
+                        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+                    NodeFrame::new(MSG_RAFT_APPEND_RESP, payload)
                         .write_to(&mut stream)
                         .await?;
                 }
