@@ -39,40 +39,50 @@ pub fn cluster_runtime_from_config(cfg: &ClusterNodeConfig) -> Option<Arc<Cluste
 
     let catalog = if super::meta_raft_network::networked_meta_ready(cfg) {
         super::meta_raft_network::init_local_meta(cfg.node_id);
+        let mut networked = false;
         if let Some(mut registry) = ShardEndpointRegistry::from_env() {
             if let Some(local) = cfg.local_addr {
                 registry.ensure_default_primary(local);
             }
-            if !super::meta_raft_network::bootstrap_catalog_with_network(cfg, &registry) {
-                return None;
-            }
+            networked = super::meta_raft_network::bootstrap_catalog_with_network(cfg, &registry);
         }
-        super::meta_raft_network::catalog_snapshot()
-    } else {
-        let cluster = MetaCluster::new(&[cfg.meta_leader_id]);
-        if let Some(mut registry) = ShardEndpointRegistry::from_env() {
-            if let Some(local) = cfg.local_addr {
-                registry.ensure_default_primary(local);
-            }
-            cluster.bootstrap_default_groups_with_registry(
-                cfg.meta_leader_id,
-                cfg.shards_per_group,
-                &registry,
-            );
+        if networked {
+            super::meta_raft_network::catalog_snapshot()
         } else {
-            cluster.bootstrap_default_groups_with_transport(
-                cfg.meta_leader_id,
-                cfg.shards_per_group,
-                cfg.bind_host,
-                transport_port,
-            );
+            legacy_catalog_from_env(cfg, transport_port)?
         }
-        cluster.catalog_on(cfg.meta_leader_id)?
+    } else {
+        legacy_catalog_from_env(cfg, transport_port)?
     };
 
     let rt = ClusterRuntime::with_catalog(catalog);
     rt.enable();
     Some(rt)
+}
+
+fn legacy_catalog_from_env(
+    cfg: &ClusterNodeConfig,
+    transport_port: u16,
+) -> Option<super::shard_group::ShardGroupCatalog> {
+    let cluster = MetaCluster::new(&[cfg.meta_leader_id]);
+    if let Some(mut registry) = ShardEndpointRegistry::from_env() {
+        if let Some(local) = cfg.local_addr {
+            registry.ensure_default_primary(local);
+        }
+        cluster.bootstrap_default_groups_with_registry(
+            cfg.meta_leader_id,
+            cfg.shards_per_group,
+            &registry,
+        );
+    } else {
+        cluster.bootstrap_default_groups_with_transport(
+            cfg.meta_leader_id,
+            cfg.shards_per_group,
+            cfg.bind_host,
+            transport_port,
+        );
+    }
+    cluster.catalog_on(cfg.meta_leader_id)
 }
 
 /// Read env, optionally bootstrap runtime, spawn transport listener.

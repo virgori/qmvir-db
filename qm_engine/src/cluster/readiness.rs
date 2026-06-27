@@ -205,12 +205,12 @@ pub fn evaluate_enterprise_readiness(cfg: &ClusterNodeConfig) -> Vec<ReadinessCh
         level: if cfg.stonith_enabled {
             ReadinessLevel::Pass
         } else {
-            ReadinessLevel::Fail
+            ReadinessLevel::Partial
         },
         detail: if cfg.stonith_enabled {
             "QM_CLUSTER_STONITH=1 + cluster_primary.lease".into()
         } else {
-            "Set QM_CLUSTER_STONITH=1".into()
+            "Optional — set QM_CLUSTER_STONITH=1 for production multi-DC".into()
         },
     });
 

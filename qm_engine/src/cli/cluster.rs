@@ -257,11 +257,20 @@ pub fn run_certify(strict: bool) -> i32 {
             "NO"
         }
     );
+    println!(
+        "  prod-full:  {}",
+        if report.production_multi_dc_full {
+            "YES"
+        } else {
+            "NO"
+        }
+    );
     println!();
 
     for g in &report.gates {
         let mark = if g.passed { "PASS" } else { "FAIL" };
-        println!("  [{mark:4}] {} — {}", g.title, g.detail);
+        let req = if g.required { "req" } else { "opt" };
+        println!("  [{mark:4}] ({req}) {} — {}", g.title, g.detail);
     }
 
     if report.enterprise_certified {

@@ -143,7 +143,7 @@ impl ClusterNodeConfig {
         cfg.failover_enabled = env_flag("QM_CLUSTER_FAILOVER");
         cfg.failover_interval_secs = parse_u32("QM_CLUSTER_FAILOVER_INTERVAL_SECS", 5) as u64;
         cfg.fencing_enabled = env_flag("QM_CLUSTER_FENCING") || cfg.failover_enabled;
-        cfg.stonith_enabled = env_flag("QM_CLUSTER_STONITH") || cfg.failover_enabled;
+        cfg.stonith_enabled = env_flag("QM_CLUSTER_STONITH");
         cfg.stonith_lease_secs = parse_u32("QM_CLUSTER_STONITH_LEASE_SECS", 30) as u64;
         cfg.forward_secret = env::var("QM_CLUSTER_FORWARD_SECRET").ok();
 
