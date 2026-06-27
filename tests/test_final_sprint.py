@@ -1144,7 +1144,9 @@ class TestPackaging:
         import tomllib
         with open("pyproject.toml", "rb") as f:
             cfg = tomllib.load(f)
-        assert cfg["project"]["version"] == "5.4.0"
+        with open("qm_engine/Cargo.toml", "rb") as f:
+            cargo = tomllib.load(f)
+        assert cfg["project"]["version"] == cargo["package"]["version"]
 
     def test_dockerfile_exists(self):
         assert os.path.isfile("Dockerfile")
