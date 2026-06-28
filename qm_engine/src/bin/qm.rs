@@ -673,8 +673,8 @@ fn main() {
             qm_engine::cli::ClusterAction::Metrics => {
                 qm_engine::cli::cluster::run_metrics();
             }
-            qm_engine::cli::ClusterAction::Certify => {
-                let code = qm_engine::cli::cluster::run_certify(true);
+            qm_engine::cli::ClusterAction::Certify { chaos } => {
+                let code = qm_engine::cli::cluster::run_certify(true, chaos);
                 if code != 0 {
                     std::process::exit(code);
                 }

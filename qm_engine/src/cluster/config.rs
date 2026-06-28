@@ -38,6 +38,10 @@ pub struct ClusterNodeConfig {
     /// STONITH primary lease before accepting writes / after promote.
     pub stonith_enabled: bool,
     pub stonith_lease_secs: u64,
+    /// Lightweight witness/arbiter — Raft voter only (no shard data).
+    pub witness_enabled: bool,
+    /// Remote witness peers for meta Raft quorum (data nodes).
+    pub witness_peers: Vec<SocketAddr>,
     /// Shared secret for forwarded auth user attestation (optional).
     pub forward_secret: Option<String>,
 }
@@ -64,6 +68,8 @@ impl Default for ClusterNodeConfig {
             fencing_enabled: false,
             stonith_enabled: false,
             stonith_lease_secs: 30,
+            witness_enabled: false,
+            witness_peers: Vec::new(),
             forward_secret: None,
         }
     }
@@ -145,6 +151,18 @@ impl ClusterNodeConfig {
         cfg.fencing_enabled = env_flag("QM_CLUSTER_FENCING") || cfg.failover_enabled;
         cfg.stonith_enabled = env_flag("QM_CLUSTER_STONITH");
         cfg.stonith_lease_secs = parse_u32("QM_CLUSTER_STONITH_LEASE_SECS", 30) as u64;
+        cfg.witness_enabled = env_flag("QM_CLUSTER_WITNESS");
+        if let Ok(peers) = env::var("QM_CLUSTER_WITNESS_PEERS") {
+            for part in peers.split(',') {
+                let part = part.trim();
+                if part.is_empty() {
+                    continue;
+                }
+                if let Ok(addr) = part.parse::<SocketAddr>() {
+                    cfg.witness_peers.push(addr);
+                }
+            }
+        }
         cfg.forward_secret = env::var("QM_CLUSTER_FORWARD_SECRET").ok();
 
         cfg

@@ -5,10 +5,10 @@ use super::i18n::Lang;
 use std::time::Duration;
 
 use crate::cluster::{
-    cluster_runtime_from_config, collect_peer_addrs, enterprise_tier,
+    apply_chaos_certification, cluster_runtime_from_config, collect_peer_addrs, enterprise_tier,
     evaluate_certification, evaluate_enterprise_readiness, probe_peers,
-    readiness_score_percent, render_cluster_metrics, topology, ClusterNodeConfig, NodeClient, ReadinessLevel, ShardEndpointRegistry,
-    TopologyJoinMsg,
+    readiness_score_percent, render_cluster_metrics, run_chaos_battery, topology,
+    ClusterNodeConfig, NodeClient, ReadinessLevel, ShardEndpointRegistry, TopologyJoinMsg,
 };
 use std::net::SocketAddr;
 
@@ -68,6 +68,14 @@ pub fn run_status() {
         println!(
             "  failover:                 enabled (interval {}s)",
             cfg.failover_interval_secs
+        );
+    }
+    if cfg.witness_enabled {
+        println!("  witness mode:             enabled (Raft voter only)");
+    } else if !cfg.witness_peers.is_empty() {
+        println!(
+            "  witness peers:            {} arbiter(s)",
+            cfg.witness_peers.len()
         );
     }
 
@@ -245,9 +253,15 @@ pub fn run_metrics() {
 }
 
 /// Enterprise certification gate — exit non-zero when not certified.
-pub fn run_certify(strict: bool) -> i32 {
+pub fn run_certify(strict: bool, chaos: bool) -> i32 {
     let cfg = ClusterNodeConfig::from_env();
-    let report = evaluate_certification(&cfg);
+    let mut report = evaluate_certification(&cfg);
+
+    if chaos {
+        println!("Running in-process chaos battery...\n");
+        let chaos_results = run_chaos_battery();
+        report = apply_chaos_certification(report, &chaos_results);
+    }
 
     println!("QM Enterprise HA Certification");
     println!("  score:      {}%", report.score_percent);
@@ -268,6 +282,16 @@ pub fn run_certify(strict: bool) -> i32 {
             "NO"
         }
     );
+    if chaos {
+        println!(
+            "  jepsen:     {}",
+            if report.jepsen_certified {
+                "YES"
+            } else {
+                "NO"
+            }
+        );
+    }
     println!();
 
     for g in &report.gates {
@@ -276,7 +300,15 @@ pub fn run_certify(strict: bool) -> i32 {
         println!("  [{mark:4}] ({req}) {} — {}", g.title, g.detail);
     }
 
-    if report.enterprise_certified {
+    if report.jepsen_certified {
+        println!("\nJepsen-safe claims:");
+        for claim in &report.marketing_claims {
+            println!("  • {claim}");
+        }
+        return 0;
+    }
+
+    if report.enterprise_certified && !chaos {
         println!("\nMarketing-safe claims:");
         for claim in &report.marketing_claims {
             println!("  • {claim}");
@@ -285,7 +317,12 @@ pub fn run_certify(strict: bool) -> i32 {
     }
 
     if strict {
-        println!("\nCertification FAILED — fix gates above before release.");
+        let msg = if chaos && !report.jepsen_certified {
+            "Chaos certification FAILED — fix scenarios above."
+        } else {
+            "Certification FAILED — fix gates above before release."
+        };
+        println!("\n{msg}");
         return 1;
     }
 

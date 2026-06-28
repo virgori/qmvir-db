@@ -11,6 +11,7 @@
 
 pub mod certify;
 pub mod chaos;
+pub mod chaos_battery;
 pub mod cluster_metrics;
 pub mod config;
 pub mod cross_shard;
@@ -39,6 +40,7 @@ pub mod wal_apply;
 pub mod wal_buffer;
 pub mod wal_catchup;
 pub mod wal_replication;
+pub mod witness;
 
 #[cfg(test)]
 pub(crate) mod test_sync {
@@ -53,7 +55,8 @@ pub use cross_shard::{
     execute_distributed_batch, is_distributed_batch, parse_distributed_batch, participant_map,
 };
 pub use ddl_fanout::{is_cluster_ddl, unique_primary_endpoints};
-pub use certify::{evaluate_certification, CertificationGate, CertificationReport};
+pub use certify::{apply_chaos_certification, evaluate_certification, CertificationGate, CertificationReport};
+pub use chaos_battery::{run_chaos_battery, all_passed as chaos_all_passed, ChaosScenarioResult};
 pub use fencing::{accept_epoch, bump_epoch, current_epoch};
 pub use meta_raft_network::{
     bootstrap_catalog_with_network, init_local_meta, networked_meta_ready, propose_with_quorum,
@@ -62,6 +65,7 @@ pub use pg_distributed::{
     clear_connection_id, execute_pg_routed, pg_distributed_enabled, set_connection_id,
 };
 pub use stonith::{promote_with_fence, require_write_lease, stonith_enabled};
+pub use witness::{witness_configured, witness_mode_from_env, witness_quorum_ready};
 pub use wal_catchup::{collect_catchup_entries, heal_standby_from_primary};
 pub use failover::{
     apply_failover_to_catalog, check_and_failover, forward_targets, spawn_failover_loop,

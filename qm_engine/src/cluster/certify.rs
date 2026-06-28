@@ -30,6 +30,7 @@ pub struct CertificationReport {
     pub tier: &'static str,
     pub enterprise_certified: bool,
     pub production_multi_dc_full: bool,
+    pub jepsen_certified: bool,
     pub gates: Vec<CertificationGate>,
     pub marketing_claims: Vec<&'static str>,
 }
@@ -166,6 +167,13 @@ pub fn evaluate_certification(cfg: &ClusterNodeConfig) -> CertificationReport {
         "QM_CLUSTER_WAL_CATCHUP=1".into(),
     ));
 
+    gates.push(optional_gate(
+        "witness_quorum",
+        "Witness arbiter for 2-DC tie-break",
+        super::witness::witness_quorum_ready(cfg),
+        "QM_CLUSTER_WITNESS_PEERS + QM_CLUSTER_META_PEERS".into(),
+    ));
+
     let peers = collect_peer_addrs(cfg);
     let probes = if peers.is_empty() {
         Vec::new()
@@ -210,12 +218,6 @@ pub fn evaluate_certification(cfg: &ClusterNodeConfig) -> CertificationReport {
     let full_pass = gates.iter().all(|g| g.passed);
     let enterprise_certified = required_pass && score >= 95;
     let production_multi_dc_full = full_pass && score >= 95;
-    let tier = if production_multi_dc_full {
-        "production-multi-dc-full"
-    } else {
-        enterprise_tier(score)
-    };
-
     let marketing_claims = if production_multi_dc_full {
         vec![
             "Production multi-DC HA with networked meta Raft quorum",
@@ -233,15 +235,44 @@ pub fn evaluate_certification(cfg: &ClusterNodeConfig) -> CertificationReport {
     } else {
         vec![]
     };
+    let tier = if production_multi_dc_full {
+        "production-multi-dc-full"
+    } else {
+        enterprise_tier(score)
+    };
 
     CertificationReport {
         score_percent: score,
         tier,
         enterprise_certified,
         production_multi_dc_full,
+        jepsen_certified: false,
         gates,
         marketing_claims,
     }
+}
+
+/// Extend report with chaos battery results for jepsen-certified tier.
+pub fn apply_chaos_certification(mut report: CertificationReport, chaos: &[super::chaos_battery::ChaosScenarioResult]) -> CertificationReport {
+    for c in chaos {
+        report.gates.push(CertificationGate {
+            id: c.id,
+            title: c.title,
+            passed: c.passed,
+            detail: format!("{} ({}ms)", c.detail, c.duration_ms),
+            required: true,
+        });
+    }
+    let chaos_pass = super::chaos_battery::all_passed(chaos);
+    report.jepsen_certified = report.enterprise_certified && chaos_pass;
+    if report.jepsen_certified {
+        report.tier = "jepsen-certified";
+        report.marketing_claims = vec![
+            "Chaos-certified: partition failover, RPO≈0, fencing, WAL dedupe",
+            "Witness quorum + enterprise HA gates validated in-process",
+        ];
+    }
+    report
 }
 
 fn check_level(checks: &[ReadinessCheck], id: &str) -> ReadinessLevel {

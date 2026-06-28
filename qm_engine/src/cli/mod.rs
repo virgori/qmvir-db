@@ -344,7 +344,11 @@ pub enum ClusterAction {
     /// Export cluster HA Prometheus metrics
     Metrics,
     /// Enterprise HA certification gate (exit 1 if not certified)
-    Certify,
+    Certify {
+        /// Run in-process chaos battery for jepsen-certified tier
+        #[arg(long)]
+        chaos: bool,
+    },
     /// Enterprise HA / production multi-DC guide (offline)
     Guide,
 }

@@ -13,14 +13,26 @@ qm cluster status
 
 Transport cluster lắng nghe `QM_CLUSTER_TRANSPORT_PORT`; PostgreSQL wire protocol vẫn ở cổng mặc định `55433`.
 
-## Hai cấp chứng nhận
+## Thang chứng nhận (certification ladder)
+
+```
+community (single-node mặc định)
+    ↓
+enterprise-certified
+    ↓
+production-multi-dc-full
+    ↓
+jepsen-certified          ← roadmap
+```
 
 | Cấp | Ý nghĩa | Kiểm tra |
 |-----|---------|----------|
-| **enterprise-certified** | Gate bắt buộc pass + điểm readiness ≥ 95% | `qm cluster certify` → `certified: YES` |
-| **production-multi-dc-full** | Tất cả gate (kể cả O–R tùy chọn) | `qm cluster certify` → `prod-full: YES` |
+| **community** | Single-node; cluster không active | Mặc định |
+| **enterprise-certified** | Gate bắt buộc + readiness ≥ 95% | `qm cluster certify` → `certified: YES` |
+| **production-multi-dc-full** | Tất cả gate (kể cả O–R) | `qm cluster certify` → `prod-full: YES` |
+| **jepsen-certified** | Chaos / partition battery | *Roadmap:* `qm cluster certify --chaos` |
 
-Trong output `qm cluster certify`: `(req)` = bắt buộc cho enterprise; `(opt)` = cần pass hết để đạt production-multi-dc-full.
+Tách gate bắt buộc / tùy chọn giống triết lý Patroni (HA) vs Cockroach (geo) — khách single-DC không phải gánh chi phí multi-DC.
 
 ### Gate bắt buộc (enterprise-certified)
 
@@ -46,6 +58,82 @@ Trong output `qm cluster certify`: `(req)` = bắt buộc cho enterprise; `(opt)
 | WAL write quorum | `QM_CLUSTER_WRITE_QUORUM=1` |
 | PG distributed txn | `QM_CLUSTER_PG_DISTRIBUTED=1` (cần 2PC) |
 | WAL catch-up durable | `QM_CLUSTER_WAL_CATCHUP=1` |
+
+## Mô hình write quorum
+
+Chính sách ack WAL được định nghĩa rõ — không suy diễn từ “sync” khi có nhiều peer.
+
+| Mức | Biến env | Ack cần (N peer) | Dùng khi |
+|-----|----------|------------------|----------|
+| **One** | *(mặc định)* | W = 1 | Dev |
+| **Quorum** | `QM_CLUSTER_WRITE_QUORUM=1` | W = ⌊N/2⌋ + 1 | Production N≥3 |
+| **All** | `QM_CLUSTER_WRITE_ALL=1` | W = N | Durability tối đa |
+
+Ví dụ: N=3 peer, `WRITE_QUORUM=1` → W=2 (majority). N=5 → W=3.
+
+**RPO≈0:** với `QM_CLUSTER_WAL_SYNC=1`, client chỉ nhận ack sau khi đủ W peer WAL ack.
+
+## Ma trận consistency (hành vi hiện tại)
+
+| Thao tác | Đảm bảo | Cơ chế |
+|----------|---------|--------|
+| DML single-shard | Mạnh trên shard — commit sau sync WAL | `execute_routed` |
+| Read primary | Linearizable trên primary shard | Routing tới primary |
+| Cross-shard | Atomic all-or-nothing | 2PC / `QM DISTRIBUTED` |
+| PG BEGIN/COMMIT phân tán | Atomic | `pg_distributed.rs` |
+| Standby apply | Exactly-once theo LSN | `WalApplyTracker` |
+| Failover | Primary cũ bị fence | Epoch + STONITH (opt) |
+
+**Chưa claim:** linearizable toàn cụm mọi read như Spanner/Cockroach.
+
+## SLA
+
+### Đo được hôm nay (CI)
+
+| Metric | Quan sát |
+|--------|----------|
+| RPO (sync WAL) | **0** (lag LSN = 0) |
+| Failover RTO | **< 5 s** (test bound) |
+| Split-brain write | **Bị chặn** (epoch fencing) |
+| WAL trùng lặp | **Idempotent** (LSN dedupe) |
+
+### Mục tiêu vận hành (SLO)
+
+| Metric | Mục tiêu | Giám sát |
+|--------|----------|----------|
+| Failover | **< 10 s** | `qm cluster lag`, metrics |
+| WAL lag | **< 100 ms** (LAN) | `qm cluster lag` |
+| RPO | **0** | `WAL_SYNC` + peer ack |
+| Catch-up sau failover | **< 30 s** | `WAL_CATCHUP` |
+
+Validate trên mạng thật trước khi ký SLA khách hàng.
+
+## Chaos engineering
+
+**Đã có:** `cargo test --lib cluster::chaos`, certify live, failover soak, `enterprise_ha_gate.sh`.
+
+**Roadmap (`jepsen-certified`):** `qm cluster certify --chaos` — đã ship battery in-process.
+
+```bash
+qm cluster certify --chaos   # jepsen: YES khi enterprise + chaos pass
+```
+
+Chưa có: clock skew, disk full, slow follower, Jepsen history checker.
+
+## Witness / tie-breaker (2-DC)
+
+**Đã ship:** node witness nhẹ cho meta Raft quorum.
+
+```bash
+# Witness node
+export QM_CLUSTER_WITNESS=1
+export QM_CLUSTER_META_PEERS=data-a:55441,data-b:55442
+
+# Data nodes
+export QM_CLUSTER_WITNESS_PEERS=witness:55443
+```
+
+2 data + 1 witness = 3 voters → cần 2 grant.
 
 ## Layout tham chiếu 2 node
 
@@ -142,9 +230,23 @@ bash scripts/publish_packages.sh
 
 ## Cứng hóa tùy chọn (không gate)
 
-- mTLS client-auth đầy đủ giữa các node
-- Witness cross-DC / routing theo region
-- Soak production dài (không `--quick`)
+- mTLS client-auth đầy đủ
+- **Witness / arbiter** cho WAN split (xem trên)
+- Routing theo region
+- Soak dài (`cluster_production_soak.sh` không `--quick`)
+- **`qm cluster certify --chaos`** → tier **jepsen-certified**
+
+## So sánh với CSDL enterprise hiện đại
+
+| | Patroni | Cockroach/YB | QMvir |
+|---|---------|--------------|-------|
+| Opt-in HA | ✓ | Luôn phân tán | ✓ |
+| RPO≈0 sync | ✓ | ✓ | ✓ |
+| Failover + fence | ✓ | ✓ | ✓ |
+| Witness quorum | ✓ (etcd) | ✓ (Raft) | Roadmap |
+| Jepsen chaos | Cộng đồng | Công bố | Roadmap |
+
+**Định vị:** enterprise-certified ≈ Patroni + sync WAL; production-multi-dc-full thêm Raft/STONITH/quorum; jepsen-certified là bar formal verification.
 
 ## Xem thêm
 

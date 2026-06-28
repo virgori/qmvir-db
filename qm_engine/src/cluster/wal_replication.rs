@@ -45,6 +45,11 @@ fn required_acks(peer_count: usize, level: ConsistencyLevel) -> usize {
     }
 }
 
+/// Public wrapper for chaos battery / docs (W = f(N, level)).
+pub fn required_ack_count(peer_count: usize, level: ConsistencyLevel) -> usize {
+    required_acks(peer_count, level)
+}
+
 pub fn replicate_after_local_write(cfg: &ClusterNodeConfig, sql: &str) -> Result<(), String> {
     if !cfg.wal_replicate || !is_replicable_dml(sql) || cfg.wal_peers.is_empty() {
         return Ok(());

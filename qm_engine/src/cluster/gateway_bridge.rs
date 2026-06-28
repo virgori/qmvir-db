@@ -97,15 +97,23 @@ pub fn prepare_gateway_cluster(
     if let Some(port) = cfg.transport_port {
         spawn_transport_server(tokio, port, Arc::clone(&engine), runtime.clone());
         if cfg.enabled {
-            tracing::info!(
-                "cluster transport on port {} (node_id={})",
-                port,
-                cfg.node_id
-            );
+            if cfg.witness_enabled {
+                tracing::info!(
+                    "cluster witness on port {} (node_id={}) — Raft voter only",
+                    port,
+                    cfg.node_id
+                );
+            } else {
+                tracing::info!(
+                    "cluster transport on port {} (node_id={})",
+                    port,
+                    cfg.node_id
+                );
+            }
         }
     }
 
-    if cfg.failover_enabled && runtime.is_active() {
+    if cfg.failover_enabled && runtime.is_active() && !cfg.witness_enabled {
         failover::spawn_failover_loop(
             runtime.clone(),
             cfg.clone(),
@@ -115,7 +123,7 @@ pub fn prepare_gateway_cluster(
         tracing::info!("cluster failover health loop enabled");
     }
 
-    if cfg.wal_catchup_enabled && cfg.wal_replicate && !cfg.wal_peers.is_empty() {
+    if cfg.wal_catchup_enabled && cfg.wal_replicate && !cfg.wal_peers.is_empty() && !cfg.witness_enabled {
         spawn_standby_heal_loop(engine.clone(), cfg.clone(), tokio);
     }
 

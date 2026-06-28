@@ -15,12 +15,28 @@ qm cluster status
 
 ## Certification tiers
 
+QMvir uses a **progressive certification ladder** — similar to Patroni (HA) → Cockroach/Yugabyte (geo-distributed) → Jepsen-verified (formal chaos):
+
+```
+community (default single-node)
+    ↓  QM_CLUSTER_ENABLE + enterprise gates
+enterprise-certified
+    ↓  optional O–R gates (STONITH, Raft quorum, write quorum, …)
+production-multi-dc-full
+    ↓  planned — formal chaos / partition suite
+jepsen-certified          ← roadmap (not yet a release gate)
+```
+
 | Tier | Meaning | How to verify |
 |------|---------|---------------|
+| **community** | Single-node; cluster modules inactive | Default — no `QM_CLUSTER_*` |
 | **enterprise-certified** | Required HA gates pass + readiness score ≥ 95% | `qm cluster certify` → `certified: YES` |
 | **production-multi-dc-full** | All gates pass, including optional Phase O–R features | `qm cluster certify` → `prod-full: YES` |
+| **jepsen-certified** | Survives partition / crash / duplicate-WAL chaos battery | *Roadmap:* `qm cluster certify --chaos` |
 
 Gates marked `(req)` in `qm cluster certify` output are required for **enterprise-certified**. Gates marked `(opt)` unlock **production-multi-dc-full** when all pass.
+
+Required vs optional gate split is intentional: single-DC customers are not forced to pay the operational cost of multi-DC features (same philosophy as PostgreSQL + Patroni vs Cockroach geo-replication).
 
 ### Required gates (enterprise-certified)
 
@@ -46,6 +62,148 @@ Gates marked `(req)` in `qm cluster certify` output are required for **enterpris
 | WAL write quorum | `QM_CLUSTER_WRITE_QUORUM=1` (with sync WAL) |
 | PG distributed txn | `QM_CLUSTER_PG_DISTRIBUTED=1` (requires 2PC) |
 | Durable WAL catch-up | `QM_CLUSTER_WAL_CATCHUP=1` |
+
+## Write quorum model
+
+WAL replication ack policy is explicit — not implied by “sync” alone when multiple peers exist.
+
+### Consistency levels (`ConsistencyLevel`)
+
+| Level | Env flag | Required acks (N peers) | Typical use |
+|-------|----------|---------------------------|-------------|
+| **One** | *(default when neither flag set)* | `W = 1` | Dev / minimum latency |
+| **Quorum** | `QM_CLUSTER_WRITE_QUORUM=1` | `W = ⌊N/2⌋ + 1` | Production multi-replica (N≥3) |
+| **All** | `QM_CLUSTER_WRITE_ALL=1` | `W = N` | Strongest durability; highest latency |
+
+Formula (from `wal_replication.rs`):
+
+```
+required_acks(N, Quorum) = N / 2 + 1     // integer division
+required_acks(N, All)    = max(N, 1)
+required_acks(N, One)    = 1
+```
+
+### Worked examples
+
+| Topology | N (WAL peers) | `WRITE_QUORUM` | W | Commits when |
+|----------|---------------|----------------|---|--------------|
+| 2-node primary + standby | 1 | — (sync to 1 peer) | 1 | Standby acks |
+| 3-node (1 primary + 2 standbys) | 2 | `WRITE_QUORUM=1` | 2 | Both standbys ack |
+| 3-node | 2 | `WRITE_ALL=1` | 2 | Both standbys ack |
+| 5-node | 4 | `WRITE_QUORUM=1` | 3 | Majority of 4 peers |
+
+**Read path today:** gateway routes OLTP writes to shard **primary**; standbys serve WAL apply + failover promotion. Read-your-writes on primary; replica reads are not yet exposed as a separate consistency tier (default replica config uses `read_consistency = One` when used).
+
+**RPO≈0 definition:** with `QM_CLUSTER_WAL_SYNC=1`, the client write returns only after the configured `W` WAL peer ack(s). Loss of primary after ack ⇒ committed data exists on at least one surviving replica.
+
+## Consistency matrix
+
+Guarantees below describe **current QMvir cluster behaviour** — not aspirational marketing.
+
+| Operation | Guarantee | Mechanism |
+|-----------|-----------|-----------|
+| Single-shard DML (primary) | **Strong per-shard** — commit after sync WAL ack | `execute_routed` + sync replication |
+| Single-shard read (primary) | **Linearizable relative to local primary** | Reads hit elected primary for shard |
+| Cross-shard batch | **Atomic (all-or-nothing)** | `QM DISTRIBUTED` + 2PC (`QM_CLUSTER_2PC=1`) |
+| PG wire distributed txn | **Atomic commit/abort** | `BEGIN`/`COMMIT` + `pg_distributed.rs` |
+| Standby apply | **Exactly-once per LSN** | `WalApplyTracker` LSN dedupe |
+| Failover promotion | **Stale primary fenced** | Epoch bump + optional STONITH lease |
+| Meta catalog change | **Quorum when Raft network ready** | `meta_raft_network` propose |
+| Async replica read | *Not exposed as production API yet* | Standby is WAL target, not read replica tier |
+
+**Not claimed (vs Spanner/Cockroach):** global linearizability across shards on every read; automatic geo-replica read routing; external clock sync for TrueTime-style bounds.
+
+## SLA targets
+
+### Measured today (CI / lib tests)
+
+| Metric | Observed | Where |
+|--------|----------|-------|
+| RPO (sync WAL) | **0** (lag LSN = 0 after commit) | `cluster::chaos::sync_wal_rpo_zero_*`, certify live |
+| Failover RTO (probe scale) | **< 5 s** (test bound) | `cluster::chaos::failover_reroute_after_primary_partition` |
+| Failover probe interval | Default **5 s** | `QM_CLUSTER_FAILOVER_INTERVAL_SECS` |
+| Split-brain write after promote | **Rejected** (stale epoch) | `fencing_rejects_stale_epoch_after_bump` |
+| WAL duplicate delivery | **Idempotent apply** | `WalApplyTracker` |
+
+### Production targets (operational SLO — tune via env)
+
+| Metric | Target SLO | How to monitor |
+|--------|------------|----------------|
+| Failover detection + promote | **< 10 s** | `qm cluster metrics` → `failover_rto_ms_*` |
+| WAL replication lag | **< 100 ms** (LAN) | `qm cluster lag`, `qmvir_cluster_wal_lag_p99` |
+| RPO | **0** (sync WAL) | Require `wal_sync` + peer ack before client ack |
+| Split-brain writes | **Impossible** (with fencing + STONITH) | Epoch + `cluster_primary.lease` |
+| Post-failover catch-up | **< 30 s** (gap replay) | `QM_CLUSTER_WAL_CATCHUP=1` + metrics |
+
+SLO tables should be validated in **your** network (WAN latency dominates WAL lag). Use `scripts/cluster_production_soak.sh` (full, no `--quick`) before signing customer SLAs.
+
+## Chaos engineering
+
+### Shipped today
+
+| Layer | Coverage |
+|-------|----------|
+| Lib integration | `cargo test --lib cluster::chaos` — sync WAL RPO=0, primary partition → promote, epoch fencing |
+| Live 2-node | `cluster_certify_live`, `run_cluster_certify_live.sh` |
+| Failover soak | `cluster_failover_soak.sh` |
+| Production soak | `cluster_production_soak.sh` |
+| CI gate | `enterprise_ha_gate.sh` (7 steps) |
+
+Run manually:
+
+```bash
+cargo test --no-default-features --lib cluster::chaos -- --test-threads=1
+bash scripts/cluster_failover_soak.sh --quick
+bash scripts/enterprise_ha_gate.sh
+```
+
+### Roadmap: `jepsen-certified` tier
+
+**Shipped:** `qm cluster certify --chaos` runs an in-process chaos battery (no cargo subprocess):
+
+```bash
+qm cluster certify --chaos
+# → jepsen: YES when enterprise gates + all chaos scenarios pass
+```
+
+| Scenario | Status |
+|----------|--------|
+| Sync WAL RPO≈0 | **Shipped** (`--chaos`) |
+| Primary partition → failover | **Shipped** |
+| Epoch fencing stale writer | **Shipped** |
+| Duplicate WAL LSN dedupe | **Shipped** |
+| Write quorum W=⌊N/2⌋+1 | **Shipped** |
+| Witness 2/3 majority | **Shipped** |
+| SLA metrics (RTO histogram, lag p99) | **Shipped** (`qm cluster metrics`) |
+| Clock skew | **Not tested** |
+| Disk full / WAL corruption inject | **Not tested** |
+| Slow follower | **Not tested** |
+| Full Jepsen history checker | **Roadmap** |
+
+## Witness / tie-breaker (2-DC WAN split)
+
+**Shipped in v6.x:** lightweight witness voter for meta Raft quorum.
+
+**Witness node** (no shard data):
+
+```bash
+export QM_CLUSTER_WITNESS=1
+export QM_CLUSTER_ENABLE=1
+export QM_CLUSTER_TRANSPORT_PORT=55443
+export QM_CLUSTER_META_PEERS=data-a:55441,data-b:55442
+qm --data-dir ./witness-data start
+```
+
+**Data nodes** include witness in quorum:
+
+```bash
+export QM_CLUSTER_WITNESS_PEERS=witness:55443
+export QM_CLUSTER_META_PEERS=data-b:55442
+```
+
+With 2 data nodes + 1 witness = **3 voters → need 2 grants** for Raft election/propose.
+
+STONITH + lease still recommended; witness provides Patroni/etcd-class tie-break for WAN partition.
 
 ## Two-node reference layout
 
@@ -95,6 +253,7 @@ export QM_CLUSTER_PG_DISTRIBUTED=1
 | `qm cluster health` | Live ping to shard / WAL peers |
 | `qm cluster readiness` | Readiness scorecard (% and tier) |
 | `qm cluster certify` | Certification gates; exit `1` if not enterprise-certified |
+| `qm cluster certify --chaos` | + in-process chaos battery → **jepsen-certified** tier |
 | `qm cluster lag` | Primary vs standby WAL LSN |
 | `qm cluster metrics` | Prometheus text export |
 | `qm cluster join` / `leave` | Register or remove shard endpoints on peers |
@@ -150,8 +309,25 @@ bash scripts/publish_packages.sh
 ## Optional hardening (not gated)
 
 - Full mTLS client-auth between all nodes
-- Cross-DC witness / region-aware routing
+- **Witness / arbiter node** for 2-DC WAN tie-break (see above)
+- Cross-DC region-aware routing
 - Long production soak without `--quick`
+- **`qm cluster certify --chaos`** → future **jepsen-certified** tier
+
+## Comparison with modern enterprise databases
+
+| Capability | PostgreSQL + Patroni | Cockroach / Yugabyte | QMvir (today) |
+|------------|---------------------|----------------------|---------------|
+| Single → HA opt-in | ✓ | Always distributed | ✓ opt-in cluster |
+| Sync replication RPO≈0 | ✓ (sync rep) | ✓ | ✓ (`WAL_SYNC`) |
+| Auto failover | ✓ (Patroni) | ✓ | ✓ |
+| Fencing / STONITH | ✓ (external) | ✓ (Raft) | ✓ (epoch + optional STONITH) |
+| Witness / quorum voter | ✓ (etcd) | ✓ (Raft) | **Shipped** (witness node) |
+| Multi-region by default | ✗ | ✓ | Opt-in multi-DC tier |
+| Jepsen / formal chaos | Community | Published | **`certify --chaos`** |
+| Cross-shard serializable | ✗ (2PC manual) | ✓ | ✓ (`2PC` / PG distributed) |
+
+**Overall positioning:** QMvir **enterprise-certified** ≈ Patroni-grade HA with sync WAL; **production-multi-dc-full** adds Raft meta, STONITH, write quorum, and durable catch-up; **jepsen-certified** remains the bar for Spanner/Cockroach-class formal verification.
 
 ## See also
 

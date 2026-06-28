@@ -22,12 +22,45 @@ OVERVIEW
   QMvir cluster mode is opt-in (QM_CLUSTER_ENABLE=1). Without it, the engine
   runs single-node — cluster modules are linked but inactive.
 
-CERTIFICATION TIERS
-  enterprise-certified       Required HA gates pass + readiness score >= 95%
-  production-multi-dc-full   ALL gates pass (incl. optional O–R features)
+CERTIFICATION LADDER
+  community                  Single-node (default)
+  enterprise-certified       Required gates + score >= 95%
+  production-multi-dc-full   All gates incl. O–R optional
+  jepsen-certified           Roadmap — formal chaos battery
 
   Check:  qm cluster certify
   Score:  qm cluster readiness
+
+WRITE QUORUM (WAL ack policy)
+  One     W=1 ack                    (default)
+  Quorum  QM_CLUSTER_WRITE_QUORUM=1  W = floor(N/2)+1
+  All     QM_CLUSTER_WRITE_ALL=1     W = N peers
+  RPO≈0:  QM_CLUSTER_WAL_SYNC=1 + required W acks before client ack
+
+CONSISTENCY (current behaviour)
+  Single-shard write   Strong — sync WAL to W peers
+  Cross-shard          Atomic — 2PC / QM DISTRIBUTED
+  Standby apply        Exactly-once — WalApplyTracker LSN dedupe
+  Failover             Stale primary fenced — epoch + optional STONITH
+
+SLA (measured in CI / targets)
+  RPO          0 (sync WAL, lag_lsn=0)
+  Failover RTO <5s test bound; target <10s production
+  WAL lag      target <100ms LAN — qm cluster lag
+
+CHAOS (today)
+  cargo test --lib cluster::chaos
+  qm cluster certify --chaos     → jepsen-certified tier
+  enterprise_ha_gate.sh / cluster_production_soak.sh
+
+WITNESS (2-DC tie-break)
+  Data:  QM_CLUSTER_WITNESS_PEERS=host:port
+  Node:  QM_CLUSTER_WITNESS=1 (Raft voter only, no shard data)
+  2 data + 1 witness = 3 voters, need 2 grants
+
+SLA METRICS (qm cluster metrics)
+  qmvir_cluster_failover_rto_ms_*  histogram
+  qmvir_cluster_wal_lag_p99        rolling p99
 
 REQUIRED GATES (enterprise-certified)
   • Multi-node topology (>=2 shard endpoints)
@@ -117,12 +150,24 @@ QMvir v{} — Huong dan Enterprise HA & Production Multi-DC
 TONG QUAN
   Che do cluster bat bang QM_CLUSTER_ENABLE=1. Khong set = single-node.
 
-HAI CAP CHUNG NHAN
-  enterprise-certified       Gate bat buoc dat + diem readiness >= 95%
-  production-multi-dc-full   Tat ca gate (bao gom tinh nang O–R tuy chon)
+THANG CHUNG NHAN
+  community → enterprise-certified → production-multi-dc-full
+  jepsen-certified (roadmap — qm cluster certify --chaos)
 
-  Kiem tra:  qm cluster certify
-  Diem so:   qm cluster readiness
+WRITE QUORUM
+  One=1 ack | Quorum=QM_CLUSTER_WRITE_QUORUM (W=⌊N/2⌋+1)
+  All=QM_CLUSTER_WRITE_ALL (W=N) | RPO≈0 cần WAL_SYNC
+
+CONSISTENCY
+  Single-shard: manh (sync WAL) | Cross-shard: atomic (2PC)
+  Standby: exactly-once LSN | Failover: epoch fence + STONITH (opt)
+
+SLA: RPO=0 | RTO <10s muc tieu | WAL lag <100ms LAN
+
+CHAOS: cluster::chaos + enterprise_ha_gate (co)
+       --chaos / Jepsen tier (roadmap)
+
+WITNESS: chua co v6.x — can N>=3 voter hoac etcd
 
 GATE BAT BUOC (enterprise-certified)
   • Topology >= 2 shard endpoint

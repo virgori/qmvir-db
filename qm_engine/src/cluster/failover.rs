@@ -87,6 +87,7 @@ pub fn check_and_failover(
             continue;
         }
 
+        let promote_start = std::time::Instant::now();
         let Some(standby) = pick_standby(ep, cfg, primary, timeout) else {
             tracing::warn!("failover: shard {} primary {primary} down, no standby", ep.shard_id);
             cluster_metrics::inc_failover_skipped();
@@ -113,6 +114,7 @@ pub fn check_and_failover(
             super::fencing::bump_epoch();
         }
         promotions += 1;
+        cluster_metrics::record_failover_rto_ms(promote_start.elapsed().as_millis() as u64);
         cluster_metrics::inc_failover();
         tracing::warn!(
             "failover: promoted shard {} {primary} -> {standby}",

@@ -56,15 +56,11 @@ pub fn leader_catalog_for_runtime() -> Option<ShardGroupCatalog> {
 }
 
 fn peer_addrs(cfg: &ClusterNodeConfig) -> Vec<SocketAddr> {
-    let mut peers = parse_meta_peers();
-    if let Some(local) = cfg.local_addr {
-        peers.retain(|p| *p != local);
-    }
-    peers
+    super::witness::voter_peers(cfg)
 }
 
 fn quorum_size(total_voters: usize) -> usize {
-    total_voters / 2 + 1
+    super::witness::quorum_size(total_voters)
 }
 
 /// Request votes from configured meta peers; become leader on majority grant.

@@ -97,6 +97,21 @@ fn pg_distributed_flag_requires_2pc() {
 }
 
 #[test]
+fn chaos_battery_all_scenarios_pass() {
+    let results = qm_engine::cluster::run_chaos_battery();
+    assert!(results.len() >= 7, "expected >=7 scenarios");
+    for r in &results {
+        assert!(r.passed, "scenario {} failed: {}", r.id, r.detail);
+    }
+}
+
+#[test]
+fn witness_quorum_three_voters() {
+    use qm_engine::cluster::witness;
+    assert_eq!(witness::quorum_size(3), 2);
+}
+
+#[test]
 fn single_node_engine_unaffected_without_cluster_env() {
     let engine = NativeSqlEngine::new();
     engine

@@ -264,6 +264,25 @@ pub fn evaluate_enterprise_readiness(cfg: &ClusterNodeConfig) -> Vec<ReadinessCh
     });
 
     checks.push(ReadinessCheck {
+        id: "witness_quorum",
+        title: "Witness arbiter for 2-DC tie-break",
+        level: if super::witness::witness_quorum_ready(cfg) {
+            ReadinessLevel::Pass
+        } else if super::witness::witness_configured(cfg) {
+            ReadinessLevel::Partial
+        } else {
+            ReadinessLevel::Partial
+        },
+        detail: if cfg.witness_enabled {
+            "QM_CLUSTER_WITNESS=1 (this node is arbiter)".into()
+        } else if !cfg.witness_peers.is_empty() {
+            format!("{} witness peer(s)", cfg.witness_peers.len())
+        } else {
+            "Optional — QM_CLUSTER_WITNESS_PEERS for 2-DC WAN".into()
+        },
+    });
+
+    checks.push(ReadinessCheck {
         id: "cluster_ops",
         title: "Cluster join/leave operations",
         level: ReadinessLevel::Pass,
