@@ -679,6 +679,9 @@ fn main() {
                     std::process::exit(code);
                 }
             }
+            qm_engine::cli::ClusterAction::Guide => {
+                qm_engine::cli::cluster::run_guide(&lang);
+            }
         },
     }
 }

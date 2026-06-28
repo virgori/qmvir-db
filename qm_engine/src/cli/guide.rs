@@ -1,5 +1,6 @@
 //! `qm guide` — built-in usage guide and important notes (offline, no network).
 
+use super::cluster_guide;
 use super::i18n::Lang;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -9,6 +10,7 @@ pub enum GuideTopic {
     Backup,
     Studio,
     Cli,
+    Cluster,
     Notes,
 }
 
@@ -20,6 +22,7 @@ impl GuideTopic {
             "backup" | "restore" | "dump" => Some(Self::Backup),
             "studio" | "desktop" | "gui" => Some(Self::Studio),
             "cli" | "commands" => Some(Self::Cli),
+            "cluster" | "ha" | "enterprise" | "multi-dc" => Some(Self::Cluster),
             "notes" | "caveats" | "warnings" | "luu-y" => Some(Self::Notes),
             _ => None,
         }
@@ -30,7 +33,7 @@ pub fn run_guide(lang: &Lang, topic: &str) {
     let version = env!("CARGO_PKG_VERSION");
     let Some(topic) = GuideTopic::from_str(topic) else {
         eprintln!("unknown guide topic: {topic}");
-        eprintln!("topics: all | quickstart | backup | studio | cli | notes");
+        eprintln!("topics: all | quickstart | backup | studio | cli | cluster | notes");
         std::process::exit(2);
     };
 
@@ -55,6 +58,7 @@ TOPICS
   backup       .qmvb backup/restore, dump, checkpoint
   studio       QMvir Studio desktop admin app
   cli          QMvir-exclusive CLI commands (not in psql)
+  cluster      Enterprise HA & production multi-DC deploy
   notes        Important caveats and upgrade tips
 
 QUICK START
@@ -70,9 +74,11 @@ ESSENTIAL COMMANDS
   qm restore -i prod.qmvb --drop-existing
   qm checkpoint
   qm guide notes                # read before production
+  qm guide cluster              # HA / multi-DC deploy
 
 Full docs: USAGE_GUIDE_EN.md in the source repo
 Performance: docs/QMVIR_PERFORMANCE_GUIDE_VI.md
+HA: docs/ENTERPRISE_HA_GUIDE.md | docs/ENTERPRISE_HA_GUIDE_VI.md
 "
         ),
         GuideTopic::Quickstart => format!(
@@ -202,9 +208,15 @@ OTHER
   qm version
   qm guide [topic]    # this help
 
+CLUSTER HA (env-driven, opt-in)
+  qm cluster status | health | readiness | certify | lag | metrics
+  qm cluster guide    # enterprise HA / production multi-DC
+
 TIP: run `qm guide notes` before production deployments.
+TIP: run `qm guide cluster` before HA / multi-DC deploy.
 "
         ),
+        GuideTopic::Cluster => cluster_guide::cluster_guide_body(&Lang::En),
         GuideTopic::Notes => format!(
             "\
 QMvir v{version} — Important notes & caveats
@@ -242,7 +254,7 @@ PERFORMANCE
   • WAL group commit: see performance guide for tuning scripts
   • Vector HNSW: CREATE INDEX ... USING hnsw after bulk INSERT
 
-More: qm guide backup | qm guide studio | USAGE_GUIDE_EN.md
+More: qm guide backup | qm guide studio | qm guide cluster | USAGE_GUIDE_EN.md
 "
         ),
     }
@@ -260,6 +272,7 @@ CHU DE
   backup       Sao luu .qmvb, restore, dump, checkpoint
   studio       Ung dung QMvir Studio (desktop)
   cli          Lenh chi co trong qm (khong co trong psql)
+  cluster      Enterprise HA & production multi-DC
   notes        Luu y quan trong truoc production
 
 BAT DAU NHANH
@@ -275,10 +288,13 @@ LENH THUONG DUNG
   qm restore -i prod.qmvb --drop-existing
   qm checkpoint
   qm guide notes
+  qm guide cluster
 
 Tai lieu day du: USAGE_GUIDE_EN.md (tieng Anh)
+HA: docs/ENTERPRISE_HA_GUIDE_VI.md
 "
         ),
+        GuideTopic::Cluster => cluster_guide::cluster_guide_body(&Lang::Vi),
         GuideTopic::Notes => format!(
             "\
 QMvir v{version} — Luu y quan trong
@@ -304,7 +320,7 @@ PSQL vs QM
   • SQL thong thuong → psql hoac qm sql
   • backup, restore, dump, checkpoint → chi qm CLI
 
-Xem them: qm guide backup | qm guide studio
+Xem them: qm guide backup | qm guide studio | qm guide cluster
 "
         ),
         _ => guide_en(topic, version),
@@ -318,12 +334,13 @@ fn guide_zht(topic: GuideTopic, version: &str) -> String {
 QMvir v{version} — 使用指南（內建）
 
 主題：qm guide <topic>
-  quickstart | backup | studio | cli | notes
+  quickstart | backup | studio | cli | cluster | notes
 
 快速開始
   qm start --admin-password <密碼>
   psql -h 127.0.0.1 -p 55433 -U admin
   qm guide notes   # 上線前必讀
+  qm guide cluster # HA / 多 DC 部署
 
 詳見 USAGE_GUIDE_EN.md
 "
@@ -336,6 +353,7 @@ QMvir v{version} — 使用指南（內建）
   • 僅 psql 無法執行 backup / restore / dump — 請用 qm CLI
 "
         .to_string(),
+        GuideTopic::Cluster => cluster_guide::cluster_guide_body(&Lang::Zht),
         _ => guide_en(topic, version),
     }
 }
@@ -347,12 +365,13 @@ fn guide_zh(topic: GuideTopic, version: &str) -> String {
 QMvir v{version} — 使用指南（内置）
 
 主题：qm guide <topic>
-  quickstart | backup | studio | cli | notes
+  quickstart | backup | studio | cli | cluster | notes
 
 快速开始
   qm start --admin-password <密码>
   psql -h 127.0.0.1 -p 55433 -U admin
   qm guide notes   # 上线前必读
+  qm guide cluster # HA / 多 DC 部署
 "
         ),
         GuideTopic::Notes => "\
@@ -363,6 +382,7 @@ QMvir v{version} — 使用指南（内置）
   • 仅 psql 无法执行 backup / restore / dump — 请用 qm CLI
 "
         .to_string(),
+        GuideTopic::Cluster => cluster_guide::cluster_guide_body(&Lang::Zh),
         _ => guide_en(topic, version),
     }
 }

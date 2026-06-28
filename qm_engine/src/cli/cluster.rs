@@ -1,5 +1,7 @@
 //! `qm cluster` — HA topology status, health probes, enterprise readiness.
 
+use super::cluster_guide;
+use super::i18n::Lang;
 use std::time::Duration;
 
 use crate::cluster::{
@@ -169,6 +171,7 @@ pub fn run_readiness() {
     println!("  • STONITH primary lease — QM_CLUSTER_STONITH=1");
     println!("  • WAL write quorum + durable catch-up");
     println!("  • PG BEGIN/COMMIT distributed txn — QM_CLUSTER_PG_DISTRIBUTED=1");
+    println!("\nFull guide: qm cluster guide  (docs/ENTERPRISE_HA_GUIDE_VI.md)");
     println!("\nOptional hardening:");
     println!("  • Full mTLS client-auth between all nodes");
     println!("  • Cross-DC witness / region-aware routing");
@@ -290,4 +293,9 @@ pub fn run_certify(strict: bool) -> i32 {
     let score = readiness_score_percent(&checks);
     println!("\nReadiness score (non-strict): {score}%");
     1
+}
+
+/// Built-in Enterprise HA / production multi-DC guide.
+pub fn run_guide(lang: &Lang) {
+    cluster_guide::run_cluster_guide(lang);
 }

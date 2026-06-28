@@ -3,6 +3,7 @@
 pub mod backup_cmd;
 pub mod check;
 pub mod cluster;
+pub mod cluster_guide;
 pub mod dump;
 pub mod guide;
 pub mod i18n;
@@ -53,7 +54,11 @@ use std::path::PathBuf;
           qm backup -o data.qmvb --compress zstd\n  \
           qm restore -i data.qmvb\n  \
           qm guide notes                         # usage guide & caveats\n  \
+          qm guide cluster                       # enterprise HA / multi-DC\n  \
           qm encrypt data.qmvb -p secret\n\n\
+        CLUSTER HA (opt-in via QM_CLUSTER_* env):\n  \
+          qm cluster status | health | readiness | certify\n  \
+          qm cluster guide                       # deploy checklist\n\n\
         Docs: https://github.com/virgori/qmvir-releases",
     after_help = "EXAMPLES:\n  \
           qm start --admin-password mypass           # Daemon (default)\n  \
@@ -62,6 +67,8 @@ use std::path::PathBuf;
           qm benchtest --profile quick --json\n  \
           qm guide quickstart\n  \
           qm guide notes\n  \
+          qm guide cluster\n  \
+          qm cluster certify\n  \
           qm backup -o backup.qmvb --compress zstd\n  \
           qm inspect --tables\n  \
           qm stat --json\n\n\
@@ -260,7 +267,7 @@ pub enum Commands {
 
     /// Built-in usage guide and important notes
     Guide {
-        /// Topic: all | quickstart | backup | studio | cli | notes
+        /// Topic: all | quickstart | backup | studio | cli | cluster | notes
         #[arg(default_value = "all")]
         topic: String,
     },
@@ -338,6 +345,8 @@ pub enum ClusterAction {
     Metrics,
     /// Enterprise HA certification gate (exit 1 if not certified)
     Certify,
+    /// Enterprise HA / production multi-DC guide (offline)
+    Guide,
 }
 
 #[derive(Subcommand)]
