@@ -167,7 +167,7 @@ bash scripts/cluster_failover_soak.sh --quick
 bash scripts/enterprise_ha_gate.sh
 ```
 
-### Roadmap: `jepsen-certified` tier
+### `jepsen-certified` tier (shipped v6.2.0)
 
 **Shipped:** `qm cluster certify --chaos` runs an in-process chaos battery (no cargo subprocess):
 
@@ -185,10 +185,11 @@ qm cluster certify --chaos
 | Write quorum W=⌊N/2⌋+1 | **Shipped** |
 | Witness 2/3 majority | **Shipped** |
 | SLA metrics (RTO histogram, lag p99) | **Shipped** (`qm cluster metrics`) |
-| Clock skew | **Not tested** |
-| Disk full / WAL corruption inject | **Not tested** |
-| Slow follower | **Not tested** |
-| Full Jepsen history checker | **Roadmap** |
+| Clock skew / lease expiry | **Shipped** |
+| WAL corruption (checksum) | **Shipped** |
+| Catalog single-primary invariant | **Shipped** |
+| Jepsen-lite monotonic epoch | **Shipped** |
+| Full external Jepsen checker | Optional hardening |
 
 ## Witness / tie-breaker (2-DC WAN split)
 
