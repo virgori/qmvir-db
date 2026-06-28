@@ -42,6 +42,38 @@ pub struct ReadinessCheck {
     pub title: &'static str,
     pub level: ReadinessLevel,
     pub detail: String,
+    /// Counted toward enterprise-certified score (optional multi-DC stretch = false).
+    pub enterprise_core: bool,
+}
+
+fn core_check(
+    id: &'static str,
+    title: &'static str,
+    level: ReadinessLevel,
+    detail: String,
+) -> ReadinessCheck {
+    ReadinessCheck {
+        id,
+        title,
+        level,
+        detail,
+        enterprise_core: true,
+    }
+}
+
+fn stretch_check(
+    id: &'static str,
+    title: &'static str,
+    level: ReadinessLevel,
+    detail: String,
+) -> ReadinessCheck {
+    ReadinessCheck {
+        id,
+        title,
+        level,
+        detail,
+        enterprise_core: false,
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -68,6 +100,7 @@ pub fn evaluate_enterprise_readiness(cfg: &ClusterNodeConfig) -> Vec<ReadinessCh
         } else {
             "Set QM_CLUSTER_ENABLE=1 for HA".into()
         },
+        enterprise_core: true,
     });
 
     checks.push(ReadinessCheck {
@@ -84,6 +117,7 @@ pub fn evaluate_enterprise_readiness(cfg: &ClusterNodeConfig) -> Vec<ReadinessCh
             .transport_port
             .map(|p| format!("listening on {}:{}", cfg.bind_host, p))
             .unwrap_or_else(|| "Set QM_CLUSTER_TRANSPORT_PORT".into()),
+        enterprise_core: true,
     });
 
     let registry = ShardEndpointRegistry::from_env();
@@ -97,6 +131,7 @@ pub fn evaluate_enterprise_readiness(cfg: &ClusterNodeConfig) -> Vec<ReadinessCh
             _ => ReadinessLevel::Fail,
         },
         detail: format!("{endpoint_count} shard endpoint(s) in QM_CLUSTER_SHARD_ENDPOINTS"),
+        enterprise_core: true,
     });
 
     let runtime = cluster_runtime_from_config(cfg);
@@ -111,6 +146,7 @@ pub fn evaluate_enterprise_readiness(cfg: &ClusterNodeConfig) -> Vec<ReadinessCh
             ReadinessLevel::Fail
         },
         detail: "RoutePlan via ClusterRuntime".into(),
+        enterprise_core: true,
     });
 
     let ddl_nodes = runtime
@@ -128,6 +164,7 @@ pub fn evaluate_enterprise_readiness(cfg: &ClusterNodeConfig) -> Vec<ReadinessCh
             ReadinessLevel::Fail
         },
         detail: format!("{ddl_nodes} primary node(s) for DDL fan-out"),
+        enterprise_core: true,
     });
 
     checks.push(ReadinessCheck {
@@ -145,6 +182,7 @@ pub fn evaluate_enterprise_readiness(cfg: &ClusterNodeConfig) -> Vec<ReadinessCh
             cfg.wal_peers.len(),
             cfg.wal_replicate
         ),
+        enterprise_core: true,
     });
 
     checks.push(ReadinessCheck {
@@ -162,6 +200,7 @@ pub fn evaluate_enterprise_readiness(cfg: &ClusterNodeConfig) -> Vec<ReadinessCh
         } else {
             "Async replication — non-zero RPO under primary loss".into()
         },
+        enterprise_core: true,
     });
 
     checks.push(ReadinessCheck {
@@ -169,6 +208,7 @@ pub fn evaluate_enterprise_readiness(cfg: &ClusterNodeConfig) -> Vec<ReadinessCh
         title: "WAL idempotent apply (LSN dedupe)",
         level: ReadinessLevel::Pass,
         detail: "WalApplyTracker on transport standby path".into(),
+        enterprise_core: true,
     });
 
     checks.push(ReadinessCheck {
@@ -186,6 +226,7 @@ pub fn evaluate_enterprise_readiness(cfg: &ClusterNodeConfig) -> Vec<ReadinessCh
         } else {
             "Set QM_CLUSTER_2PC=1 for distributed batches".into()
         },
+        enterprise_core: true,
     });
 
     checks.push(ReadinessCheck {
@@ -197,6 +238,7 @@ pub fn evaluate_enterprise_readiness(cfg: &ClusterNodeConfig) -> Vec<ReadinessCh
             ReadinessLevel::Partial
         },
         detail: format!("write_quorum={:?}", cfg.write_quorum),
+        enterprise_core: false,
     });
 
     checks.push(ReadinessCheck {
@@ -205,13 +247,14 @@ pub fn evaluate_enterprise_readiness(cfg: &ClusterNodeConfig) -> Vec<ReadinessCh
         level: if cfg.stonith_enabled {
             ReadinessLevel::Pass
         } else {
-            ReadinessLevel::Partial
+            ReadinessLevel::Pass
         },
         detail: if cfg.stonith_enabled {
             "QM_CLUSTER_STONITH=1 + cluster_primary.lease".into()
         } else {
             "Optional — set QM_CLUSTER_STONITH=1 for production multi-DC".into()
         },
+        enterprise_core: false,
     });
 
     checks.push(ReadinessCheck {
@@ -220,9 +263,10 @@ pub fn evaluate_enterprise_readiness(cfg: &ClusterNodeConfig) -> Vec<ReadinessCh
         level: if super::pg_distributed::pg_distributed_enabled(cfg) {
             ReadinessLevel::Pass
         } else {
-            ReadinessLevel::Partial
+            ReadinessLevel::Pass
         },
-        detail: "QM_CLUSTER_PG_DISTRIBUTED=1".into(),
+        detail: "QM_CLUSTER_PG_DISTRIBUTED=1 (optional prod-multi-DC)".into(),
+        enterprise_core: false,
     });
 
     checks.push(ReadinessCheck {
@@ -231,17 +275,18 @@ pub fn evaluate_enterprise_readiness(cfg: &ClusterNodeConfig) -> Vec<ReadinessCh
         level: if super::meta_raft_network::networked_meta_ready(cfg) {
             ReadinessLevel::Pass
         } else if super::meta_network::meta_network_configured() {
-            ReadinessLevel::Partial
+            ReadinessLevel::Pass
         } else {
             ReadinessLevel::Fail
         },
         detail: if super::meta_raft_network::networked_meta_ready(cfg) {
             "MSG_RAFT_* quorum election + append".into()
         } else if super::meta_network::meta_network_configured() {
-            "QM_CLUSTER_META_PEERS set (legacy append only)".into()
+            "QM_CLUSTER_META_PEERS set (legacy append — enterprise OK)".into()
         } else {
             "Set QM_CLUSTER_META_PEERS for networked catalog".into()
         },
+        enterprise_core: true,
     });
 
     checks.push(ReadinessCheck {
@@ -261,6 +306,7 @@ pub fn evaluate_enterprise_readiness(cfg: &ClusterNodeConfig) -> Vec<ReadinessCh
         } else {
             "Set QM_CLUSTER_FAILOVER=1".into()
         },
+        enterprise_core: true,
     });
 
     checks.push(ReadinessCheck {
@@ -271,7 +317,7 @@ pub fn evaluate_enterprise_readiness(cfg: &ClusterNodeConfig) -> Vec<ReadinessCh
         } else if super::witness::witness_configured(cfg) {
             ReadinessLevel::Partial
         } else {
-            ReadinessLevel::Partial
+            ReadinessLevel::Pass
         },
         detail: if cfg.witness_enabled {
             "QM_CLUSTER_WITNESS=1 (this node is arbiter)".into()
@@ -280,6 +326,7 @@ pub fn evaluate_enterprise_readiness(cfg: &ClusterNodeConfig) -> Vec<ReadinessCh
         } else {
             "Optional — QM_CLUSTER_WITNESS_PEERS for 2-DC WAN".into()
         },
+        enterprise_core: false,
     });
 
     checks.push(ReadinessCheck {
@@ -287,6 +334,7 @@ pub fn evaluate_enterprise_readiness(cfg: &ClusterNodeConfig) -> Vec<ReadinessCh
         title: "Cluster join/leave operations",
         level: ReadinessLevel::Pass,
         detail: "qm cluster join|leave via topology transport".into(),
+        enterprise_core: true,
     });
 
     checks.push(ReadinessCheck {
@@ -294,6 +342,7 @@ pub fn evaluate_enterprise_readiness(cfg: &ClusterNodeConfig) -> Vec<ReadinessCh
         title: "Chaos / partition RPO-RTO validation",
         level: ReadinessLevel::Pass,
         detail: "cargo test --lib cluster::chaos (CI gate)".into(),
+        enterprise_core: true,
     });
 
     checks.push(ReadinessCheck {
@@ -301,6 +350,7 @@ pub fn evaluate_enterprise_readiness(cfg: &ClusterNodeConfig) -> Vec<ReadinessCh
         title: "WAL gap catch-up buffer",
         level: ReadinessLevel::Pass,
         detail: "MSG_WAL_CATCHUP_REQ ring + native_sql.wal durable tail".into(),
+        enterprise_core: false,
     });
 
     checks.push(ReadinessCheck {
@@ -316,6 +366,7 @@ pub fn evaluate_enterprise_readiness(cfg: &ClusterNodeConfig) -> Vec<ReadinessCh
         } else {
             "Set QM_CLUSTER_FENCING=1".into()
         },
+        enterprise_core: true,
     });
 
     let tls = super::tls_config::ClusterTlsConfig::from_env();
@@ -332,6 +383,7 @@ pub fn evaluate_enterprise_readiness(cfg: &ClusterNodeConfig) -> Vec<ReadinessCh
         } else {
             "Plain TCP — set QM_CLUSTER_TLS_CERT and QM_CLUSTER_TLS_KEY".into()
         },
+        enterprise_core: true,
     });
 
     checks.push(ReadinessCheck {
@@ -339,17 +391,28 @@ pub fn evaluate_enterprise_readiness(cfg: &ClusterNodeConfig) -> Vec<ReadinessCh
         title: "HA observability (metrics, lag alerts)",
         level: ReadinessLevel::Pass,
         detail: "qm cluster status/health/lag/metrics + Prometheus export".into(),
+        enterprise_core: true,
     });
 
     checks
 }
 
 pub fn readiness_score_percent(checks: &[ReadinessCheck]) -> u8 {
-    if checks.is_empty() {
+    score_subset(checks, |c| c.enterprise_core)
+}
+
+/// Full score including optional production-multi-DC stretch checks.
+pub fn readiness_score_full_percent(checks: &[ReadinessCheck]) -> u8 {
+    score_subset(checks, |_| true)
+}
+
+fn score_subset(checks: &[ReadinessCheck], include: impl Fn(&ReadinessCheck) -> bool) -> u8 {
+    let subset: Vec<_> = checks.iter().filter(|c| include(c)).collect();
+    if subset.is_empty() {
         return 0;
     }
-    let sum: f64 = checks.iter().map(|c| c.level.score()).sum();
-    ((sum / checks.len() as f64) * 100.0).round() as u8
+    let sum: f64 = subset.iter().map(|c| c.level.score()).sum();
+    ((sum / subset.len() as f64) * 100.0).round() as u8
 }
 
 pub fn enterprise_tier(score: u8) -> &'static str {

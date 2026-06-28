@@ -99,7 +99,7 @@ fn pg_distributed_flag_requires_2pc() {
 #[test]
 fn chaos_battery_all_scenarios_pass() {
     let results = qm_engine::cluster::run_chaos_battery();
-    assert!(results.len() >= 7, "expected >=7 scenarios");
+    assert!(results.len() >= 11, "expected >=11 chaos scenarios, got {}", results.len());
     for r in &results {
         assert!(r.passed, "scenario {} failed: {}", r.id, r.detail);
     }

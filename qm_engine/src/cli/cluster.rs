@@ -7,7 +7,7 @@ use std::time::Duration;
 use crate::cluster::{
     apply_chaos_certification, cluster_runtime_from_config, collect_peer_addrs, enterprise_tier,
     evaluate_certification, evaluate_enterprise_readiness, probe_peers,
-    readiness_score_percent, render_cluster_metrics, run_chaos_battery, topology,
+    readiness_score_full_percent, readiness_score_percent, render_cluster_metrics, run_chaos_battery, topology,
     ClusterNodeConfig, NodeClient, ReadinessLevel, ShardEndpointRegistry, TopologyJoinMsg,
 };
 use std::net::SocketAddr;
@@ -137,7 +137,9 @@ pub fn run_readiness() {
     let tier = enterprise_tier(score);
 
     println!("QM Enterprise HA Readiness");
-    println!("  score:  {score}%");
+    println!("  score:  {score}% (enterprise core)");
+    let full = readiness_score_full_percent(&checks);
+    println!("  full:   {full}% (incl. prod-multi-DC stretch)");
     println!("  tier:   {tier}");
     println!();
 

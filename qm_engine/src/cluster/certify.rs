@@ -11,7 +11,7 @@ use super::fencing;
 use super::meta_network;
 use super::readiness::{
     collect_peer_addrs, enterprise_tier, evaluate_enterprise_readiness, probe_peers,
-    readiness_score_percent, ReadinessCheck, ReadinessLevel,
+    readiness_score_full_percent, readiness_score_percent, ReadinessCheck, ReadinessLevel,
 };
 use super::tls_config::ClusterTlsConfig;
 
@@ -64,6 +64,7 @@ fn optional_gate(
 pub fn evaluate_certification(cfg: &ClusterNodeConfig) -> CertificationReport {
     let checks = evaluate_enterprise_readiness(cfg);
     let score = readiness_score_percent(&checks);
+    let full_score = readiness_score_full_percent(&checks);
     let tier = enterprise_tier(score);
 
     let mut gates = Vec::new();
@@ -217,7 +218,7 @@ pub fn evaluate_certification(cfg: &ClusterNodeConfig) -> CertificationReport {
     let required_pass = gates.iter().filter(|g| g.required).all(|g| g.passed);
     let full_pass = gates.iter().all(|g| g.passed);
     let enterprise_certified = required_pass && score >= 95;
-    let production_multi_dc_full = full_pass && score >= 95;
+    let production_multi_dc_full = full_pass && full_score >= 95;
     let marketing_claims = if production_multi_dc_full {
         vec![
             "Production multi-DC HA with networked meta Raft quorum",

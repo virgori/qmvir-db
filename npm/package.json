@@ -1,6 +1,6 @@
 {
   "name": "qmvir",
-  "version": "6.1.1",
+  "version": "6.2.0",
   "description": "QMvir — Hybrid AI-Native Database: OLTP + OLAP + Search + Vector + Cache. Native Rust binary + JS/TS SDK.",
   "license": "SEE LICENSE IN LICENSE",
   "repository": {

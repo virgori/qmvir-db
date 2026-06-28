@@ -84,11 +84,16 @@ pub fn run_chaos_battery() -> Vec<ChaosScenarioResult> {
     vec![
         rt.block_on(scenario_sync_wal_rpo_zero()),
         rt.block_on(scenario_failover_partition()),
+        rt.block_on(scenario_failover_catalog_invariant()),
         scenario_fencing_stale_epoch(),
         scenario_wal_lsn_dedupe(),
+        scenario_wal_checksum_reject(),
+        scenario_stonith_expired_lease(),
+        scenario_concurrent_epoch_fence(),
         scenario_write_quorum_math(),
         scenario_witness_quorum_math(),
         scenario_failover_rto_metric(),
+        scenario_jepsen_lite_history(),
     ]
 }
 
@@ -252,4 +257,133 @@ fn scenario_failover_rto_metric() -> ChaosScenarioResult {
 
 pub fn all_passed(results: &[ChaosScenarioResult]) -> bool {
     results.iter().all(|r| r.passed)
+}
+
+fn scenario_wal_checksum_reject() -> ChaosScenarioResult {
+    let start = Instant::now();
+    use super::transport::WalEntry;
+    use super::wal_apply::verify_wal_checksum;
+    let mut entry = WalEntry {
+        lsn: 99,
+        sql: "INSERT INTO t VALUES (1);".into(),
+        checksum: 0,
+    };
+    let mut hasher = crc32fast::Hasher::new();
+    hasher.update(entry.sql.as_bytes());
+    entry.checksum = hasher.finalize();
+    let good = verify_wal_checksum(&entry);
+    entry.checksum ^= 0xDEAD_BEEF;
+    let bad = verify_wal_checksum(&entry);
+    let passed = good && !bad;
+    scenario(
+        "wal_checksum",
+        "WAL corruption / tamper rejected by checksum",
+        passed,
+        format!("valid={good} tampered={bad}"),
+        start,
+    )
+}
+
+fn scenario_stonith_expired_lease() -> ChaosScenarioResult {
+    let start = Instant::now();
+    use super::stonith::{holds_valid_lease, write_lease};
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let dir = std::env::temp_dir().join(format!(
+        "qm_chaos_lease_{}",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+    let epoch = super::fencing::current_epoch().saturating_add(1);
+    super::fencing::set_epoch(epoch);
+    write_lease(&dir, 1, epoch, std::time::Duration::from_millis(1)).unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(5));
+    let expired = !holds_valid_lease(&dir, 1);
+    let _ = fs::remove_dir_all(&dir);
+    scenario(
+        "clock_skew_lease",
+        "STONITH lease expiry (clock-skew tolerance)",
+        expired,
+        format!("expired_after_ttl={expired}"),
+        start,
+    )
+}
+
+fn scenario_concurrent_epoch_fence() -> ChaosScenarioResult {
+    let start = Instant::now();
+    let e0 = super::fencing::current_epoch();
+    super::fencing::bump_epoch();
+    let e1 = super::fencing::current_epoch();
+    super::fencing::bump_epoch();
+    let e2 = super::fencing::current_epoch();
+    let passed = e2 > e1 && e1 > e0 && !super::fencing::accept_epoch(e0, true);
+    scenario(
+        "concurrent_failover",
+        "Rolling epoch bumps fence stale primaries",
+        passed,
+        format!("epochs {e0}->{e1}->{e2}"),
+        start,
+    )
+}
+
+async fn scenario_failover_catalog_invariant() -> ChaosScenarioResult {
+    let start = Instant::now();
+    use super::shard_group::ShardGroupKind;
+    let node_a = Arc::new(NativeSqlEngine::new());
+    let node_b = Arc::new(NativeSqlEngine::new());
+    let (addr_a, ha) = spawn_transport(Arc::clone(&node_a)).await;
+    let (addr_b, _hb) = spawn_transport(Arc::clone(&node_b)).await;
+    let mut registry = ShardEndpointRegistry::new();
+    registry.insert(0, addr_a);
+    registry.insert_replica(0, addr_b);
+    let cluster = MetaCluster::new(&[1]);
+    cluster.bootstrap_default_groups_with_registry(1, 4, &registry);
+    let runtime = ClusterRuntime::with_catalog(cluster.catalog_on(1).expect("cat"));
+    runtime.enable();
+    ha.abort();
+    let cfg = ClusterNodeConfig {
+        enabled: true,
+        local_addr: Some(addr_b),
+        failover_enabled: true,
+        ..ClusterNodeConfig::default()
+    };
+    let _ = check_and_failover(&runtime, &cfg, None);
+    let cat = runtime.router_snapshot().expect("cat");
+    let ep = cat
+        .group_for_kind(ShardGroupKind::Oltp)
+        .and_then(|g| g.endpoints.iter().find(|e| e.shard_id == 0));
+    let passed = ep.is_some_and(|e| e.primary == addr_b && e.replicas.contains(&addr_a));
+    scenario(
+        "catalog_invariant",
+        "Single primary per shard after failover",
+        passed,
+        format!("primary={:?}", ep.map(|e| e.primary)),
+        start,
+    )
+}
+
+fn scenario_jepsen_lite_history() -> ChaosScenarioResult {
+    let start = Instant::now();
+    // Linear history: epoch only increases; stale writers always rejected.
+    let base = super::fencing::current_epoch();
+    let mut history_ok = true;
+    for _ in 0..4 {
+        let stale = super::fencing::current_epoch();
+        super::fencing::bump_epoch();
+        if super::fencing::accept_epoch(stale, true) {
+            history_ok = false;
+        }
+    }
+    let passed = history_ok && super::fencing::current_epoch() >= base.saturating_add(4);
+    scenario(
+        "jepsen_lite",
+        "Jepsen-lite: monotonic epoch / no stale write acceptance",
+        passed,
+        format!("final_epoch={}", super::fencing::current_epoch()),
+        start,
+    )
 }

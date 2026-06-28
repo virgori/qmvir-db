@@ -93,7 +93,7 @@ pub use meta_cluster::{
 };
 pub use readiness::{
     collect_peer_addrs, enterprise_tier, evaluate_enterprise_readiness, probe_peers,
-    readiness_score_percent, PeerProbe, ReadinessCheck, ReadinessLevel,
+    readiness_score_full_percent, readiness_score_percent, PeerProbe, ReadinessCheck, ReadinessLevel,
 };
 pub use router::{QmRouter, RoutePlan, WorkloadClass};
 pub use runtime::{cluster_router_env_enabled, may_forward_to_remote, ClusterRuntime};

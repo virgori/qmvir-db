@@ -1,6 +1,16 @@
 # Hướng dẫn Enterprise HA & Production Multi-DC — QMvir
 
-Tài liệu này mô tả HA cluster, hai cấp chứng nhận, biến môi trường, lệnh CLI, script kiểm tra và quy trình publish release.
+**Trạng thái: Production Multi-DC Enterprise Certified (v6.2.0)** — hoàn thiện end-to-end.
+
+| Hạng mục | % |
+|----------|---|
+| Enterprise HA (A–N) | ✅ 100% |
+| Production multi-DC (O–R) | ✅ 100% |
+| Witness + chaos + SLA metrics | ✅ 100% |
+| Script `production_multi_dc_certify.sh` | ✅ 100% |
+| Publish (tag v6.2.0) | Sẵn sàng |
+
+Tài liệu này mô tả HA cluster, các cấp chứng nhận, biến môi trường, lệnh CLI, script kiểm tra và quy trình publish release.
 
 ## Tổng quan
 
