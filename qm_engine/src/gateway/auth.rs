@@ -74,9 +74,12 @@ impl Privilege {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct UserRecord {
     pub username: String,
-    /// SHA-256(password + salt)
+    /// SHA-256(password + salt) — legacy cleartext-auth verification.
     pub password_hash: String,
     pub salt: String,
+    /// SCRAM-SHA-256 credentials for PostgreSQL wire clients.
+    #[serde(default)]
+    pub scram_secret: Option<super::scram::ScramSecret>,
     pub is_superuser: bool,
     /// table_name -> set of privileges.  "*" = all tables.
     pub table_privileges: HashMap<String, HashSet<Privilege>>,
@@ -90,6 +93,7 @@ impl UserRecord {
             username: username.to_string(),
             password_hash: hash,
             salt,
+            scram_secret: Some(super::scram::ScramSecret::from_password(password)),
             is_superuser,
             table_privileges: HashMap::new(),
         }
@@ -106,6 +110,16 @@ impl UserRecord {
         let hash = Self::hash_password(password, &self.salt);
         // constant-time compare to avoid timing attacks
         constant_time_eq(hash.as_bytes(), self.password_hash.as_bytes())
+    }
+
+    pub fn scram_secret(&self) -> Option<super::scram::ScramSecret> {
+        self.scram_secret.clone()
+    }
+
+    fn ensure_scram_secret(&mut self, password: &str) {
+        if self.scram_secret.is_none() {
+            self.scram_secret = Some(super::scram::ScramSecret::from_password(password));
+        }
     }
 
     pub fn has_privilege(&self, table: &str, priv_needed: Privilege) -> bool {
@@ -222,6 +236,17 @@ impl AuthManager {
         }
     }
 
+    /// SCRAM secret for wire authentication.
+    pub fn scram_secret_for(&self, username: &str) -> Result<super::scram::ScramSecret, String> {
+        let s = self.store.read().unwrap();
+        let user = s.users.get(username).ok_or_else(|| {
+            format!("password authentication failed for user \"{}\"", username)
+        })?;
+        user.scram_secret().ok_or_else(|| {
+            format!("SCRAM credentials missing for user \"{}\"", username)
+        })
+    }
+
     // -----------------------------------------------------------------------
     // Privilege check
     // -----------------------------------------------------------------------
@@ -299,6 +324,7 @@ impl AuthManager {
             Some(u) => {
                 u.salt = hex::encode(&rand::random::<[u8; 16]>());
                 u.password_hash = UserRecord::hash_password(new_password, &u.salt);
+                u.scram_secret = Some(super::scram::ScramSecret::from_password(new_password));
                 drop(s);
                 self.save_snapshot();
                 Ok("ALTER ROLE".to_string())

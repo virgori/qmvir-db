@@ -11,7 +11,7 @@ pub use super::tx_manager::{Isolation, Snapshot};
 pub fn is_tx_committed_before(
     tx_id: u64,
     ts: u64,
-    registry: &std::collections::HashMap<u64, super::tx_manager::TransactionRecord>,
+    registry: &ahash::AHashMap<u64, super::tx_manager::TransactionRecord>,
 ) -> bool {
     match registry.get(&tx_id) {
         Some(record) => matches!(
@@ -37,7 +37,7 @@ pub fn is_tx_committed_before(
 pub fn is_visible(
     version: &MvccRowVersion,
     snapshot: &Snapshot,
-    registry: &std::collections::HashMap<u64, super::tx_manager::TransactionRecord>,
+    registry: &ahash::AHashMap<u64, super::tx_manager::TransactionRecord>,
 ) -> bool {
     // FAST PATH: own writes always visible
     if version.created_by_tx == snapshot.own_tx_id {
@@ -92,11 +92,11 @@ pub fn is_visible(
 /// Traverses the chain from head to tail (newest to oldest) and returns
 /// the first version that is visible according to the snapshot.
 pub fn visible_version_for_row<'a>(
-    versions: &'a std::collections::HashMap<u64, MvccRowVersion>,
-    heads: &std::collections::HashMap<i64, u64>,
+    versions: &'a ahash::AHashMap<u64, MvccRowVersion>,
+    heads: &ahash::AHashMap<i64, u64>,
     row_id: i64,
     snapshot: &Snapshot,
-    registry: &std::collections::HashMap<u64, super::tx_manager::TransactionRecord>,
+    registry: &ahash::AHashMap<u64, super::tx_manager::TransactionRecord>,
 ) -> Option<&'a MvccRowVersion> {
     let mut current_version_id = heads.get(&row_id).copied();
 
@@ -115,7 +115,7 @@ pub fn visible_version_for_row<'a>(
 #[inline]
 fn is_tx_aborted(
     tx_id: u64,
-    registry: &std::collections::HashMap<u64, super::tx_manager::TransactionRecord>,
+    registry: &ahash::AHashMap<u64, super::tx_manager::TransactionRecord>,
 ) -> bool {
     matches!(
         registry.get(&tx_id).map(|r| &r.state),
@@ -131,10 +131,10 @@ pub struct VisibleRowIds {
 impl VisibleRowIds {
     /// Create visible row ID set by scanning all versions.
     pub fn from_versions(
-        versions: &std::collections::HashMap<u64, MvccRowVersion>,
-        heads: &std::collections::HashMap<i64, u64>,
+        versions: &ahash::AHashMap<u64, MvccRowVersion>,
+        heads: &ahash::AHashMap<i64, u64>,
         snapshot: &Snapshot,
-        registry: &std::collections::HashMap<u64, super::tx_manager::TransactionRecord>,
+        registry: &ahash::AHashMap<u64, super::tx_manager::TransactionRecord>,
     ) -> Self {
         let mut visible = std::collections::HashSet::new();
 
@@ -154,7 +154,8 @@ impl VisibleRowIds {
 mod tests {
     use super::*;
     use crate::gateway::native_sql::{Cell, NativeRow};
-    use std::collections::{HashMap, HashSet};
+    use ahash::AHashMap;
+    use std::collections::HashSet;
     use std::sync::Arc;
 
     fn create_snapshot(read_ts: u64, own_tx_id: u64) -> Snapshot {
@@ -192,7 +193,7 @@ mod tests {
     fn test_visibility_own_write() {
         let snapshot = create_snapshot(10, 1);
         let version = create_version(1, 100, 1, Some(5));
-        let registry = HashMap::new();
+        let registry = AHashMap::new();
 
         assert!(is_visible(&version, &snapshot, &registry));
     }
@@ -201,7 +202,7 @@ mod tests {
     fn test_visibility_committed_before_snapshot() {
         let snapshot = create_snapshot(10, 2);
         let version = create_version(1, 100, 1, Some(5));
-        let registry = HashMap::new();
+        let registry = AHashMap::new();
 
         assert!(is_visible(&version, &snapshot, &registry));
     }
@@ -210,7 +211,7 @@ mod tests {
     fn test_visibility_committed_after_snapshot() {
         let snapshot = create_snapshot(10, 2);
         let version = create_version(1, 100, 1, Some(15));
-        let registry = HashMap::new();
+        let registry = AHashMap::new();
 
         assert!(!is_visible(&version, &snapshot, &registry));
     }
@@ -219,7 +220,7 @@ mod tests {
     fn test_visibility_uncommitted() {
         let snapshot = create_snapshot(10, 2);
         let version = create_version(1, 100, 1, None);
-        let registry = HashMap::new();
+        let registry = AHashMap::new();
 
         assert!(!is_visible(&version, &snapshot, &registry));
     }
@@ -230,7 +231,7 @@ mod tests {
         let mut version = create_version(1, 100, 1, Some(5));
         version.mark_deleted(1);
         version.deleted_commit_ts = Some(7);
-        let registry = HashMap::new();
+        let registry = AHashMap::new();
 
         assert!(!is_visible(&version, &snapshot, &registry));
     }
@@ -241,7 +242,7 @@ mod tests {
         let mut version = create_version(1, 100, 1, Some(5));
         version.mark_deleted(3);
         version.deleted_commit_ts = Some(7);
-        let registry = HashMap::new();
+        let registry = AHashMap::new();
 
         assert!(!is_visible(&version, &snapshot, &registry));
     }
@@ -252,7 +253,7 @@ mod tests {
         let mut version = create_version(1, 100, 1, Some(5));
         version.mark_deleted(3);
         version.deleted_commit_ts = Some(15);
-        let registry = HashMap::new();
+        let registry = AHashMap::new();
 
         // Deleted after snapshot, so old version should be visible
         assert!(is_visible(&version, &snapshot, &registry));

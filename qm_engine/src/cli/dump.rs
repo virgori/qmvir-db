@@ -35,7 +35,7 @@ pub fn dump_table(
     format: DumpFormat,
     writer: &mut dyn Write,
 ) -> Result<u64, String> {
-    let tables = engine.tables.read().unwrap();
+    let tables = engine.tables.to_native_map();
     let t = tables
         .get(table_name)
         .ok_or(format!("table '{table_name}' not found"))?;
@@ -94,7 +94,7 @@ pub fn run_dump(
     let table_names: Vec<String> = if let Some(t) = table {
         vec![t.to_string()]
     } else {
-        let tables = engine.tables.read().unwrap();
+        let tables = engine.tables.to_native_map();
         tables.keys().cloned().collect()
     };
 

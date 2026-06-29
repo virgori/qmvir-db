@@ -199,5 +199,13 @@ name = "cluster_full_enterprise"
 path = "tests/cluster_full_enterprise.rs"
 
 [[test]]
+name = "pgwire_e2e"
+path = "tests/pgwire_e2e.rs"
+
+[[test]]
+name = "htap_integration"
+path = "tests/htap_integration.rs"
+
+[[test]]
 name = "single_node_cluster_isolation"
 path = "tests/single_node_cluster_isolation.rs"

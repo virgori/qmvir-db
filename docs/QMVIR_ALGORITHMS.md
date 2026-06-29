@@ -1,6 +1,7 @@
 # QMvir — Danh mục thuật toán & kiến trúc dữ liệu
 
-Bản kê theo **crate `qm_engine`**, trỏ tới file triển khai chính. Dùng cùng [QMVIR_ARCHITECTURE.md](QMVIR_ARCHITECTURE.md).
+**Phiên bản:** 6.2.0  
+Bản kê theo **crate `qm_engine`**, trỏ tới file triển khai chính. Đọc cùng [QMVIR_ARCHITECTURE.md](QMVIR_ARCHITECTURE.md) · [BASIC_USAGE.md](BASIC_USAGE.md) · [ENTERPRISE_HA_GUIDE.md](ENTERPRISE_HA_GUIDE.md).
 
 ---
 
@@ -84,16 +85,26 @@ Bản kê theo **crate `qm_engine`**, trỏ tới file triển khai chính. Dùn
 
 ---
 
-## 7. Cluster & phân tán
+## 7. Cluster & phân tán (v6.2.0)
 
-| Chủ đề | Vị trí |
-|--------|--------|
-| Consistent hashing / shard routing | `cluster/shard.rs` |
-| Replica set | `cluster/replica.rs` |
-| Two-phase commit | `cluster/two_phase_commit.rs` |
-| TCP transport bin | `cluster/transport.rs` |
+| Chủ đề | Thuật toán / kỹ thuật | Vị trí code |
+|--------|----------------------|-------------|
+| Consistent hashing | Shard ring routing | `cluster/shard.rs` |
+| Sync WAL replication | RPO≈0, fsync + peer ack | `cluster/wal_replication.rs` |
+| Write quorum | W = ⌊N/2⌋+1 acks | `cluster/wal_replication.rs` |
+| Failover | Health probe + promotion | `cluster/failover.rs` |
+| Epoch fencing | Stale writer reject | `cluster/fencing.rs` |
+| Meta Raft | Leader election, log replicate | `cluster/meta_raft_network.rs` |
+| Two-phase commit | Cross-shard atomicity | `cluster/two_phase_commit.rs` |
+| PG distributed txn | BEGIN/COMMIT wire | `cluster/pg_distributed.rs` |
+| STONITH lease | Primary lease fencing | `cluster/stonith.rs` |
+| Witness voter | 2-DC tie-break | `cluster/witness.rs` |
+| WAL catch-up | Segment replay on standby | `cluster/wal_catchup.rs` |
+| LSN dedupe | Exactly-once apply | `cluster/wal_apply.rs` |
+| Chaos battery | Partition, duplicate WAL, RPO/RTO | `cluster/chaos_battery.rs` |
 
-*(Wiring vào PostgresGateway có thể chưa đầy đủ cho mọi deployment — xem ARCHITECTURE chính.)*
+Certification CLI: `qm cluster certify` · chaos tier: `qm cluster certify --chaos`.  
+See [ENTERPRISE_HA_GUIDE.md](ENTERPRISE_HA_GUIDE.md).
 
 ---
 

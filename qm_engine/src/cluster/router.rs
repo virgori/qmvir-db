@@ -127,6 +127,21 @@ impl QmRouter {
             shard_key,
         })
     }
+
+    /// Analytics read path: prefer async replica when available (HA OLAP).
+    pub fn route_analytics_read(
+        &self,
+        sql: &str,
+        shard_key: u64,
+    ) -> Result<(RoutePlan, Option<SocketAddr>), String> {
+        let plan = self.route_sql(sql, shard_key)?;
+        let read_target = if matches!(plan.workload, WorkloadClass::Analytics | WorkloadClass::Vector) {
+            plan.replicas.first().copied()
+        } else {
+            None
+        };
+        Ok((plan, read_target))
+    }
 }
 
 #[cfg(test)]

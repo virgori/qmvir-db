@@ -73,7 +73,7 @@ impl<'a> DiffEngine<'a> {
         let base_lsn = base_header.end_lsn;
 
         // 2. Scan tables for changed rows.
-        let tables_guard = self.engine.tables.read().unwrap();
+        let tables_guard = self.engine.tables.to_native_map();
         let current_lsn = self.engine.row_lsn_counter.load(Ordering::SeqCst);
 
         let mut tables_changed = 0usize;

@@ -6,8 +6,10 @@ pub mod cluster;
 pub mod cluster_guide;
 pub mod dump;
 pub mod guide;
+pub mod htap_cmd;
 pub mod i18n;
 pub mod inspect;
+pub mod pitr_cmd;
 pub mod schema;
 pub mod server;
 pub mod stat;
@@ -266,6 +268,7 @@ pub enum Commands {
     },
 
     /// Built-in usage guide and important notes
+    #[command(name = "guide", aliases = ["usage"])]
     Guide {
         /// Topic: all | quickstart | backup | studio | cli | cluster | notes
         #[arg(default_value = "all")]
@@ -310,10 +313,57 @@ pub enum Commands {
     /// Show status of a running QMvir server
     Status,
 
+    /// Point-in-time recovery (WAL replay to timestamp/LSN)
+    Pitr {
+        #[command(subcommand)]
+        action: PitrAction,
+    },
+
+    /// HTAP certification and isolation checks
+    Htap {
+        #[command(subcommand)]
+        action: HtapAction,
+    },
+
     /// Cluster HA status (env-driven topology)
     Cluster {
         #[command(subcommand)]
         action: ClusterAction,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum HtapAction {
+    /// Evaluate HTAP functional gates on the live engine
+    Certify {
+        /// Table for isolation battery (created if missing)
+        #[arg(long, default_value = "htap_cert")]
+        table: String,
+        /// Run Jepsen-style MVCC isolation battery
+        #[arg(long)]
+        isolation: bool,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum PitrAction {
+    /// Compute target LSN for a wall-clock timestamp
+    Plan {
+        /// Unix timestamp (seconds)
+        #[arg(long)]
+        timestamp: i64,
+    },
+    /// Materialize a new data directory restored to timestamp/LSN
+    Restore {
+        /// Unix timestamp (seconds); mutually exclusive with --lsn
+        #[arg(long)]
+        timestamp: Option<i64>,
+        /// WAL line index (1-based); overrides --timestamp
+        #[arg(long)]
+        lsn: Option<u64>,
+        /// Output data directory (must be empty or missing)
+        #[arg(short, long)]
+        output: PathBuf,
     },
 }
 

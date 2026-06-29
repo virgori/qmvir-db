@@ -34,7 +34,7 @@ pub fn clear_connection_id() {
     CONN_ID.with(|c| c.set(0));
 }
 
-fn connection_id() -> u64 {
+pub fn connection_id() -> u64 {
     CONN_ID.with(|c| c.get())
 }
 

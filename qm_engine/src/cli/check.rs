@@ -3,7 +3,7 @@
 use crate::gateway::native_sql::NativeSqlEngine;
 
 pub fn run_check(engine: &NativeSqlEngine, table: Option<&str>) {
-    let tables = engine.tables.read().unwrap();
+    let tables = engine.tables.to_native_map();
 
     if let Some(name) = table {
         if let Some(t) = tables.get(name) {

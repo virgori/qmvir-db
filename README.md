@@ -17,7 +17,9 @@
 
 ## 🎯 Overview
 
-QMvir is a **hybrid database engine** built in Rust that combines transactional SQL, analytics-oriented execution, semantic search, and vector similarity search in one local engine. It includes a PostgreSQL wire-protocol gateway for common clients, but it is not a general PostgreSQL replacement or a production HA database.
+QMvir is a **hybrid database engine** (Rust) combining transactional SQL, analytics-style execution, full-text search, and vector similarity in one process. It exposes a **PostgreSQL wire-protocol** gateway for standard clients.
+
+**v6.2.0** adds optional **Production Multi-DC Enterprise HA**: sync WAL replication, automatic failover, meta Raft, 2PC, STONITH, witness, and `qm cluster certify` certification tiers.
 
 ### 🌟 What Makes QMvir Special?
 
@@ -37,7 +39,7 @@ QMvir is a **hybrid database engine** built in Rust that combines transactional 
 
 #### Option 1: NPM (Recommended)
 ```bash
-npm install -g qmvir
+npm install -g qmvir@6.2.0
 qm --version
 ```
 
@@ -153,15 +155,22 @@ QMvir uses a **single-engine hybrid architecture** that eliminates data movement
 
 ## 📚 Documentation
 
-### Core Documentation
-- **[Architecture Guide](repo/docs/QMVIR_ARCHITECTURE.md)** - Deep dive into system design
-- **[Algorithm Reference](repo/docs/QMVIR_ALGORITHMS.md)** - Complete algorithm inventory
-- **[Repository Guide](repo/README.md)** - Build and usage instructions
+| # | Guide | Description |
+|---|--------|-------------|
+| 1 | [Architecture](docs/QMVIR_ARCHITECTURE.md) | Gateway, engine, storage, enterprise cluster |
+| 2 | [Algorithms](docs/QMVIR_ALGORITHMS.md) | Data structures & algorithms (with source map) |
+| 3 | [Basic usage](docs/BASIC_USAGE.md) | Install, SQL, search, vector, backup, CLI |
+| 4 | [Enterprise HA](docs/ENTERPRISE_HA_GUIDE.md) | Multi-DC deployment, certification, env vars |
 
-### Quick Links
-- **GitHub Repository**: [virgori/qmvir-db](https://github.com/virgori/qmvir-db)
-- **NPM Package**: [@qmvir](https://www.npmjs.com/package/qmvir)
-- **Documentation Site**: [qmvir.readthedocs.io](https://qmvir.readthedocs.io/)
+**Index:** [docs/README.md](docs/README.md) · **Tiếng Việt HA:** [docs/ENTERPRISE_HA_GUIDE_VI.md](docs/ENTERPRISE_HA_GUIDE_VI.md)
+
+Historical reports and old audits: [docs/_archive/legacy/](docs/_archive/legacy/) (not maintained).
+
+### Links
+
+- **GitHub:** [virgori/qmvir-db](https://github.com/virgori/qmvir-db)
+- **Releases:** [virgori/qmvir-releases v6.2.0](https://github.com/virgori/qmvir-releases/releases/tag/v6.2.0)
+- **npm:** [qmvir@6.2.0](https://www.npmjs.com/package/qmvir/v/6.2.0)
 
 ---
 

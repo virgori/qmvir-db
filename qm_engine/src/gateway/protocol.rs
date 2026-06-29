@@ -72,7 +72,9 @@ pub enum Message {
     Bind {
         portal: String,
         statement: String,
+        param_formats: Vec<i16>,
         params: Vec<Option<Bytes>>,
+        result_formats: Vec<i16>,
     },
     Execute {
         portal: String,
@@ -89,12 +91,16 @@ pub enum Message {
         name: String,
     },
     Terminate,
-    Password(String),
+    Password(Vec<u8>),
     CancelRequest {
         process_id: i32,
         secret_key: i32,
     },
     SSLRequest,
+    GssEncRequest,
+    CopyData(Vec<u8>),
+    CopyDone,
+    CopyFail(String),
 }
 
 /// Startup message parameters
@@ -125,6 +131,11 @@ impl ProtocolCodec {
         // SSL request
         if protocol == 80877103 {
             return Ok(Message::SSLRequest);
+        }
+
+        // GSSAPI encryption request (PostgreSQL 12+ clients may probe this first)
+        if protocol == 80877104 {
+            return Ok(Message::GssEncRequest);
         }
 
         // Cancel request
@@ -186,10 +197,11 @@ impl ProtocolCodec {
                 let portal = Self::read_cstring(buf)?;
                 let statement = Self::read_cstring(buf)?;
 
-                // Format codes
-                let n_formats = buf.get_i16() as usize;
-                for _ in 0..n_formats {
-                    let _ = buf.get_i16();
+                // Parameter format codes
+                let n_param_formats = buf.get_i16() as usize;
+                let mut param_formats = Vec::with_capacity(n_param_formats);
+                for _ in 0..n_param_formats {
+                    param_formats.push(buf.get_i16());
                 }
 
                 // Parameters
@@ -206,10 +218,19 @@ impl ProtocolCodec {
                     }
                 }
 
+                // Result-column format codes
+                let n_result_formats = buf.get_i16() as usize;
+                let mut result_formats = Vec::with_capacity(n_result_formats);
+                for _ in 0..n_result_formats {
+                    result_formats.push(buf.get_i16());
+                }
+
                 Ok(Message::Bind {
                     portal,
                     statement,
+                    param_formats,
                     params,
+                    result_formats,
                 })
             }
             b'E' => {
@@ -231,8 +252,21 @@ impl ProtocolCodec {
             }
             b'X' => Ok(Message::Terminate),
             b'p' => {
-                let password = Self::read_cstring(buf)?;
-                Ok(Message::Password(password))
+                let pos = buf.position() as usize;
+                let data = buf.get_ref()[pos..].to_vec();
+                buf.set_position(buf.get_ref().len() as u64);
+                Ok(Message::Password(data))
+            }
+            b'd' => {
+                let pos = buf.position() as usize;
+                let data = buf.get_ref()[pos..].to_vec();
+                buf.set_position(buf.get_ref().len() as u64);
+                Ok(Message::CopyData(data))
+            }
+            b'c' => Ok(Message::CopyDone),
+            b'f' => {
+                let msg = Self::read_cstring(buf).unwrap_or_default();
+                Ok(Message::CopyFail(msg))
             }
             _ => Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -267,6 +301,17 @@ impl ProtocolCodec {
     // Encoding (Backend -> Frontend)
     // =========================================================================
 
+    /// Encode CopyInResponse (text format).
+    pub fn encode_copy_in_response(buf: &mut BytesMut, columns: u16) {
+        buf.put_u8(b'G');
+        buf.put_i32(7 + columns as i32 * 2);
+        buf.put_i8(0); // text format
+        buf.put_i16(columns as i16);
+        for _ in 0..columns {
+            buf.put_i16(0); // text format per column
+        }
+    }
+
     /// Encode AuthenticationOk
     pub fn encode_auth_ok(buf: &mut BytesMut) {
         buf.put_u8(b'R');
@@ -287,6 +332,38 @@ impl ProtocolCodec {
         buf.put_i32(12);
         buf.put_i32(5); // MD5
         buf.put_slice(salt);
+    }
+
+    /// Encode AuthenticationSASL (type 10) with mechanism list.
+    pub fn encode_auth_sasl(buf: &mut BytesMut, mechanisms: &[&str]) {
+        let mut body = BytesMut::new();
+        body.put_i32(10);
+        for mech in mechanisms {
+            body.put_slice(mech.as_bytes());
+            body.put_u8(0);
+        }
+        body.put_u8(0);
+        buf.put_u8(b'R');
+        buf.put_i32(body.len() as i32 + 4);
+        buf.put(body);
+    }
+
+    /// Encode AuthenticationSASLContinue (type 11).
+    pub fn encode_auth_sasl_continue(buf: &mut BytesMut, payload: &str) {
+        let bytes = payload.as_bytes();
+        buf.put_u8(b'R');
+        buf.put_i32(8 + bytes.len() as i32);
+        buf.put_i32(11);
+        buf.put_slice(bytes);
+    }
+
+    /// Encode AuthenticationSASLFinal (type 12).
+    pub fn encode_auth_sasl_final(buf: &mut BytesMut, payload: &str) {
+        let bytes = payload.as_bytes();
+        buf.put_u8(b'R');
+        buf.put_i32(8 + bytes.len() as i32);
+        buf.put_i32(12);
+        buf.put_slice(bytes);
     }
 
     /// Encode ParameterStatus
@@ -364,6 +441,83 @@ impl ProtocolCodec {
                 }
             }
         }
+    }
+
+    /// Format code for one result column (Bind `result_formats`).
+    pub fn column_format_code(formats: &[i16], index: usize) -> i16 {
+        if formats.is_empty() {
+            0
+        } else if formats.len() == 1 {
+            formats[0]
+        } else {
+            formats.get(index).copied().unwrap_or(0)
+        }
+    }
+
+    /// Convert engine text cell bytes to PostgreSQL binary representation.
+    pub fn encode_cell_binary(oid: i32, text_bytes: &[u8]) -> Option<Vec<u8>> {
+        let s = std::str::from_utf8(text_bytes).ok()?;
+        match oid {
+            oid::BOOL => {
+                let b = matches!(s, "t" | "true" | "1" | "yes" | "T" | "TRUE");
+                Some(vec![u8::from(b)])
+            }
+            oid::INT2 => {
+                let v: i16 = s.parse().ok()?;
+                Some(v.to_be_bytes().to_vec())
+            }
+            oid::INT4 => {
+                let v: i32 = s.parse().ok()?;
+                Some(v.to_be_bytes().to_vec())
+            }
+            oid::INT8 => {
+                let v: i64 = s.parse().ok()?;
+                Some(v.to_be_bytes().to_vec())
+            }
+            oid::FLOAT4 => {
+                let v: f32 = s.parse().ok()?;
+                Some(v.to_be_bytes().to_vec())
+            }
+            oid::FLOAT8 => {
+                let v: f64 = s.parse().ok()?;
+                Some(v.to_be_bytes().to_vec())
+            }
+            oid::BYTEA => {
+                if let Some(hex) = s.strip_prefix("\\x") {
+                    hex::decode(hex).ok()
+                } else {
+                    Some(s.as_bytes().to_vec())
+                }
+            }
+            oid::TEXT | oid::VARCHAR | oid::JSON | oid::JSONB | oid::UUID => {
+                Some(text_bytes.to_vec())
+            }
+            _ => Some(text_bytes.to_vec()),
+        }
+    }
+
+    /// Encode DataRow honoring per-column binary/text format codes.
+    pub fn encode_data_row_formatted(
+        buf: &mut BytesMut,
+        row: &[Option<Vec<u8>>],
+        columns: &[(String, i32, i16)],
+        formats: &[i16],
+    ) {
+        let mut scratch = Vec::with_capacity(row.len());
+        for (i, cell) in row.iter().enumerate() {
+            let fmt = Self::column_format_code(formats, i);
+            let oid = columns.get(i).map(|c| c.1).unwrap_or(oid::TEXT);
+            scratch.push(match cell {
+                None => None,
+                Some(bytes) if fmt == 0 => Some(bytes.clone()),
+                Some(bytes) => Self::encode_cell_binary(oid, bytes).or_else(|| Some(bytes.clone())),
+            });
+        }
+        let refs: Vec<Option<&[u8]>> = scratch
+            .iter()
+            .map(|v| v.as_ref().map(|b| b.as_slice()))
+            .collect();
+        Self::encode_data_row(buf, &refs);
     }
 
     /// Encode CommandComplete
@@ -451,4 +605,41 @@ pub mod oid {
     pub const UUID: i32 = 2950;
     pub const NUMERIC: i32 = 1700;
     pub const VECTOR: i32 = 16385; // Custom OID for vectors
+}
+
+#[cfg(test)]
+mod tests {
+    use super::oid;
+    use super::ProtocolCodec;
+    use bytes::Buf;
+
+    #[test]
+    fn encode_cell_binary_int4() {
+        let bin = ProtocolCodec::encode_cell_binary(oid::INT4, b"42").expect("int4");
+        assert_eq!(bin, 42i32.to_be_bytes());
+    }
+
+    #[test]
+    fn encode_cell_binary_int8() {
+        let bin = ProtocolCodec::encode_cell_binary(oid::INT8, b"1000").expect("int8");
+        assert_eq!(bin, 1000i64.to_be_bytes());
+    }
+
+    #[test]
+    fn encode_data_row_formatted_binary_int4() {
+        let mut buf = bytes::BytesMut::new();
+        let row = vec![Some(b"7".to_vec())];
+        let cols = vec![("id".to_string(), oid::INT4, 4i16)];
+        ProtocolCodec::encode_data_row_formatted(&mut buf, &row, &cols, &[1]);
+        assert_eq!(buf[0], b'D');
+        let mut cur = std::io::Cursor::new(&buf[1..]);
+        let _len = cur.get_i32();
+        let ncols = cur.get_i16();
+        assert_eq!(ncols, 1);
+        let field_len = cur.get_i32();
+        assert_eq!(field_len, 4);
+        let mut bytes = [0u8; 4];
+        cur.copy_to_slice(&mut bytes);
+        assert_eq!(i32::from_be_bytes(bytes), 7);
+    }
 }

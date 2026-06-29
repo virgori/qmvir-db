@@ -33,8 +33,8 @@ community (default single-node)
 enterprise-certified
     ↓  optional O–R gates (STONITH, Raft quorum, write quorum, …)
 production-multi-dc-full
-    ↓  planned — formal chaos / partition suite
-jepsen-certified          ← roadmap (not yet a release gate)
+    ↓  qm cluster certify --chaos (11 in-process scenarios)
+jepsen-certified
 ```
 
 | Tier | Meaning | How to verify |
@@ -42,7 +42,7 @@ jepsen-certified          ← roadmap (not yet a release gate)
 | **community** | Single-node; cluster modules inactive | Default — no `QM_CLUSTER_*` |
 | **enterprise-certified** | Required HA gates pass + readiness score ≥ 95% | `qm cluster certify` → `certified: YES` |
 | **production-multi-dc-full** | All gates pass, including optional Phase O–R features | `qm cluster certify` → `prod-full: YES` |
-| **jepsen-certified** | Survives partition / crash / duplicate-WAL chaos battery | *Roadmap:* `qm cluster certify --chaos` |
+| **jepsen-certified** | Survives partition / crash / duplicate-WAL chaos battery | `qm cluster certify --chaos` |
 
 Gates marked `(req)` in `qm cluster certify` output are required for **enterprise-certified**. Gates marked `(opt)` unlock **production-multi-dc-full** when all pass.
 

@@ -73,16 +73,17 @@ impl<'a> BackupEngine<'a> {
         let marker_path = config.output.with_extension("qmvb.incomplete");
         fs::write(&marker_path, format!("backup started at {:?}", start))?;
 
-        let tables_guard = self.engine.tables.read().unwrap();
+        let tables_guard = self.engine.tables.to_native_map();
 
         // Filter tables if specific ones requested.
-        let table_names: Vec<&String> = if let Some(ref names) = config.tables {
+        let table_names: Vec<String> = if let Some(ref names) = config.tables {
             names
                 .iter()
                 .filter(|n| tables_guard.contains_key(n.as_str()))
+                .cloned()
                 .collect()
         } else {
-            tables_guard.keys().collect()
+            tables_guard.keys().cloned().collect()
         };
 
         // Serialize all table data into chunks and build manifest entries.
@@ -92,7 +93,7 @@ impl<'a> BackupEngine<'a> {
         let mut original_size = 0u64;
 
         for table_name in &table_names {
-            let table = &tables_guard[table_name.as_str()];
+            let table = &tables_guard[table_name];
             let row_count = table.rows.len() as u64;
             total_rows += row_count;
 

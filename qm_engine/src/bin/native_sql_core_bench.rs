@@ -4,6 +4,7 @@ use qm_engine::gateway::native_sql::{
 use qm_engine::index::{BPlusTree, IndexKey, IndexLookupKeyRef};
 use qm_engine::mvcc::{visibility, Isolation, MvccRowVersion, Snapshot, TransactionRecord};
 use serde::Serialize;
+use ahash::AHashMap;
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs;
@@ -179,18 +180,16 @@ fn main() {
         }
         engine
             .tables
-            .write()
-            .expect("table lock")
-            .insert("core".to_string(), t);
+            .insert_native("core".to_string(), t);
     }
 
     results.push(bench("core.table_lookup_by_id", iterations, || {
-        let guard = engine.tables.read().expect("table lock");
-        black_box(guard.get("core").map(|t| t.rows.len()));
+        let shared = engine.tables.get_shared("core").unwrap();
+        black_box(shared.read().rows.len());
     }));
 
     let insert_engine = NativeSqlEngine::new();
-    insert_engine.tables.write().expect("table lock").insert(
+    insert_engine.tables.insert_native(
         "insert_core".to_string(),
         table(
             &["id", "score", "label"],
@@ -201,18 +200,17 @@ fn main() {
     results.push(bench("core.row_insert_direct_no_index", iterations, || {
         let id = next_id;
         next_id += 1;
-        let mut guard = insert_engine.tables.write().expect("table lock");
-        guard
-            .get_mut("insert_core")
-            .unwrap()
+        let shared = insert_engine.tables.get_shared("insert_core").unwrap();
+        shared
+            .write()
             .rows
             .insert(id, row(id, id % 101, "insert"));
     }));
 
     let mut select_id = 1i64;
     results.push(bench("core.row_select_direct_by_id", iterations, || {
-        let guard = engine.tables.read().expect("table lock");
-        let table = guard.get("core").unwrap();
+        let shared = engine.tables.get_shared("core").unwrap();
+        let table = shared.read();
         black_box(table.rows.get(&select_id));
         select_id += 1;
         if select_id > iterations.max(10_000) as i64 {
@@ -222,8 +220,8 @@ fn main() {
 
     let mut update_id = 1i64;
     results.push(bench("core.row_update_direct_by_id", iterations, || {
-        let mut guard = engine.tables.write().expect("table lock");
-        let table = guard.get_mut("core").unwrap();
+        let shared = engine.tables.get_shared("core").unwrap();
+        let mut table = shared.write();
         if let Some(row) = table.rows.get_mut(&update_id) {
             row.cols.insert("score".to_string(), Cell::Int(update_id));
         }
@@ -244,16 +242,13 @@ fn main() {
         }
         delete_engine
             .tables
-            .write()
-            .expect("table lock")
-            .insert("delete_core".to_string(), t);
+            .insert_native("delete_core".to_string(), t);
     }
     let mut delete_id = 1i64;
     results.push(bench("core.row_delete_direct_by_id", iterations, || {
-        let mut guard = delete_engine.tables.write().expect("table lock");
-        guard
-            .get_mut("delete_core")
-            .unwrap()
+        let shared = delete_engine.tables.get_shared("delete_core").unwrap();
+        shared
+            .write()
             .rows
             .remove(&delete_id);
         delete_id += 1;
@@ -333,7 +328,7 @@ fn main() {
         active_tx_ids: HashSet::new(),
         isolation: Isolation::ReadCommitted,
     };
-    let registry: HashMap<u64, TransactionRecord> = HashMap::new();
+    let registry: AHashMap<u64, TransactionRecord> = AHashMap::new();
     results.push(bench(
         "core.mvcc_visibility_check_direct",
         iterations,

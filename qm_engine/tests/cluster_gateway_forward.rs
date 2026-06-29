@@ -124,6 +124,31 @@ async fn two_node_registry_routes_to_correct_peer() {
     drop(hb);
 }
 
+#[test]
+fn analytics_read_route_targets_replica() {
+    use qm_engine::cluster::{MetaCluster, QmRouter, WorkloadClass};
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+    fn localhost(port: u16) -> SocketAddr {
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port)
+    }
+
+    let primary = localhost(17101);
+    let replica = localhost(17102);
+    let mut registry = qm_engine::cluster::ShardEndpointRegistry::new();
+    registry.insert(0, primary);
+    registry.insert(1, primary);
+    registry.insert_replica(0, replica);
+    let cluster = MetaCluster::new(&[1]);
+    cluster.bootstrap_default_groups_with_registry(1, 2, &registry);
+    let router = QmRouter::new(cluster.catalog_on(1).unwrap());
+    let (plan, target) = router
+        .route_analytics_read("SELECT SUM(v) FROM t GROUP BY k", 0)
+        .expect("route");
+    assert_eq!(plan.workload, WorkloadClass::Analytics);
+    assert_eq!(target, Some(replica));
+}
+
 async fn spawn_listener(
     engine: Arc<NativeSqlEngine>,
 ) -> (SocketAddr, tokio::task::JoinHandle<()>) {

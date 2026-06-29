@@ -1,6 +1,7 @@
 use super::auth::{AuthManager, Privilege};
 use super::connection::QueryResult;
 use super::protocol::oid;
+use super::table_store::{SharedTable, TableStore};
 use crate::executor::agg::{
     apply_having, AggFunction as ExecAggFunction, AggSpec, AggValue as ExecAggValue,
     AggregateExecutor, HavingPredicate,
@@ -14,6 +15,7 @@ use crate::index::{
     VectorHnswCatalogSnapshot,
 };
 use ahash::AHashMap;
+use dashmap::DashMap;
 use parking_lot::RwLock as PLRwLock;
 #[cfg(feature = "python")]
 use pyo3::prelude::*;
@@ -2426,7 +2428,38 @@ const GROUP_COMMIT_DEFAULT_WINDOW_US: u64 = 150;
 const GROUP_COMMIT_DEFAULT_MAX_BATCH: u64 = 128;
 const WAL_BUF_CAPACITY: usize = 256 * 1024;
 
-type WalWriterHandle = BufWriter<fs::File>;
+type WalWriterHandle = WalBackend;
+
+const URING_WAL_SQL_RECORD_TYPE: u8 = 4;
+
+enum WalBackend {
+    Text(BufWriter<fs::File>),
+    #[cfg(target_os = "linux")]
+    Uring(parking_lot::Mutex<crate::storage::uring_wal::UringWalWriter>),
+}
+
+fn uring_wal_enabled(data_dir: &std::path::Path) -> bool {
+    cfg!(target_os = "linux")
+        && std::env::var("QMVIR_URING_WAL")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+        && data_dir.is_dir()
+}
+
+fn open_uring_wal(data_dir: &std::path::Path) -> Result<WalBackend, String> {
+    #[cfg(target_os = "linux")]
+    {
+        let dir = data_dir.join("uring_wal");
+        let writer = crate::storage::uring_wal::UringWalWriter::open(&dir, false)
+            .map_err(|e| format!("io_uring WAL open failed: {e}"))?;
+        Ok(WalBackend::Uring(parking_lot::Mutex::new(writer)))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = data_dir;
+        Err("io_uring WAL requires Linux".to_string())
+    }
+}
 
 #[cfg(unix)]
 fn sync_wal_parent_dir(wal_path: &std::path::Path) -> Result<(), String> {
@@ -2447,7 +2480,69 @@ fn sync_wal_parent_dir(_wal_path: &std::path::Path) -> Result<(), String> {
 /// O_DSYNC makes flushed WAL bytes data-durable without a separate per-commit
 /// `sync_all()`. Linux and macOS both use this fast path when the filesystem
 /// accepts O_DSYNC; otherwise we fall back to flush + kernel sync.
-fn open_wal_writer(wal_path: &std::path::Path) -> Result<(WalWriterHandle, bool), String> {
+impl WalBackend {
+    fn append_sql(&mut self, sql: &str) -> Result<(), String> {
+        match self {
+            WalBackend::Text(writer) => {
+                writeln!(writer, "{}", sql).map_err(|err| format!("WAL append failed: {err}"))?;
+                writer
+                    .flush()
+                    .map_err(|err| format!("WAL append flush failed: {err}"))
+            }
+            #[cfg(target_os = "linux")]
+            WalBackend::Uring(writer) => {
+                let mut guard = writer.lock();
+                guard
+                    .append(0, URING_WAL_SQL_RECORD_TYPE, sql.as_bytes())
+                    .map_err(|err| format!("io_uring WAL append failed: {err}"))?;
+                Ok(())
+            }
+        }
+    }
+
+    fn append_sql_batch(&mut self, sqls: &[String]) -> Result<(), String> {
+        for sql in sqls {
+            self.append_sql(sql)?;
+        }
+        Ok(())
+    }
+
+    fn flush_buffer(&mut self) -> Result<(), String> {
+        match self {
+            WalBackend::Text(writer) => writer
+                .flush()
+                .map_err(|err| format!("WAL flush failed: {err}")),
+            #[cfg(target_os = "linux")]
+            WalBackend::Uring(writer) => writer
+                .lock()
+                .flush()
+                .map_err(|err| format!("io_uring WAL flush failed: {err}")),
+        }
+    }
+
+    fn sync_all(&mut self) -> Result<(), String> {
+        self.flush_buffer()
+    }
+}
+
+/// Open WAL backend: io_uring segments when `QMVIR_URING_WAL=1`, else text SQL log.
+fn open_wal_writer(data_dir: &std::path::Path) -> Result<(WalWriterHandle, bool), String> {
+    if uring_wal_enabled(data_dir) {
+        match open_uring_wal(data_dir) {
+            Ok(backend) => {
+                eprintln!(
+                    "[WAL] io_uring backend enabled at {}",
+                    data_dir.join("uring_wal").display()
+                );
+                return Ok((backend, false));
+            }
+            Err(err) => {
+                eprintln!("[WAL] io_uring open failed ({err}); using text WAL");
+            }
+        }
+    }
+
+    let wal_path = data_dir.join("native_sql.wal");
     let existed = wal_path.exists();
     #[cfg(unix)]
     {
@@ -2457,14 +2552,14 @@ fn open_wal_writer(wal_path: &std::path::Path) -> Result<(WalWriterHandle, bool)
             .append(true)
             .read(true)
             .custom_flags(libc::O_DSYNC)
-            .open(wal_path)
+            .open(&wal_path)
         {
             Ok(file) => {
                 if !existed {
-                    sync_wal_parent_dir(wal_path)?;
+                    sync_wal_parent_dir(&wal_path)?;
                 }
                 Ok((
-                    BufWriter::with_capacity(WAL_BUF_CAPACITY, file),
+                    WalBackend::Text(BufWriter::with_capacity(WAL_BUF_CAPACITY, file)),
                     true,
                 ))
             }
@@ -2476,15 +2571,15 @@ fn open_wal_writer(wal_path: &std::path::Path) -> Result<(WalWriterHandle, bool)
                     .create(true)
                     .append(true)
                     .read(true)
-                    .open(wal_path)
+                    .open(&wal_path)
                     .map_err(|fallback_err| {
                         format!("open WAL failed after O_DSYNC fallback: {fallback_err}")
                     })?;
                 if !existed {
-                    sync_wal_parent_dir(wal_path)?;
+                    sync_wal_parent_dir(&wal_path)?;
                 }
                 Ok((
-                    BufWriter::with_capacity(WAL_BUF_CAPACITY, file),
+                    WalBackend::Text(BufWriter::with_capacity(WAL_BUF_CAPACITY, file)),
                     false,
                 ))
             }
@@ -2496,9 +2591,9 @@ fn open_wal_writer(wal_path: &std::path::Path) -> Result<(WalWriterHandle, bool)
             .create(true)
             .append(true)
             .read(true)
-            .open(wal_path)
+            .open(&wal_path)
             .map_err(|err| format!("open WAL failed: {err}"))?;
-        Ok((BufWriter::with_capacity(WAL_BUF_CAPACITY, file), false))
+        Ok((WalBackend::Text(BufWriter::with_capacity(WAL_BUF_CAPACITY, file)), false))
     }
 }
 
@@ -3645,9 +3740,9 @@ impl BufferPool {
 
 #[derive(Clone)]
 pub struct NativeSqlEngine {
-    /// Logical session identifier for Phase-1 MVCC transaction metadata.
-    session_id: SessionId,
-    pub tables: Arc<RwLock<HashMap<String, NativeTable>>>,
+    /// Logical session identifier for MVCC.
+    pub session_id: SessionId,
+    pub tables: Arc<TableStore>,
     index_mgr: Arc<IndexManager>,
     inverted_catalog: Arc<InvertedIndexCatalog>,
     json_path_catalog: Arc<JsonPathCatalog>,
@@ -3661,6 +3756,8 @@ pub struct NativeSqlEngine {
     wal_open_datasync: Arc<AtomicBool>,
     /// Mutations since last checkpoint (for auto-checkpoint).
     wal_mutations: Arc<AtomicU64>,
+    /// Tracked WAL file size (avoids fs::metadata on commit hot path).
+    wal_file_bytes: Arc<AtomicU64>,
     /// Optional engine-native WAL sync policy. Default preserves the legacy
     /// append/explicit-sync behavior; benchmarks can opt into sync-at-return.
     wal_sync_policy: Arc<AtomicU64>,
@@ -3689,9 +3786,11 @@ pub struct NativeSqlEngine {
     pub tombstone_log: Arc<RwLock<Vec<(String, i64, u64)>>>,
     /// Session-local transaction snapshot. DML mutates the live tables while this
     /// stores the committed baseline for rollback.
-    transaction: Arc<RwLock<Option<TransactionState>>>,
-    /// Phase-1 MVCC metadata registry. It does not drive row visibility yet.
+    transaction: Arc<PLRwLock<Option<TransactionState>>>,
+    /// Phase-1 MVCC metadata registry. Visibility is enforced via `htap.mvcc`.
     mvcc_tx_mgr: Arc<MvccTransactionManager>,
+    /// Production HTAP runtime (MVCC store, segments, planner, spill, PITR).
+    pub htap: Arc<crate::htap::HtapRuntime>,
     prepared_plans: Arc<RwLock<HashMap<u64, PreparedPlan>>>,
     next_prepared_plan_id: Arc<AtomicU64>,
 }
@@ -4068,9 +4167,7 @@ impl PyNativeSqlEngine {
     pub fn snapshot_info(&self) -> PyResult<PyObject> {
         Python::with_gil(|py| {
             let dict = pyo3::types::PyDict::new_bound(py);
-            let tables = self.inner.tables.read().map_err(|e| {
-                pyo3::exceptions::PyRuntimeError::new_err(format!("tables lock poisoned: {e}"))
-            })?;
+            let tables = self.inner.tables.to_native_map();
             let total_rows: usize = tables.values().map(|table| table.rows.len()).sum();
             let table_list = pyo3::types::PyList::empty_bound(py);
             for (name, table) in tables.iter() {
@@ -4773,12 +4870,107 @@ enum CreateIndexKind {
 }
 
 impl NativeSqlEngine {
+    #[inline]
+    fn table_read_guard(&self, table: &str) -> Result<SharedTable, String> {
+        self.tables.lock_table_read(table)
+    }
+
+    #[inline]
+    fn with_table_read<R>(
+        &self,
+        table: &str,
+        f: impl FnOnce(&NativeTable) -> Result<R, String>,
+    ) -> Result<R, String> {
+        let shared = self.table_read_guard(table)?;
+        let guard = shared.read();
+        f(&guard)
+    }
+
+    #[inline]
+    fn table_row_count(&self, table: &str) -> usize {
+        if !self.htap_tx_active() && !self.transaction_active() {
+            if let Some(n) = self.tables.row_count(table) {
+                if n > 0 {
+                    return n;
+                }
+            }
+        }
+        self.htap.bootstrap_table_engine(&self.tables, table);
+        let n = self.htap_visible_row_count(table);
+        if n > 0 {
+            return n;
+        }
+        self.tables.row_count(table).unwrap_or(0)
+    }
+
+    /// Fast OLTP commit: MVCC vacuum (throttled) + cached WAL archive append.
+    fn htap_publish_commit(&self, commit_ts: u64) {
+        let wal_path = self
+            .data_dir
+            .as_ref()
+            .map(|d| d.join("native_sql.wal"))
+            .unwrap_or_default();
+        let wal_bytes = self.wal_file_bytes.load(Ordering::Relaxed);
+        self.htap.after_commit(
+            commit_ts,
+            &wal_path,
+            wal_bytes,
+            self.htap.tx_mgr.oldest_active_snapshot(),
+        );
+    }
+
+    fn htap_needs_column_refresh(&self, table: &str) -> bool {
+        if self.data_dir.is_none() {
+            return false;
+        }
+        if self.htap.is_column_dirty(table) {
+            return true;
+        }
+        if self.htap.column_segments.has_any_for_table(table) {
+            return false;
+        }
+        self.htap_visible_row_count(table) > 0
+    }
+
+    /// Lazy OLAP path: materialize column segments for one dirty table on demand.
+    fn htap_ensure_column_segments(&self, table: &str) {
+        if !self.htap_needs_column_refresh(table) {
+            return;
+        }
+        let commit_ts = self.htap.tx_mgr.current_commit_ts();
+        if self.data_dir.is_none() {
+            return;
+        }
+        let Ok(shared) = self.tables.lock_table_read(table) else {
+            return;
+        };
+        let mut native = shared.read().clone();
+        self.htap.mvcc.sync_native_table(
+            &self.htap.tx_mgr,
+            self.session_id,
+            table,
+            &mut native,
+        );
+        let _ = self.htap.columnizer.columnize_table(
+            &self.htap.column_segments,
+            table,
+            &native,
+            commit_ts,
+        );
+        drop(shared);
+        if let Ok(shared) = self.tables.lock_table_write(table) {
+            *shared.write() = native;
+        }
+        self.htap.clear_column_dirty(table);
+    }
+
     pub fn new() -> Self {
+        let htap = Arc::new(crate::htap::HtapRuntime::new_in_memory());
+        let session_id = htap.register_session();
         let mvcc_tx_mgr = Arc::new(MvccTransactionManager::new());
-        let session_id = mvcc_tx_mgr.register_session();
         Self {
             session_id,
-            tables: Arc::new(RwLock::new(HashMap::new())),
+            tables: Arc::new(TableStore::new()),
             index_mgr: Arc::new(IndexManager::new()),
             inverted_catalog: Arc::new(InvertedIndexCatalog::new()),
             json_path_catalog: Arc::new(JsonPathCatalog::new()),
@@ -4788,6 +4980,7 @@ impl NativeSqlEngine {
             wal_writer: Arc::new(RwLock::new(None)),
             wal_open_datasync: Arc::new(AtomicBool::new(false)),
             wal_mutations: Arc::new(AtomicU64::new(0)),
+            wal_file_bytes: Arc::new(AtomicU64::new(0)),
             wal_sync_policy: Arc::new(AtomicU64::new(WalSyncPolicy::AppendOnlyProfile as u64)),
             wal_sync_count: Arc::new(AtomicU64::new(0)),
             group_commit: Arc::new(GroupCommitState::default()),
@@ -4801,8 +4994,9 @@ impl NativeSqlEngine {
             buf_pool: Arc::new(BufferPool::new()),
             row_lsn_counter: Arc::new(AtomicU64::new(0)),
             tombstone_log: Arc::new(RwLock::new(Vec::new())),
-            transaction: Arc::new(RwLock::new(None)),
+            transaction: Arc::new(PLRwLock::new(None)),
             mvcc_tx_mgr,
+            htap,
             prepared_plans: Arc::new(RwLock::new(HashMap::new())),
             next_prepared_plan_id: Arc::new(AtomicU64::new(1)),
         }
@@ -4812,11 +5006,12 @@ impl NativeSqlEngine {
     pub fn with_data_dir(dir: PathBuf) -> Self {
         let start = std::time::Instant::now();
         fs::create_dir_all(&dir).ok();
+        let htap = Arc::new(crate::htap::HtapRuntime::with_data_dir(dir.clone()));
+        let session_id = htap.register_session();
         let mvcc_tx_mgr = Arc::new(MvccTransactionManager::new());
-        let session_id = mvcc_tx_mgr.register_session();
         let mut engine = Self {
             session_id,
-            tables: Arc::new(RwLock::new(HashMap::new())),
+            tables: Arc::new(TableStore::new()),
             index_mgr: Arc::new(IndexManager::new()),
             inverted_catalog: Arc::new(InvertedIndexCatalog::new()),
             json_path_catalog: Arc::new(JsonPathCatalog::new()),
@@ -4826,6 +5021,7 @@ impl NativeSqlEngine {
             wal_writer: Arc::new(RwLock::new(None)),
             wal_open_datasync: Arc::new(AtomicBool::new(false)),
             wal_mutations: Arc::new(AtomicU64::new(0)),
+            wal_file_bytes: Arc::new(AtomicU64::new(0)),
             wal_sync_policy: Arc::new(AtomicU64::new(WalSyncPolicy::AppendOnlyProfile as u64)),
             wal_sync_count: Arc::new(AtomicU64::new(0)),
             group_commit: Arc::new(GroupCommitState::default()),
@@ -4839,8 +5035,9 @@ impl NativeSqlEngine {
             buf_pool: Arc::new(BufferPool::new()),
             row_lsn_counter: Arc::new(AtomicU64::new(0)),
             tombstone_log: Arc::new(RwLock::new(Vec::new())),
-            transaction: Arc::new(RwLock::new(None)),
+            transaction: Arc::new(PLRwLock::new(None)),
             mvcc_tx_mgr,
+            htap,
             prepared_plans: Arc::new(RwLock::new(HashMap::new())),
             next_prepared_plan_id: Arc::new(AtomicU64::new(1)),
         };
@@ -4863,7 +5060,7 @@ impl NativeSqlEngine {
         }
         // Open WAL for appending new mutations.
         let wal_path = dir.join("native_sql.wal");
-        match open_wal_writer(&wal_path) {
+        match open_wal_writer(&dir) {
             Ok((writer, open_datasync)) => {
                 if let Ok(mut guard) = engine.wal_writer.write() {
                     *guard = Some(writer);
@@ -4871,6 +5068,10 @@ impl NativeSqlEngine {
                 engine
                     .wal_open_datasync
                     .store(open_datasync, Ordering::Relaxed);
+                engine.wal_file_bytes.store(
+                    fs::metadata(&wal_path).map(|m| m.len()).unwrap_or(0),
+                    Ordering::Relaxed,
+                );
             }
             Err(err) => eprintln!("[WAL] Failed to open append log: {err}"),
         }
@@ -5062,7 +5263,7 @@ impl NativeSqlEngine {
     pub fn new_session(&self) -> Self {
         let mut session = self.clone();
         session.session_id = self.mvcc_tx_mgr.register_session();
-        session.transaction = Arc::new(RwLock::new(None));
+        session.transaction = Arc::new(PLRwLock::new(None));
         session
     }
 
@@ -5226,6 +5427,25 @@ impl NativeSqlEngine {
         for row_id in row_ids {
             if let Some(row) = t.rows.get(row_id) {
                 rows.push(Self::materialize_projected_row(*row_id, row, projection));
+            }
+        }
+        rows
+    }
+
+    fn materialize_indexed_projection_rows_visible(
+        &self,
+        table: &str,
+        heap: &NativeTable,
+        row_ids: &[i64],
+        projection: &[String],
+    ) -> Vec<Vec<Option<Vec<u8>>>> {
+        if projection.len() == 1 && projection[0] == "id" {
+            return materialize_id_rows(row_ids);
+        }
+        let mut rows = Vec::with_capacity(row_ids.len());
+        for row_id in row_ids {
+            if let Some(row) = self.row_at(table, heap, *row_id) {
+                rows.push(Self::materialize_projected_row(*row_id, &row, projection));
             }
         }
         rows
@@ -5463,19 +5683,28 @@ impl NativeSqlEngine {
     }
 
     pub fn mvcc_active_transaction_count(&self) -> usize {
-        self.mvcc_tx_mgr.active_count()
+        self.htap.tx_mgr.active_count()
     }
 
     pub fn mvcc_oldest_active_snapshot(&self) -> CommitTs {
-        self.mvcc_tx_mgr.oldest_active_snapshot()
+        self.htap.tx_mgr.oldest_active_snapshot()
     }
 
     pub fn mvcc_active_tx_for_session(&self) -> Option<TxId> {
-        self.mvcc_tx_mgr.active_tx_for_session(self.session_id)
+        self.htap.tx_mgr.active_tx_for_session(self.session_id)
     }
 
     pub fn mvcc_transaction_state(&self, tx_id: TxId) -> Option<MvccTxState> {
-        self.mvcc_tx_mgr.transaction_state(tx_id)
+        self.htap
+            .tx_mgr
+            .transaction_state(tx_id)
+            .map(|s| match s {
+                crate::mvcc::tx_manager::TxState::Active => MvccTxState::Active,
+                crate::mvcc::tx_manager::TxState::Committed { commit_ts } => {
+                    MvccTxState::Committed { commit_ts }
+                }
+                crate::mvcc::tx_manager::TxState::Aborted => MvccTxState::Aborted,
+            })
     }
 
     pub fn execute_vector_with_timing(
@@ -5486,10 +5715,173 @@ impl NativeSqlEngine {
     }
 
     fn transaction_active(&self) -> bool {
-        self.transaction
-            .read()
-            .map(|tx| tx.is_some())
-            .unwrap_or(false)
+        self.transaction.read().is_some()
+    }
+
+    fn htap_track_row_write(&self, table: &str, t: &NativeTable, row_id: i64, row: &NativeRow) {
+        if let Some(tx_id) = self.htap.tx_mgr.active_tx_for_session(self.session_id) {
+            self.htap.bootstrap_table_engine(&self.tables, table);
+            let _ = self
+                .htap
+                .mvcc
+                .upsert_row(tx_id, table, t, row_id, row.clone());
+            self.htap.mark_column_dirty(table);
+        }
+    }
+
+    fn htap_track_row_delete(&self, table: &str, t: &NativeTable, row_id: i64) {
+        if let Some(tx_id) = self.htap.tx_mgr.active_tx_for_session(self.session_id) {
+            self.htap.bootstrap_table_engine(&self.tables, table);
+            let _ = self.htap.mvcc.delete_row(tx_id, table, t, row_id);
+            self.htap.mark_column_dirty(table);
+        }
+    }
+
+    #[inline]
+    fn htap_tx_active(&self) -> bool {
+        self.htap
+            .tx_mgr
+            .active_tx_for_session(self.session_id)
+            .is_some()
+    }
+
+    fn htap_plan_sql(&self, sql: &str, table: &str) -> crate::htap::HtapPhysicalPlan {
+        let rows = self.table_row_count(table) as u64;
+        let has_col = self.htap.column_segments.has_any_for_table(table)
+            || self.htap.is_column_dirty(table);
+        self.htap.planner.plan_sql(sql, rows, has_col)
+    }
+
+    /// Durable mmap column segment SUM when planner picks ColumnScan (no WHERE).
+    fn htap_try_durable_sum(
+        &self,
+        table: &str,
+        agg_col: &str,
+        sql: &str,
+    ) -> Option<(f64, i64)> {
+        if self.htap_plan_sql(sql, table).path != crate::htap::planner::ScanPath::ColumnScan {
+            return None;
+        }
+        self.htap_ensure_column_segments(table);
+        if !self.htap.column_segments.has_any_for_table(table) {
+            return None;
+        }
+        let lsn = self.htap.tx_mgr.current_commit_ts();
+        self.htap
+            .column_segments
+            .sum_f64_at_lsn(table, agg_col, lsn)
+            .map(|(s, n)| (s, n as i64))
+    }
+
+    /// Durable SUM with `id BETWEEN lo AND hi` when segments are sorted by id.
+    fn htap_try_durable_sum_between(
+        &self,
+        table: &str,
+        id_col: &str,
+        agg_col: &str,
+        lo: i64,
+        hi: i64,
+        sql: &str,
+    ) -> Option<(f64, i64)> {
+        if self.htap_plan_sql(sql, table).path != crate::htap::planner::ScanPath::ColumnScan {
+            return None;
+        }
+        self.htap_ensure_column_segments(table);
+        if !self.htap.column_segments.has_any_for_table(table) {
+            return None;
+        }
+        let lsn = self.htap.tx_mgr.current_commit_ts();
+        self.htap
+            .column_segments
+            .sum_f64_between_on_id(table, id_col, agg_col, lo, hi, lsn)
+            .map(|(s, n)| (s, n as i64))
+    }
+
+    /// Row count from durable id column segment when ColumnScan applies.
+    fn htap_try_durable_count(&self, table: &str, sql: &str, id_col: &str) -> Option<i64> {
+        if self.htap_plan_sql(sql, table).path != crate::htap::planner::ScanPath::ColumnScan {
+            return None;
+        }
+        self.htap_ensure_column_segments(table);
+        if !self.htap.column_segments.has_any_for_table(table) {
+            return None;
+        }
+        let lsn = self.htap.tx_mgr.current_commit_ts();
+        self.htap
+            .column_segments
+            .row_count_at_lsn(table, id_col, lsn)
+            .map(|n| n as i64)
+    }
+
+    /// MVCC-aware row lookup with heap fallback during migration.
+    #[inline]
+    fn row_at(&self, table: &str, heap: &NativeTable, id: i64) -> Option<NativeRow> {
+        self.htap_visible_row(table, id)
+            .map(|r| (*r).clone())
+            .or_else(|| heap.rows.get(&id).cloned())
+    }
+
+    /// Real autocommit: implicit BEGIN/COMMIT via HTAP tx_mgr (not WAL-only fake commit).
+    fn htap_autocommit_mutation<F>(
+        &self,
+        sql: &str,
+        f: F,
+    ) -> Result<QueryResult, String>
+    where
+        F: FnOnce(&Self) -> Result<QueryResult, String>,
+    {
+        let tx_id = self.htap.tx_mgr.begin_transaction(self.session_id)?;
+        let result = f(self);
+        match result {
+            Ok(q) => {
+                self.htap.mvcc.apply_deferred_touches(tx_id);
+                let dirty = self.htap.tx_mgr.touched_tables_for(tx_id);
+                let commit_ts = self.htap.tx_mgr.commit_transaction(tx_id)?;
+                self.htap
+                    .mvcc
+                    .publish_transaction(tx_id, commit_ts)?;
+                if self.data_dir.is_some() {
+                    self.wal_append(sql)?;
+                }
+                for table in dirty {
+                    self.htap.mark_column_dirty(&table);
+                }
+                self.htap_publish_commit(commit_ts);
+                self.after_successful_autocommit_wal_mutation()?;
+                Ok(q)
+            }
+            Err(e) => {
+                self.htap.mvcc.abort_transaction(tx_id);
+                let _ = self.htap.tx_mgr.abort_transaction(tx_id);
+                for name in self.tables.table_names() {
+                    if let Ok(shared) = self.tables.lock_table_read(&name) {
+                        self.htap.mvcc.rebuild_table(&name, &shared.read());
+                    }
+                }
+                Err(e)
+            }
+        }
+    }
+
+    fn htap_explain_line(&self, sql: &str) -> String {
+        let table = Self::extract_from_table(sql).unwrap_or_else(|| "?".into());
+        let rows = self.htap_visible_row_count(&table).max(1) as u64;
+        let has_col = self.htap.column_segments.has_any_for_table(&table)
+            || self.htap.is_column_dirty(&table);
+        let plan = self.htap.planner.plan_sql(sql, rows, has_col);
+        format!(
+            "{} on {} (est_rows={}, spill={})",
+            match plan.path {
+                crate::htap::planner::ScanPath::IndexPoint => "Index Scan",
+                crate::htap::planner::ScanPath::RowScan => "Seq Scan",
+                crate::htap::planner::ScanPath::ColumnScan => "Column Scan",
+                crate::htap::planner::ScanPath::VectorHnsw => "HNSW Vector Scan",
+                crate::htap::planner::ScanPath::FtsInverted => "GIN/Inverted Scan",
+            },
+            table,
+            plan.estimated_rows,
+            plan.use_spill
+        )
     }
 
     fn begin_transaction(&self) -> Result<QueryResult, String> {
@@ -5498,16 +5890,11 @@ impl NativeSqlEngine {
         } else {
             None
         };
-        let mut tx = self
-            .transaction
-            .write()
-            .map_err(|_| "transaction lock poisoned")?;
+        let mut tx = self.transaction.write();
         if tx.is_some() {
             return Err("transaction already active; nested BEGIN is not supported".to_string());
         }
-        let (mvcc_tx_id, _snapshot) = self
-            .mvcc_tx_mgr
-            .begin(self.session_id, MvccIsolationLevel::ReadCommitted)?;
+        let mvcc_tx_id = self.htap.tx_mgr.begin_transaction(self.session_id)?;
         *tx = Some(TransactionState {
             tables_snapshot: None,
             row_undo: HashMap::new(),
@@ -5542,14 +5929,12 @@ impl NativeSqlEngine {
         if rows.is_empty() && !snapshot_indexes {
             return Ok(());
         }
-        let mut tx = self
-            .transaction
-            .write()
-            .map_err(|_| "transaction lock poisoned")?;
+        let needs_tombstone = rows.iter().any(|(_, before)| before.is_some());
+        let mut tx = self.transaction.write();
         let Some(state) = tx.as_mut() else {
             return Ok(());
         };
-        if state.tombstone_snapshot.is_none() {
+        if needs_tombstone && state.tombstone_snapshot.is_none() {
             state.tombstone_snapshot = Some(
                 self.tombstone_log
                     .read()
@@ -5581,20 +5966,12 @@ impl NativeSqlEngine {
     }
 
     fn ensure_full_transaction_snapshot(&self) -> Result<(), String> {
-        let mut tx = self
-            .transaction
-            .write()
-            .map_err(|_| "transaction lock poisoned")?;
+        let mut tx = self.transaction.write();
         let Some(state) = tx.as_mut() else {
             return Ok(());
         };
         if state.tables_snapshot.is_none() {
-            state.tables_snapshot = Some(
-                self.tables
-                    .read()
-                    .map_err(|_| "table lock poisoned")?
-                    .clone(),
-            );
+            state.tables_snapshot = Some(self.tables.to_native_map());
         }
         if state.tombstone_snapshot.is_none() {
             state.tombstone_snapshot = Some(
@@ -5679,7 +6056,6 @@ impl NativeSqlEngine {
         let tx_state = self
             .transaction
             .write()
-            .map_err(|_| "transaction lock poisoned")?
             .take()
             .ok_or_else(|| "COMMIT without active transaction".to_string())?;
 
@@ -5690,8 +6066,24 @@ impl NativeSqlEngine {
         if tx_state.dirty {
             self.validate_internal_state()?;
         }
-        self.mvcc_tx_mgr
-            .commit(self.session_id, tx_state.mvcc_tx_id)?;
+        self.htap
+            .mvcc
+            .apply_deferred_touches(tx_state.mvcc_tx_id);
+        let touched = self
+            .htap
+            .tx_mgr
+            .touched_tables_for(tx_state.mvcc_tx_id);
+        let commit_ts = self
+            .htap
+            .tx_mgr
+            .commit_transaction(tx_state.mvcc_tx_id)?;
+        self.htap
+            .mvcc
+            .publish_transaction(tx_state.mvcc_tx_id, commit_ts)?;
+        for table in touched {
+            self.htap.mark_column_dirty(&table);
+        }
+        self.htap_publish_commit(commit_ts);
         if with_wal {
             let wal_statement_count = tx_state.wal_sql.len() as u64;
             if wal_statement_count > 0 {
@@ -5759,26 +6151,26 @@ impl NativeSqlEngine {
         let tx_state = self
             .transaction
             .write()
-            .map_err(|_| "transaction lock poisoned")?
             .take()
             .ok_or_else(|| "ROLLBACK without active transaction".to_string())?;
         if tx_state.dirty {
             if let Some(tables_snapshot) = tx_state.tables_snapshot {
-                let mut tables = self.tables.write().map_err(|_| "table lock poisoned")?;
-                let mut restored = tables_snapshot;
-                for (table_name, current_table) in tables.iter() {
-                    if let Some(restored_table) = restored.get_mut(table_name) {
-                        restored_table.next_auto_id =
-                            restored_table.next_auto_id.max(current_table.next_auto_id);
-                        for (col, current_seq) in &current_table.sequences {
-                            if let Some(restored_seq) = restored_table.sequences.get_mut(col) {
-                                restored_seq.current_value =
-                                    restored_seq.current_value.max(current_seq.current_value);
+                self.tables.update_all(|tables| {
+                    let mut restored = tables_snapshot;
+                    for (table_name, current_table) in tables.iter() {
+                        if let Some(restored_table) = restored.get_mut(table_name) {
+                            restored_table.next_auto_id =
+                                restored_table.next_auto_id.max(current_table.next_auto_id);
+                            for (col, current_seq) in &current_table.sequences {
+                                if let Some(restored_seq) = restored_table.sequences.get_mut(col) {
+                                    restored_seq.current_value =
+                                        restored_seq.current_value.max(current_seq.current_value);
+                                }
                             }
                         }
                     }
-                }
-                *tables = restored;
+                    *tables = restored;
+                });
                 if let Some(index_snapshot) = tx_state.index_snapshot {
                     self.index_mgr.restore_snapshot(index_snapshot);
                 }
@@ -5811,25 +6203,29 @@ impl NativeSqlEngine {
                     self.vector_hnsw_catalog
                         .restore_snapshot(vector_hnsw_snapshot);
                 }
-                let mut tables = self.tables.write().map_err(|_| "table lock poisoned")?;
-                for (table_name, row_undos) in tx_state.row_undo {
-                    if let Some(table) = tables.get_mut(&table_name) {
-                        for (row_id, before) in row_undos {
-                            match before {
-                                Some(row) => {
-                                    table.rows.insert(row_id, row);
-                                }
-                                None => {
-                                    table.rows.remove(&row_id);
+                let undo_tables: Vec<String> = tx_state.row_undo.keys().cloned().collect();
+                self.tables.update_all(|tables| {
+                    for (table_name, row_undos) in tx_state.row_undo {
+                        if let Some(table) = tables.get_mut(&table_name) {
+                            for (row_id, before) in row_undos {
+                                match before {
+                                    Some(row) => {
+                                        table.rows.insert(row_id, row);
+                                    }
+                                    None => {
+                                        table.rows.remove(&row_id);
+                                    }
                                 }
                             }
                         }
                     }
+                });
+                for table_name in undo_tables {
                     self.buf_pool.invalidate(&table_name);
                 }
                 self.buf_pool.clear_all_caches();
             } else {
-                let mut tables = self.tables.write().map_err(|_| "table lock poisoned")?;
+                let mut tables = self.tables.write();
                 for (table_name, row_undos) in tx_state.row_undo {
                     if let Some(table) = tables.get_mut(&table_name) {
                         for (row_id, before) in row_undos {
@@ -5863,8 +6259,13 @@ impl NativeSqlEngine {
         if tx_state.dirty {
             self.validate_internal_state()?;
         }
-        self.mvcc_tx_mgr
-            .abort(self.session_id, tx_state.mvcc_tx_id)?;
+        self.htap.mvcc.abort_transaction(tx_state.mvcc_tx_id);
+        let _ = self.htap.tx_mgr.abort_transaction(tx_state.mvcc_tx_id);
+        for name in self.tables.table_names() {
+            if let Ok(shared) = self.tables.lock_table_read(&name) {
+                self.htap.mvcc.rebuild_table(&name, &shared.read());
+            }
+        }
         if let Some(start) = profile_start {
             Self::profile_ns(&self.native_profile.tx_rollback_ns, start.elapsed());
         }
@@ -5872,10 +6273,7 @@ impl NativeSqlEngine {
     }
 
     fn record_transaction_wal(&self, sql: &str) -> Result<(), String> {
-        let mut tx = self
-            .transaction
-            .write()
-            .map_err(|_| "transaction lock poisoned")?;
+        let mut tx = self.transaction.write();
         if let Some(state) = tx.as_mut() {
             state.wal_sql.push(sql.to_string());
             Ok(())
@@ -5889,6 +6287,9 @@ impl NativeSqlEngine {
     }
 
     fn trace_wal_append(&self, statements: u64, bytes: u64, batch: bool) {
+        if bytes > 0 {
+            self.wal_file_bytes.fetch_add(bytes, Ordering::Relaxed);
+        }
         if !Self::wal_trace_enabled() {
             return;
         }
@@ -5936,9 +6337,7 @@ impl NativeSqlEngine {
         } else {
             None
         };
-        writeln!(f, "{}", sql).map_err(|err| format!("WAL append failed: {err}"))?;
-        f.flush()
-            .map_err(|err| format!("WAL append flush failed: {err}"))?;
+        f.append_sql(sql)?;
         if let Some(start) = write_start {
             Self::profile_ns(&self.native_profile.wal_write_ns, start.elapsed());
             self.native_profile
@@ -5986,12 +6385,11 @@ impl NativeSqlEngine {
             None
         };
         for sql in sqls {
-            writeln!(f, "{}", sql).map_err(|err| format!("WAL batch append failed: {err}"))?;
+            f.append_sql(sql)?;
             written += 1;
             bytes += sql.len() as u64 + 1;
         }
-        f.flush()
-            .map_err(|err| format!("WAL batch append flush failed: {err}"))?;
+        f.flush_buffer()?;
         if let Some(start) = write_start {
             Self::profile_ns(&self.native_profile.wal_write_ns, start.elapsed());
             self.native_profile
@@ -6036,65 +6434,82 @@ impl NativeSqlEngine {
             None
         };
         self.maybe_fail_wal_flush_for_test()?;
-        f.flush()
-            .map_err(|err| format!("WAL flush before sync failed: {err}"))?;
-        if let Some(start) = flush_start {
-            Self::profile_ns(&self.native_profile.wal_flush_ns, start.elapsed());
-            self.native_profile
-                .flush_count
-                .fetch_add(1, Ordering::Relaxed);
-        }
-        if Self::wal_trace_enabled() {
-            self.wal_trace.flush_calls.fetch_add(1, Ordering::Relaxed);
-        }
-        let open_datasync = self.wal_open_datasync.load(Ordering::Relaxed);
-        if !open_datasync {
-            let sync_start = if profile_enabled {
-                Some(Instant::now())
-            } else {
-                None
-            };
+        match f {
+            WalBackend::Text(writer) => {
+                writer
+                    .flush()
+                    .map_err(|err| format!("WAL flush before sync failed: {err}"))?;
+                if let Some(start) = flush_start {
+                    Self::profile_ns(&self.native_profile.wal_flush_ns, start.elapsed());
+                    self.native_profile
+                        .flush_count
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                if Self::wal_trace_enabled() {
+                    self.wal_trace.flush_calls.fetch_add(1, Ordering::Relaxed);
+                }
+                let open_datasync = self.wal_open_datasync.load(Ordering::Relaxed);
+                if !open_datasync {
+                    let sync_start = if profile_enabled {
+                        Some(Instant::now())
+                    } else {
+                        None
+                    };
+                    #[cfg(target_os = "linux")]
+                    {
+                        self.maybe_fail_wal_sync_data_for_test()?;
+                        writer
+                            .get_ref()
+                            .sync_data()
+                            .map_err(|err| format!("WAL sync_data failed: {err}"))?;
+                        if let Some(start) = sync_start {
+                            let elapsed = start.elapsed();
+                            Self::profile_ns(&self.native_profile.wal_sync_ns, elapsed);
+                            Self::profile_ns(&self.native_profile.wal_sync_data_ns, elapsed);
+                            self.native_profile
+                                .sync_data_count
+                                .fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                    #[cfg(not(target_os = "linux"))]
+                    {
+                        self.maybe_fail_wal_sync_all_for_test()?;
+                        writer
+                            .get_ref()
+                            .sync_all()
+                            .map_err(|err| format!("WAL sync_all failed: {err}"))?;
+                        if let Some(start) = sync_start {
+                            let elapsed = start.elapsed();
+                            Self::profile_ns(&self.native_profile.wal_sync_ns, elapsed);
+                            Self::profile_ns(&self.native_profile.wal_sync_all_ns, elapsed);
+                            self.native_profile
+                                .sync_all_count
+                                .fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                    if Self::wal_trace_enabled() {
+                        self.wal_trace.sync_calls.fetch_add(1, Ordering::Relaxed);
+                    }
+                } else {
+                    self.maybe_fail_wal_sync_all_for_test()?;
+                }
+            }
             #[cfg(target_os = "linux")]
-            {
-                self.maybe_fail_wal_sync_data_for_test()?;
-                f.get_ref()
-                    .sync_data()
-                    .map_err(|err| format!("WAL sync_data failed: {err}"))?;
-                if let Some(start) = sync_start {
-                    let elapsed = start.elapsed();
-                    Self::profile_ns(&self.native_profile.wal_sync_ns, elapsed);
-                    Self::profile_ns(&self.native_profile.wal_sync_data_ns, elapsed);
+            WalBackend::Uring(writer) => {
+                writer
+                    .lock()
+                    .flush()
+                    .map_err(|err| format!("io_uring WAL sync failed: {err}"))?;
+                if let Some(start) = flush_start {
+                    Self::profile_ns(&self.native_profile.wal_flush_ns, start.elapsed());
                     self.native_profile
-                        .sync_data_count
+                        .flush_count
                         .fetch_add(1, Ordering::Relaxed);
                 }
-            }
-            #[cfg(not(target_os = "linux"))]
-            {
-                self.maybe_fail_wal_sync_all_for_test()?;
-                f.get_ref()
-                    .sync_all()
-                    .map_err(|err| format!("WAL sync_all failed: {err}"))?;
-                if let Some(start) = sync_start {
-                    let elapsed = start.elapsed();
-                    Self::profile_ns(&self.native_profile.wal_sync_ns, elapsed);
-                    Self::profile_ns(&self.native_profile.wal_sync_all_ns, elapsed);
-                    self.native_profile
-                        .sync_all_count
-                        .fetch_add(1, Ordering::Relaxed);
+                if Self::wal_trace_enabled() {
+                    self.wal_trace.flush_calls.fetch_add(1, Ordering::Relaxed);
+                    self.wal_trace.sync_calls.fetch_add(1, Ordering::Relaxed);
                 }
-            }
-            if Self::wal_trace_enabled() {
-                self.wal_trace.sync_calls.fetch_add(1, Ordering::Relaxed);
-            }
-        } else {
-            // O_DSYNC path: bytes are durable on write, but test fault injection must
-            // still run at the per-commit sync hook.
-            self.maybe_fail_wal_sync_all_for_test()?;
-            if profile_enabled {
-                self.native_profile
-                    .sync_data_count
-                    .fetch_add(1, Ordering::Relaxed);
             }
         }
         self.wal_sync_count.fetch_add(1, Ordering::Relaxed);
@@ -6131,8 +6546,7 @@ impl NativeSqlEngine {
             None
         };
         self.maybe_fail_wal_flush_for_test()?;
-        f.flush()
-            .map_err(|err| format!("WAL flush before sync_data failed: {err}"))?;
+        f.flush_buffer()?;
         if let Some(start) = flush_start {
             Self::profile_ns(&self.native_profile.wal_flush_ns, start.elapsed());
             self.native_profile
@@ -6159,9 +6573,17 @@ impl NativeSqlEngine {
             None
         };
         self.maybe_fail_wal_sync_data_for_test()?;
-        f.get_ref()
-            .sync_data()
-            .map_err(|err| format!("WAL sync_data failed: {err}"))?;
+        match f {
+            WalBackend::Text(writer) => writer
+                .get_ref()
+                .sync_data()
+                .map_err(|err| format!("WAL sync_data failed: {err}"))?,
+            #[cfg(target_os = "linux")]
+            WalBackend::Uring(writer) => writer
+                .lock()
+                .flush()
+                .map_err(|err| format!("io_uring WAL sync_data failed: {err}"))?,
+        };
         if let Some(start) = sync_start {
             let elapsed = start.elapsed();
             Self::profile_ns(&self.native_profile.wal_sync_ns, elapsed);
@@ -6283,8 +6705,7 @@ impl NativeSqlEngine {
             None
         };
         self.maybe_fail_wal_flush_for_test()?;
-        f.flush()
-            .map_err(|err| format!("WAL relaxed flush failed: {err}"))?;
+        f.flush_buffer()?;
         if let Some(start) = flush_start {
             Self::profile_ns(&self.native_profile.wal_flush_ns, start.elapsed());
             self.native_profile
@@ -6299,6 +6720,7 @@ impl NativeSqlEngine {
 
     /// Replay WAL file to rebuild in-memory state.
     fn replay_wal(&mut self) {
+        let _uring = self.replay_uring_wal_if_present();
         let wal_path = match &self.data_dir {
             Some(d) => d.join("native_sql.wal"),
             None => return,
@@ -6348,6 +6770,85 @@ impl NativeSqlEngine {
                 String::new()
             }
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    fn replay_uring_wal_if_present(&mut self) -> bool {
+        let dir = match &self.data_dir {
+            Some(d) => d.join("uring_wal"),
+            None => return false,
+        };
+        if !dir.is_dir() {
+            return false;
+        }
+        let has_segments = std::fs::read_dir(&dir)
+            .ok()
+            .map(|rd| {
+                rd.flatten().any(|e| {
+                    e.path()
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .map(|n| n.starts_with("uring_wal_") && n.ends_with(".log"))
+                        .unwrap_or(false)
+                })
+            })
+            .unwrap_or(false);
+        if !has_segments {
+            return false;
+        }
+
+        let writer = match crate::storage::uring_wal::UringWalWriter::open(&dir, false) {
+            Ok(w) => w,
+            Err(err) => {
+                eprintln!("[WAL] io_uring replay open failed: {err}");
+                return false;
+            }
+        };
+        let records = match writer.recover() {
+            Ok(r) => r,
+            Err(err) => {
+                eprintln!("[WAL] io_uring replay recover failed: {err}");
+                return false;
+            }
+        };
+        eprintln!("[WAL] Replaying io_uring WAL ({} records)...", records.len());
+        let start = std::time::Instant::now();
+        let mut count = 0u64;
+        let mut errors = 0u64;
+        const URING_WAL_SQL_RECORD_TYPE: u8 = 4;
+        for rec in records {
+            if rec.record_type != URING_WAL_SQL_RECORD_TYPE {
+                continue;
+            }
+            if let Ok(sql) = std::str::from_utf8(&rec.data) {
+                let trimmed = sql.trim();
+                if !trimmed.is_empty() {
+                    count += 1;
+                    if let Err(e) = self.execute_inner(trimmed, false) {
+                        errors += 1;
+                        if errors <= 5 {
+                            eprintln!("[WAL replay] uring: {e}");
+                        }
+                    }
+                }
+            }
+        }
+        eprintln!(
+            "[WAL] io_uring done: {} entries in {:.1}ms{}",
+            count,
+            start.elapsed().as_secs_f64() * 1000.0,
+            if errors > 0 {
+                format!(" ({} errors)", errors)
+            } else {
+                String::new()
+            }
+        );
+        true
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn replay_uring_wal_if_present(&mut self) -> bool {
+        false
     }
 
     /// Load binary snapshot from disk into memory.
@@ -6401,9 +6902,7 @@ impl NativeSqlEngine {
         }
 
         if let Some(loaded) = loaded_tables {
-            if let Ok(mut guard) = self.tables.write() {
-                *guard = loaded;
-            }
+            self.tables.replace_all(loaded);
         }
 
         let index_path = dir.join("native_sql.indexes");
@@ -6488,20 +6987,9 @@ impl NativeSqlEngine {
         profile.dirty_row_count = dirty_rows;
         profile.dirty_page_or_segment_count = dirty_names.len() as u64;
         let lock_wait_start = Instant::now();
-        let tables = self.tables.read().map_err(|_| ()).ok();
+        let tables = self.tables.to_native_map();
         profile.lock_wait_ms = lock_wait_start.elapsed().as_secs_f64() * 1000.0;
         let lock_held_start = Instant::now();
-        let tables = match tables {
-            Some(t) => t,
-            None => {
-                profile.checkpoint_trigger_reason = "failed_table_lock".to_string();
-                profile.checkpoint_total_ms = checkpoint_start.elapsed().as_secs_f64() * 1000.0;
-                if let Ok(mut guard) = self.last_checkpoint_profile.write() {
-                    *guard = profile;
-                }
-                return;
-            }
-        };
         let table_dir = Self::table_snapshot_dir(dir);
         if fs::create_dir_all(&table_dir).is_err() {
             profile.checkpoint_trigger_reason = "failed_table_snapshot_dir".to_string();
@@ -6732,7 +7220,7 @@ impl NativeSqlEngine {
             // Reopen for appending.
             let wal_reopen_start = Instant::now();
             if let Ok(mut guard) = self.wal_writer.write() {
-                match open_wal_writer(&wal_path) {
+                match open_wal_writer(&dir) {
                     Ok((writer, open_datasync)) => {
                         *guard = Some(writer);
                         self.wal_open_datasync
@@ -6986,7 +7474,7 @@ impl NativeSqlEngine {
             false
         };
 
-        let g = self.tables.read().map_err(|_| "table lock poisoned")?;
+        let g = self.tables.to_native_map();
         let t = g
             .get(table)
             .ok_or_else(|| format!("table \"{}\" does not exist", table))?;
@@ -7622,7 +8110,7 @@ impl NativeSqlEngine {
         table: &str,
         columns: &[String],
     ) -> Result<(), String> {
-        let g = self.tables.read().map_err(|_| "table lock poisoned")?;
+        let g = self.tables.to_native_map();
         let t = g
             .get(table)
             .ok_or_else(|| format!("Table '{}' does not exist", table))?;
@@ -7643,7 +8131,7 @@ impl NativeSqlEngine {
         table: &str,
     ) -> Result<Vec<String>, String> {
         let select_cols = Self::parse_select_columns(sql);
-        let g = self.tables.read().map_err(|_| "table lock poisoned")?;
+        let g = self.tables.to_native_map();
         let t = g
             .get(table)
             .ok_or_else(|| format!("Table '{}' does not exist", table))?;
@@ -7712,7 +8200,7 @@ impl NativeSqlEngine {
                 .collect()
         };
         {
-            let mut g = self.tables.write().map_err(|_| "table lock poisoned")?;
+            let mut g = self.tables.write();
             let old_next_auto_id = {
                 let t = g
                     .get_mut(table)
@@ -7785,7 +8273,7 @@ impl NativeSqlEngine {
         params: &[String],
     ) -> Result<QueryResult, String> {
         let row_id = Self::resolve_prepared_i64(key, params)?;
-        let g = self.tables.read().map_err(|_| "table lock poisoned")?;
+        let g = self.tables.to_native_map();
         let t = g
             .get(table)
             .ok_or_else(|| format!("table \"{}\" does not exist", table))?;
@@ -7847,7 +8335,7 @@ impl NativeSqlEngine {
                 tree.search(&index_key)
             }
         };
-        let g = self.tables.read().map_err(|_| "table lock poisoned")?;
+        let g = self.tables.to_native_map();
         let t = g
             .get(table)
             .ok_or_else(|| format!("table \"{}\" does not exist", table))?;
@@ -7874,7 +8362,7 @@ impl NativeSqlEngine {
             .collect::<Result<_, String>>()?;
         let mut count = 0usize;
         {
-            let mut g = self.tables.write().map_err(|_| "table lock poisoned")?;
+            let mut g = self.tables.write();
             let has_fk_references = Self::table_has_fk_references(&g, table, false);
             if let Some(t) = g.get(table) {
                 resolved = Self::coerce_assignments_for_table(t, &resolved)?;
@@ -7922,7 +8410,7 @@ impl NativeSqlEngine {
         let mut deleted = 0usize;
         let mut fk_affected = Vec::new();
         {
-            let mut g = self.tables.write().map_err(|_| "table lock poisoned")?;
+            let mut g = self.tables.write();
             if g.get(table).and_then(|t| t.rows.get(&row_id)).is_some() {
                 let has_fk_references = Self::table_has_fk_references(&g, table, true);
                 if has_fk_references {
@@ -7995,7 +8483,7 @@ impl NativeSqlEngine {
                 }
             }
         }
-        let g = self.tables.read().map_err(|_| "table lock poisoned")?;
+        let g = self.tables.to_native_map();
         let t = g
             .get(table)
             .ok_or_else(|| format!("table \"{}\" does not exist", table))?;
@@ -8015,7 +8503,7 @@ impl NativeSqlEngine {
         table: &str,
         terms: &[FastCountTerm],
     ) -> Result<QueryResult, String> {
-        let g = self.tables.read().map_err(|_| "table lock poisoned")?;
+        let g = self.tables.to_native_map();
         let t = g
             .get(table)
             .ok_or_else(|| format!("table \"{}\" does not exist", table))?;
@@ -8304,16 +8792,17 @@ impl NativeSqlEngine {
             let tbl = Self::parse_ident_after(s, "DELETE FROM").unwrap_or("");
             self.auth
                 .check_privilege(username, tbl, Privilege::Delete)?;
-            let result = self.handle_delete(s);
+            let result = if autocommit_wal_mutation {
+                self.htap_autocommit_mutation(s, |e| e.handle_delete(s))
+            } else {
+                self.handle_delete(s)
+            };
             if result.is_ok() && with_wal && tx_active_at_start {
                 self.record_transaction_wal(s)?;
             }
             if result.is_ok() {
                 self.mark_table_data_dirty(tbl, 1);
-                if autocommit_wal_mutation {
-                    self.wal_append(s)?;
-                    self.after_successful_autocommit_wal_mutation()?;
-                }
+                self.htap.mark_column_dirty(tbl);
             }
             return result;
         }
@@ -8321,16 +8810,17 @@ impl NativeSqlEngine {
             let tbl = Self::parse_ident_after(s, "INSERT INTO").unwrap_or("");
             self.auth
                 .check_privilege(username, tbl, Privilege::Insert)?;
-            let result = self.handle_insert(s);
+            let result = if autocommit_wal_mutation {
+                self.htap_autocommit_mutation(s, |e| e.handle_insert(s))
+            } else {
+                self.handle_insert(s)
+            };
             if result.is_ok() && with_wal && tx_active_at_start {
                 self.record_transaction_wal(s)?;
             }
             if result.is_ok() {
                 self.mark_table_data_dirty(tbl, 1);
-                if autocommit_wal_mutation {
-                    self.wal_append(s)?;
-                    self.after_successful_autocommit_wal_mutation()?;
-                }
+                self.htap.mark_column_dirty(tbl);
             }
             return result;
         }
@@ -8338,16 +8828,17 @@ impl NativeSqlEngine {
             let tbl = Self::parse_ident_after(s, "UPDATE").unwrap_or("");
             self.auth
                 .check_privilege(username, tbl, Privilege::Update)?;
-            let result = self.handle_update(s);
+            let result = if autocommit_wal_mutation {
+                self.htap_autocommit_mutation(s, |e| e.handle_update(s))
+            } else {
+                self.handle_update(s)
+            };
             if result.is_ok() && with_wal && tx_active_at_start {
                 self.record_transaction_wal(s)?;
             }
             if result.is_ok() {
                 self.mark_table_data_dirty(tbl, 1);
-                if autocommit_wal_mutation {
-                    self.wal_append(s)?;
-                    self.after_successful_autocommit_wal_mutation()?;
-                }
+                self.htap.mark_column_dirty(tbl);
             }
             return result;
         }
@@ -8450,8 +8941,7 @@ impl NativeSqlEngine {
             .trim();
         let up = sql.to_ascii_uppercase();
         let plan = if up.starts_with("SELECT") || up.starts_with("WITH ") {
-            let table = Self::extract_from_table(sql).unwrap_or_else(|| "<constant>".to_string());
-            format!("Seq Scan on {table}")
+            self.htap_explain_line(sql)
         } else if up.starts_with("INSERT") {
             let table = Self::parse_ident_after(sql, "INSERT INTO").unwrap_or("<unknown>");
             format!("Insert on {table}")
@@ -9503,9 +9993,7 @@ impl NativeSqlEngine {
         }
 
         let row_count = new_table.rows.len();
-        let mut g = self.tables.write().map_err(|_| "table lock poisoned")?;
-        g.insert(table.to_string(), new_table);
-        drop(g);
+        self.tables.insert_native(table.to_string(), new_table);
 
         Ok(Self::empty_ok(&format!("SELECT {}", row_count)))
     }
@@ -9521,7 +10009,7 @@ impl NativeSqlEngine {
             Self::parse_ident_after(s, "TRUNCATE").ok_or("Invalid TRUNCATE")?
         };
 
-        let mut g = self.tables.write().map_err(|_| "table lock poisoned")?;
+        let mut g = self.tables.write();
 
         // Check FK constraints — TRUNCATE with CASCADE would need to truncate children too
         // For now, check if any child tables reference this table
@@ -9747,7 +10235,7 @@ impl NativeSqlEngine {
             });
         }
 
-        let mut g = self.tables.write().map_err(|_| "table lock poisoned")?;
+        let mut g = self.tables.write();
         g.entry(table.to_string()).or_insert_with(|| {
             let mut t = NativeTable::new(cols, col_types);
             t.foreign_keys = foreign_keys;
@@ -9764,7 +10252,7 @@ impl NativeSqlEngine {
         let up = s.to_ascii_uppercase();
         let table = Self::parse_ident_after(s, "ALTER TABLE").ok_or("Invalid ALTER TABLE")?;
 
-        let mut g = self.tables.write().map_err(|_| "table lock poisoned")?;
+        let mut g = self.tables.write();
         let t = g
             .get_mut(table)
             .ok_or_else(|| format!("table \"{}\" does not exist", table))?;
@@ -9987,8 +10475,7 @@ impl NativeSqlEngine {
         if table.is_empty() {
             return Err("DROP TABLE: missing table name".to_string());
         }
-        let mut g = self.tables.write().map_err(|_| "table lock poisoned")?;
-        if g.remove(table).is_none() && !if_exists {
+        if self.tables.remove(table).is_none() && !if_exists {
             return Err(format!("table \"{}\" does not exist", table));
         }
         self.buf_pool.invalidate(table);
@@ -10150,7 +10637,7 @@ impl NativeSqlEngine {
         entry: &crate::index::ManagedJsonPathIndex,
         table: &str,
     ) -> Result<(), String> {
-        let g = self.tables.read().map_err(|_| "table lock poisoned")?;
+        let g = self.tables.to_native_map();
         let Some(t) = g.get(table) else {
             return Ok(());
         };
@@ -10172,7 +10659,7 @@ impl NativeSqlEngine {
         entry: &crate::index::ManagedTrigramIndex,
         table: &str,
     ) -> Result<(), String> {
-        let g = self.tables.read().map_err(|_| "table lock poisoned")?;
+        let g = self.tables.to_native_map();
         let Some(t) = g.get(table) else {
             return Ok(());
         };
@@ -10193,7 +10680,7 @@ impl NativeSqlEngine {
     ) -> Result<(), String> {
         let col = entry.meta.key.column.clone();
         let row_ids: Vec<i64> = {
-            let g = self.tables.read().map_err(|_| "table lock poisoned")?;
+            let g = self.tables.to_native_map();
             let Some(t) = g.get(table) else {
                 return Ok(());
             };
@@ -10201,7 +10688,7 @@ impl NativeSqlEngine {
         };
         let mut vectors = Vec::with_capacity(row_ids.len());
         {
-            let mut g = self.tables.write().map_err(|_| "table lock poisoned")?;
+            let mut g = self.tables.write();
             let Some(t) = g.get_mut(table) else {
                 return Ok(());
             };
@@ -10487,7 +10974,7 @@ impl NativeSqlEngine {
                 let entry = self
                     .inverted_catalog
                     .create_index(name, table.clone(), cols);
-                let g = self.tables.read().map_err(|_| "table lock poisoned")?;
+                let g = self.tables.to_native_map();
                 if let Some(t) = g.get(&table) {
                     for (&row_id, row) in &t.rows {
                         if let Some(text) = Self::row_text_for_inverted_columns(row, &entry.meta.columns) {
@@ -10516,7 +11003,7 @@ impl NativeSqlEngine {
             }
             CreateIndexKind::Hnsw(metric) => {
                 let dim = {
-                    let g = self.tables.read().map_err(|_| "table lock poisoned")?;
+                    let g = self.tables.to_native_map();
                     g.get(&table)
                         .and_then(|t| {
                             Self::declared_vector_dim(t, &col)
@@ -10540,7 +11027,7 @@ impl NativeSqlEngine {
             }
             CreateIndexKind::BTree => {
                 let tree = self.index_mgr.create_manual_index(&name, &table, &cols);
-                let g = self.tables.read().map_err(|_| "table lock poisoned")?;
+                let g = self.tables.to_native_map();
                 if let Some(t) = g.get(&table) {
                     let mut entries = Vec::with_capacity(t.rows.len());
                     for (&row_id, row) in &t.rows {
@@ -10586,7 +11073,7 @@ impl NativeSqlEngine {
             .unwrap_or("")
             .trim_matches('"');
 
-        let g = self.tables.read().map_err(|_| "table lock poisoned")?;
+        let g = self.tables.to_native_map();
 
         let tables_to_analyze: Vec<&str> = if table.is_empty() {
             g.keys().map(|k| k.as_str()).collect()
@@ -10645,7 +11132,7 @@ impl NativeSqlEngine {
     // -----------------------------------------------------------------------
 
     fn handle_show_tables(&self) -> Result<QueryResult, String> {
-        let g = self.tables.read().map_err(|_| "lock poisoned")?;
+        let g = self.tables.to_native_map();
         let columns = vec![("Tables".to_string(), oid::TEXT, -1i16)];
         let rows: Vec<Vec<Option<Vec<u8>>>> = g
             .keys()
@@ -10665,7 +11152,7 @@ impl NativeSqlEngine {
 
     fn handle_system_catalog(&self, s: &str) -> Result<QueryResult, String> {
         let up = s.to_ascii_uppercase();
-        let g = self.tables.read().map_err(|_| "lock poisoned")?;
+        let g = self.tables.to_native_map();
 
         // information_schema.columns
         if up.contains("INFORMATION_SCHEMA.COLUMNS") {
@@ -10758,7 +11245,7 @@ impl NativeSqlEngine {
             .unwrap_or("")
             .trim_matches('"');
 
-        let g = self.tables.read().map_err(|_| "table lock poisoned")?;
+        let g = self.tables.to_native_map();
         let stats = self.index_mgr.stats.read();
 
         let columns = vec![
@@ -10901,15 +11388,24 @@ impl NativeSqlEngine {
         // Parse file path (single-quoted)
         let from_idx = up.find("FROM").ok_or("COPY: missing FROM")?;
         let after_from = s[from_idx + 4..].trim();
+
+        if let Some(hex_payload) = after_from.strip_prefix("STDIN QM_INLINE ") {
+            return self.copy_from_stdin_inline(table, hex_payload.trim());
+        }
+        if after_from.eq_ignore_ascii_case("STDIN") {
+            return Err(
+                "COPY FROM STDIN requires PostgreSQL CopyData wire protocol".into(),
+            );
+        }
+
         let path = Self::extract_quoted_path(after_from)
             .ok_or("COPY: missing file path (use single quotes)")?;
 
-        // Detect format
         let is_parquet =
             up.contains("PARQUET") || path.ends_with(".parquet") || path.ends_with(".parq");
 
         if !is_parquet {
-            return Err("COPY: only Parquet format is currently supported".into());
+            return Err("COPY: only Parquet files or STDIN wire protocol supported".into());
         }
 
         self.copy_from_parquet(table, &path)
@@ -10963,7 +11459,7 @@ impl NativeSqlEngine {
 
         // Ensure table exists with correct schema
         {
-            let mut g = self.tables.write().map_err(|_| "table lock poisoned")?;
+            let mut g = self.tables.write();
             g.entry(table_name.to_string())
                 .or_insert_with(|| NativeTable::new(col_names.clone(), col_types.clone()));
         }
@@ -10979,7 +11475,7 @@ impl NativeSqlEngine {
 
         let mut total_rows: u64 = 0;
         let mut auto_id: i64 = {
-            let g = self.tables.read().map_err(|_| "table lock poisoned")?;
+            let g = self.tables.to_native_map();
             g.get(table_name)
                 .map(|t| t.rows.keys().max().copied().unwrap_or(0))
                 .unwrap_or(0)
@@ -11028,7 +11524,7 @@ impl NativeSqlEngine {
 
             // Batch write under a single lock acquisition
             {
-                let mut g = self.tables.write().map_err(|_| "table lock poisoned")?;
+                let mut g = self.tables.write();
                 if let Some(t) = g.get_mut(table_name) {
                     for (id, row) in rows_chunk {
                         t.rows.insert(id, row);
@@ -11406,7 +11902,7 @@ impl NativeSqlEngine {
     }
 
     pub fn validate_secondary_indexes(&self) -> Result<(), String> {
-        let tables = self.tables.read().map_err(|_| "table lock poisoned")?;
+        let tables = self.tables.to_native_map();
         let indexes = self.index_mgr.indexes.read();
 
         for (name, tree) in indexes.iter() {
@@ -11461,7 +11957,7 @@ impl NativeSqlEngine {
     pub fn validate_internal_state(&self) -> Result<(), String> {
         self.validate_secondary_indexes()?;
 
-        let tables = self.tables.read().map_err(|_| "table lock poisoned")?;
+        let tables = self.tables.to_native_map();
         let tombstones = self
             .tombstone_log
             .read()
@@ -11695,10 +12191,7 @@ impl NativeSqlEngine {
     fn maybe_warm_adaptive_vector_hnsw_indexes(&self, table: &str) {
         const HNSW_ADAPTIVE_MIN_ROWS: usize = 256;
         let cols_dims = {
-            let g = match self.tables.read() {
-                Ok(g) => g,
-                Err(_) => return,
-            };
+            let g = self.tables.to_native_map();
             let Some(t) = g.get(table) else {
                 return;
             };
@@ -11845,7 +12338,7 @@ impl NativeSqlEngine {
         let up_work = s_work.to_ascii_uppercase();
 
         if tx_active {
-            let g = self.tables.read().map_err(|_| "table lock poisoned")?;
+            let g = self.tables.to_native_map();
             let needs_full_snapshot = Self::table_has_fk_side_effects(&g, table, true);
             drop(g);
             if needs_full_snapshot {
@@ -11856,7 +12349,7 @@ impl NativeSqlEngine {
         // Determine which rows to delete.
         let has_where = up_work.contains("WHERE");
 
-        let mut g = self.tables.write().map_err(|_| "table lock poisoned")?;
+        let mut g = self.tables.write();
         let has_fk_references = Self::table_has_fk_references(&g, table, true);
         let mut deleted = 0usize;
         let mut returning_rows: Vec<Vec<Option<Vec<u8>>>> = Vec::new();
@@ -11898,6 +12391,9 @@ impl NativeSqlEngine {
                             self.remove_from_indexes(table, row_id, row);
                         }
                         if let Some(t) = g.get_mut(table) {
+                            if self.htap_tx_active() {
+                                self.htap_track_row_delete(table, t, row_id);
+                            }
                             t.rows.remove(&row_id);
                         }
                         drop(g);
@@ -11991,6 +12487,9 @@ impl NativeSqlEngine {
             // Delete rows.
             if let Some(t) = g.get_mut(table) {
                 for id in &to_delete {
+                    if self.htap_tx_active() {
+                        self.htap_track_row_delete(table, t, *id);
+                    }
                     t.rows.remove(id);
                 }
                 deleted = to_delete.len();
@@ -12094,6 +12593,136 @@ impl NativeSqlEngine {
         Ok(Self::empty_ok(&format!("DELETE {deleted}")))
     }
 
+    /// Fast bulk insert: single WAL record, per-table lock only (no full-catalog snapshot).
+    fn bulk_insert_rows_fast(
+        &self,
+        table: &str,
+        cols: &[String],
+        mut prepared_rows: Vec<(i64, NativeRow)>,
+        wal_sql: &str,
+    ) -> Result<usize, String> {
+        if prepared_rows.is_empty() {
+            return Ok(0);
+        }
+        if self.transaction_active() {
+            return Err("bulk insert fast path unavailable inside transaction".into());
+        }
+
+        let table_indexes: Vec<_> = {
+            let indexes = self.index_mgr.indexes.read();
+            indexes
+                .values()
+                .filter(|tree| tree.table == table)
+                .cloned()
+                .collect()
+        };
+
+        let count = self.tables.with_write_or_create(
+            table,
+            || {
+                let default_types = cols.iter().map(|_| ColType::Text).collect();
+                NativeTable::new(cols.to_vec(), default_types)
+            },
+            |t| {
+                t.ensure_auto_id_initialized();
+                Self::normalize_insert_rows_for_table(t, &mut prepared_rows, false)?;
+                if let Err(err) = Self::enforce_constraints_on_insert(t, &mut prepared_rows) {
+                    return Err(err);
+                }
+                if let Err(err) = Self::validate_insert_vector_dimensions(t, &prepared_rows) {
+                    return Err(err);
+                }
+                let n = prepared_rows.len();
+                for (id, row) in &prepared_rows {
+                    t.rows.insert(*id, row.clone());
+                }
+                if !table_indexes.is_empty() {
+                    for (id, row) in &prepared_rows {
+                        for tree in &table_indexes {
+                            for col in &tree.columns {
+                                if let Some(val) = row.cols.get(col) {
+                                    if let Some(idx_key) = Self::index_key_for_cell(val) {
+                                        tree.insert(idx_key, *id);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                Ok(n)
+            },
+        )?;
+
+        self.wal_append(wal_sql)?;
+        self.index_mgr.record_writes(table, cols.iter().map(|c| c.as_str()));
+        self.mark_table_data_dirty(table, count as u64);
+        self.buf_pool.invalidate(table);
+        let _ = self.after_successful_autocommit_wal_mutation();
+        Ok(count)
+    }
+
+    /// COPY FROM STDIN (text, tab-separated) via wire protocol inline payload.
+    fn copy_from_stdin_inline(&self, table: &str, hex_data: &str) -> Result<QueryResult, String> {
+        let raw = hex::decode(hex_data.trim())
+            .map_err(|e| format!("COPY STDIN: invalid inline payload: {e}"))?;
+        let count = self.ingest_copy_text(table, &raw)?;
+        Ok(QueryResult {
+            columns: Vec::new(),
+            rows: Vec::new(),
+            command_tag: format!("COPY {}", count),
+        })
+    }
+
+    fn ingest_copy_text(&self, table: &str, data: &[u8]) -> Result<u64, String> {
+        let text = std::str::from_utf8(data)
+            .map_err(|_| "COPY STDIN: payload must be UTF-8 text".to_string())?;
+        let mut rows: Vec<(i64, NativeRow)> = Vec::new();
+        let cols: Vec<String> = self.tables.with_read(table, |t| t.columns.clone())?;
+        let mut next_id = self
+            .tables
+            .with_read(table, |t| t.next_auto_id.max(1))?;
+
+        for line in text.lines() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            let parts: Vec<&str> = line.split('\t').collect();
+            let mut row_map = HashMap::with_capacity(cols.len());
+            for (i, col) in cols.iter().enumerate() {
+                let cell = parts
+                    .get(i)
+                    .map(|v| {
+                        if *v == "\\N" {
+                            Cell::Null
+                        } else {
+                            Self::parse_value(v)
+                        }
+                    })
+                    .unwrap_or(Cell::Null);
+                row_map.insert(col.clone(), cell);
+            }
+            let id = row_map.get("id").map(|c| c.as_i64()).unwrap_or(next_id);
+            if id >= next_id {
+                next_id = id + 1;
+            }
+            rows.push((
+                id,
+                NativeRow {
+                    cols: row_map,
+                    last_modified_lsn: 0,
+                },
+            ));
+        }
+
+        if rows.is_empty() {
+            return Ok(0);
+        }
+
+        let wal = format!("COPY {} FROM STDIN QM_INLINE {}", table, hex::encode(data));
+        let count = self.bulk_insert_rows_fast(table, &cols, rows, &wal)?;
+        Ok(count as u64)
+    }
+
     fn handle_insert(&self, s: &str) -> Result<QueryResult, String> {
         let table = Self::parse_ident_after(s, "INSERT INTO").ok_or("Invalid INSERT")?;
         let up = s.to_ascii_uppercase();
@@ -12124,12 +12753,7 @@ impl NativeSqlEngine {
             }
             _ => {
                 // No column list: INSERT INTO table VALUES (...) - use all table columns
-                let g = self.tables.read().map_err(|_| "table lock poisoned")?;
-                let t = g
-                    .get(table)
-                    .ok_or_else(|| format!("Table '{}' does not exist", table))?;
-                let cols = t.columns.clone();
-                drop(g);
+                let cols = self.tables.with_read(table, |t| t.columns.clone())?;
                 // col_close is right before VALUES keyword
                 let col_close = values_kw_idx.unwrap_or(s.len()) - 1;
                 (cols, col_close.max(table.len() + 12)) // "INSERT INTO " = 12 chars
@@ -12299,6 +12923,20 @@ impl NativeSqlEngine {
                 rows
             };
 
+        if prepared_rows.len() >= 4
+            && matches!(conflict_action, ConflictAction::None)
+            && returning_cols.is_empty()
+            && !tx_active
+            && on_conflict_idx.is_none()
+        {
+            let count = self.bulk_insert_rows_fast(table, &cols, prepared_rows, s)?;
+            return Ok(QueryResult {
+                columns: Vec::new(),
+                rows: Vec::new(),
+                command_tag: format!("INSERT 0 {}", count),
+            });
+        }
+
         // Record write stats once per column under a single stats lock.
         self.index_mgr
             .record_writes(table, cols.iter().map(|c| c.as_str()));
@@ -12334,7 +12972,7 @@ impl NativeSqlEngine {
         let mut index_changes: Vec<(i64, Option<NativeRow>, NativeRow)> = Vec::new();
         let pending_inverted_ids: Vec<i64> = prepared_rows.iter().map(|(id, _)| *id).collect();
         {
-            let mut g = self.tables.write().map_err(|_| "table lock poisoned")?;
+            let mut g = self.tables.write();
 
             let old_next_auto_id = {
                 let t = g.entry(table.to_string()).or_insert_with(|| {
@@ -12396,6 +13034,9 @@ impl NativeSqlEngine {
                 if has_table_indexes {
                     for (id, row) in &prepared_rows {
                         t.rows.insert(*id, row.clone());
+                        if self.htap_tx_active() {
+                            self.htap_track_row_write(table, t, *id, row);
+                        }
                     }
                     let index_start = if Self::native_profile_enabled() {
                         Some(Instant::now())
@@ -12418,7 +13059,10 @@ impl NativeSqlEngine {
                     }
                 } else {
                     for (id, row) in prepared_rows.drain(..) {
-                        t.rows.insert(id, row);
+                        t.rows.insert(id, row.clone());
+                        if self.htap_tx_active() {
+                            self.htap_track_row_write(table, t, id, &row);
+                        }
                     }
                 }
             } else {
@@ -12519,7 +13163,7 @@ impl NativeSqlEngine {
                 || !self.trigram_catalog.indexes_for_table(table).is_empty();
             let has_hnsw = !self.vector_hnsw_catalog.indexes_for_table(table).is_empty();
             if has_inverted || has_hnsw {
-                let g = self.tables.read().map_err(|_| "table lock poisoned")?;
+                let g = self.tables.to_native_map();
                 if let Some(t) = g.get(table) {
                     if has_hnsw && pending_inverted_ids.len() > 1 {
                         let batch: Vec<(i64, &NativeRow)> = pending_inverted_ids
@@ -12782,7 +13426,7 @@ impl NativeSqlEngine {
         };
 
         if tx_active {
-            let g = self.tables.read().map_err(|_| "table lock poisoned")?;
+            let g = self.tables.to_native_map();
             let needs_full_snapshot = Self::table_has_fk_side_effects(&g, table, false);
             drop(g);
             if needs_full_snapshot {
@@ -12790,7 +13434,7 @@ impl NativeSqlEngine {
             }
         }
 
-        let mut g = self.tables.write().map_err(|_| "table lock poisoned")?;
+        let mut g = self.tables.write();
         let has_fk_references = Self::table_has_fk_references(&g, table, false);
         let mut count = 0usize;
         let mut returning_rows: Vec<Vec<Option<Vec<u8>>>> = Vec::new();
@@ -12832,10 +13476,18 @@ impl NativeSqlEngine {
                     }
 
                     if let Some(t) = g.get_mut(table) {
-                        if let Some(row) = t.rows.get_mut(&row_id) {
+                        let updated = if let Some(row) = t.rows.get_mut(&row_id) {
                             self.update_indexes(table, row_id, row, &assignments);
                             for (col, val) in &assignments {
                                 row.cols.insert(col.clone(), val.clone());
+                            }
+                            Some(row.clone())
+                        } else {
+                            None
+                        };
+                        if let Some(row) = updated {
+                            if self.htap_tx_active() {
+                                self.htap_track_row_write(table, t, row_id, &row);
                             }
                             drop(g);
                             self.buf_pool.invalidate(table);
@@ -12933,8 +13585,7 @@ impl NativeSqlEngine {
             // Apply the update to parent rows.
             if let Some(t) = g.get_mut(table) {
                 for row_id in &row_ids {
-                    if let Some(row) = t.rows.get_mut(row_id) {
-                        // DP-05: Update B+Tree indexes (remove old keys, insert new).
+                    let snapshot = if let Some(row) = t.rows.get_mut(row_id) {
                         self.update_indexes(table, *row_id, row, &assignments);
                         for (col, val) in &assignments {
                             row.cols.insert(col.clone(), val.clone());
@@ -12943,6 +13594,12 @@ impl NativeSqlEngine {
                         if !ret_cols_expanded.is_empty() {
                             returning_rows.push(Self::build_returning_row(row, &ret_cols_expanded));
                         }
+                        self.htap_tx_active().then(|| row.clone())
+                    } else {
+                        None
+                    };
+                    if let Some(row) = snapshot {
+                        self.htap_track_row_write(table, t, *row_id, &row);
                     }
                 }
             }
@@ -13647,7 +14304,7 @@ impl NativeSqlEngine {
                 let mut all_rows = base_result.rows.clone();
                 {
                     let temp = materialize(&base_result.rows, &col_names, &col_types, 0);
-                    let mut g = self.tables.write().map_err(|_| "table lock poisoned")?;
+                    let mut g = self.tables.write();
                     g.insert(temp_name.clone(), temp);
                     drop(g);
                 }
@@ -13667,7 +14324,7 @@ impl NativeSqlEngine {
 
                         // Replace temp table with cumulative results.
                         let temp = materialize(&all_rows, &col_names, &col_types, 0);
-                        let mut g = self.tables.write().map_err(|_| "table lock poisoned")?;
+                        let mut g = self.tables.write();
                         g.insert(temp_name.clone(), temp);
                         drop(g);
 
@@ -13726,7 +14383,7 @@ impl NativeSqlEngine {
                     );
                 }
 
-                let mut g = self.tables.write().map_err(|_| "table lock poisoned")?;
+                let mut g = self.tables.write();
                 g.insert(temp_name.clone(), temp);
                 temp_tables.push(temp_name.clone());
                 drop(g);
@@ -13772,7 +14429,7 @@ impl NativeSqlEngine {
 
         // Cleanup: remove temp tables.
         {
-            let mut g = self.tables.write().map_err(|_| "table lock poisoned")?;
+            let mut g = self.tables.write();
             for temp_name in &temp_tables {
                 g.remove(temp_name);
             }
@@ -14236,10 +14893,8 @@ impl NativeSqlEngine {
         let outer_base = s[..where_idx].trim();
         let table = Self::parse_ident_after(outer_base, "FROM").ok_or("Subquery: missing FROM")?;
         let select_cols = Self::parse_select_columns(outer_base);
-        let g = self.tables.read().map_err(|_| "table lock poisoned")?;
-        let t = g
-            .get(table)
-            .ok_or(format!("table \"{}\" does not exist", table))?;
+        let shared = self.table_read_guard(table)?;
+        let t = shared.read();
 
         let out_cols: Vec<String> =
             if select_cols.is_empty() || (select_cols.len() == 1 && select_cols[0] == "*") {
@@ -14263,7 +14918,11 @@ impl NativeSqlEngine {
 
         let col_trimmed = col_name.trim_matches('"');
         let mut rows_out = Vec::new();
-        for (_id, row) in &t.rows {
+        let visible_ids = self.htap_visible_row_ids(table);
+        for row_id in visible_ids {
+            let Some(row) = self.row_at(table, &t, row_id) else {
+                continue;
+            };
             let cell_val = row
                 .cols
                 .get(col_trimmed)
@@ -14324,10 +14983,8 @@ impl NativeSqlEngine {
     fn handle_select_all(&self, s: &str, table: &str) -> Result<QueryResult, String> {
         let select_cols = Self::parse_select_columns(s);
         let (_, limit) = Self::split_trailing_limit_clause(s);
-        let g = self.tables.read().map_err(|_| "table lock poisoned")?;
-        let t = g
-            .get(table)
-            .ok_or(format!("table \"{}\" does not exist", table))?;
+        let shared = self.table_read_guard(table)?;
+        let t = shared.read();
 
         let out_cols: Vec<String> =
             if select_cols.is_empty() || (select_cols.len() == 1 && select_cols[0] == "*") {
@@ -14355,13 +15012,14 @@ impl NativeSqlEngine {
                 && (c.contains("->") || c.contains("#>") || c.contains(" ? "))
         });
         if has_expression_projection {
-            let mut ordered: Vec<(i64, &NativeRow)> =
-                t.rows.iter().map(|(id, row)| (*id, row)).collect();
-            ordered.sort_by_key(|(id, _)| *id);
-            let rows_out: Vec<Vec<Option<Vec<u8>>>> = ordered
+            let visible_ids = self.htap_visible_row_ids(table);
+            let rows_out: Vec<Vec<Option<Vec<u8>>>> = visible_ids
                 .into_iter()
                 .take(limit.unwrap_or(usize::MAX))
-                .map(|(row_id, row)| Self::materialize_projected_row(row_id, row, &out_cols))
+                .filter_map(|row_id| {
+                    self.row_at(table, &t, row_id)
+                        .map(|row| Self::materialize_projected_row(row_id, &row, &out_cols))
+                })
                 .collect();
             let row_count = rows_out.len();
             return Ok(QueryResult {
@@ -14373,7 +15031,7 @@ impl NativeSqlEngine {
 
         // Use columnar cache for sequential access.
         // Chunk-based pipeline: process CHUNK_SIZE rows in parallel.
-        let cc = self.get_or_build_cols(table, t);
+        let cc = self.get_or_build_cols(table, &*t);
         let n = limit.map_or(cc.ids.len(), |lim| lim.min(cc.ids.len()));
 
         // Pre-resolve column references once (avoid per-row HashMap lookups)
@@ -14533,10 +15191,8 @@ impl NativeSqlEngine {
         };
 
         // Get table data
-        let g = self.tables.read().map_err(|_| "table lock poisoned")?;
-        let t = g
-            .get(&table as &str)
-            .ok_or(format!("table \"{}\" does not exist", table))?;
+        let shared = self.table_read_guard(table)?;
+        let t = shared.read();
 
         // Determine output columns
         let out_cols: Vec<String> =
@@ -14569,7 +15225,7 @@ impl NativeSqlEngine {
                 && limit.is_some()
             {
                 let lim = limit.unwrap_or(usize::MAX);
-                let cc = self.get_or_build_cols(table, t);
+                let cc = self.get_or_build_cols(table, &*t);
                 let total = cc.ids.len();
                 let rows_out: Vec<Vec<Option<Vec<u8>>>> = if is_desc {
                     // Reverse iteration: last `offset+lim` IDs, then reverse-skip
@@ -14769,10 +15425,8 @@ impl NativeSqlEngine {
             let hits = entry.search(&query, top_k);
             let select_cols = Self::parse_select_columns(s);
             let id_only = select_cols.len() == 1 && select_cols[0] == "id";
-            let g = self.tables.read().map_err(|_| "table lock poisoned")?;
-            let t = g
-                .get(table)
-                .ok_or(format!("table \"{}\" does not exist", table))?;
+            let shared = self.table_read_guard(table)?;
+            let t = shared.read();
             let out_cols: Vec<String> =
                 if select_cols.is_empty() || (select_cols.len() == 1 && select_cols[0] == "*") {
                     t.columns.clone()
@@ -14795,7 +15449,7 @@ impl NativeSqlEngine {
             let rows_out = if id_only {
                 materialize_id_rows(&row_ids)
             } else {
-                Self::materialize_indexed_projection_rows(t, &row_ids, &out_cols)
+                self.materialize_indexed_projection_rows_visible(table, &t, &row_ids, &out_cols)
             };
             let row_count = rows_out.len();
             return Ok(QueryResult {
@@ -14813,10 +15467,8 @@ impl NativeSqlEngine {
             }
             let select_cols = Self::parse_select_columns(s);
             let id_only = select_cols.len() == 1 && select_cols[0] == "id";
-            let g = self.tables.read().map_err(|_| "table lock poisoned")?;
-            let t = g
-                .get(table)
-                .ok_or(format!("table \"{}\" does not exist", table))?;
+            let shared = self.table_read_guard(table)?;
+            let t = shared.read();
             let out_cols: Vec<String> =
                 if select_cols.is_empty() || (select_cols.len() == 1 && select_cols[0] == "*") {
                     t.columns.clone()
@@ -14838,7 +15490,7 @@ impl NativeSqlEngine {
             let rows_out = if id_only {
                 materialize_id_rows(&row_ids)
             } else {
-                Self::materialize_indexed_projection_rows(t, &row_ids, &out_cols)
+                self.materialize_indexed_projection_rows_visible(table, &t, &row_ids, &out_cols)
             };
             let row_count = rows_out.len();
             return Ok(QueryResult {
@@ -14856,10 +15508,8 @@ impl NativeSqlEngine {
                 let select_cols = Self::parse_select_columns(s);
                 let id_only =
                     select_cols.len() == 1 && (select_cols[0] == "id" || select_cols[0] == "*");
-                let g = self.tables.read().map_err(|_| "table lock poisoned")?;
-                let t = g
-                    .get(table)
-                    .ok_or(format!("table \"{}\" does not exist", table))?;
+                let shared = self.table_read_guard(table)?;
+                let t = shared.read();
                 let out_cols: Vec<String> =
                     if select_cols.is_empty() || (select_cols.len() == 1 && select_cols[0] == "*") {
                         t.columns.clone()
@@ -14879,20 +15529,20 @@ impl NativeSqlEngine {
                     })
                     .collect();
 
-                let table_rows = t.rows.len();
+                let table_rows = self.htap_visible_row_count(table).max(t.rows.len());
                 let use_direct_id_scan =
                     id_only && out_cols == vec!["id".to_string()] && limit.is_none();
                 if use_direct_id_scan {
                     let rows_out = if let Some(entry) = self.trigram_catalog.find(table, &col_name) {
                         if entry.should_scan_table(&needle, table_rows) {
                             self.materialize_like_contains_ids(
-                                table, t, &col_name, &needle, is_ilike, limit,
+                                table, &*t, &col_name, &needle, is_ilike, limit,
                             )
                         } else {
                             let mut row_ids = entry.search_contains(&needle);
                             if row_ids.len() * 2 > table_rows {
                                 self.materialize_like_contains_ids(
-                                    table, t, &col_name, &needle, is_ilike, limit,
+                                    table, &*t, &col_name, &needle, is_ilike, limit,
                                 )
                             } else {
                                 if !entry.contains_match_is_exact(&needle) {
@@ -14914,7 +15564,7 @@ impl NativeSqlEngine {
                         }
                     } else {
                         self.materialize_like_contains_ids(
-                            table, t, &col_name, &needle, is_ilike, limit,
+                            table, &*t, &col_name, &needle, is_ilike, limit,
                         )
                     };
                     let row_count = rows_out.len();
@@ -14929,14 +15579,14 @@ impl NativeSqlEngine {
                 if let Some(entry) = self.trigram_catalog.find(table, &col_name) {
                     if entry.should_scan_table(&needle, table_rows) {
                         row_ids = self.like_contains_row_ids(
-                            table, t, &col_name, &needle, is_ilike, limit,
+                            table, &*t, &col_name, &needle, is_ilike, limit,
                         );
                     } else {
                         let exact_trigram = entry.contains_match_is_exact(&needle);
                         row_ids = entry.search_contains(&needle);
                         if row_ids.len() * 2 > table_rows {
                             row_ids = self.like_contains_row_ids(
-                                table, t, &col_name, &needle, is_ilike, limit,
+                                table, &*t, &col_name, &needle, is_ilike, limit,
                             );
                         } else if !exact_trigram {
                             row_ids.retain(|row_id| {
@@ -14956,7 +15606,7 @@ impl NativeSqlEngine {
                     }
                 } else {
                     row_ids = self.like_contains_row_ids(
-                        table, t, &col_name, &needle, is_ilike, limit,
+                        table, &*t, &col_name, &needle, is_ilike, limit,
                     );
                 }
 
@@ -14966,7 +15616,7 @@ impl NativeSqlEngine {
                         .map(|id| vec![Some(id.to_string().into_bytes())])
                         .collect()
                 } else {
-                    Self::materialize_indexed_projection_rows(t, &row_ids, &out_cols)
+                    self.materialize_indexed_projection_rows_visible(table, &t, &row_ids, &out_cols)
                 };
                 let row_count = rows_out.len();
                 return Ok(QueryResult {
@@ -14987,7 +15637,7 @@ impl NativeSqlEngine {
             // Convert SQL LIKE pattern to simple matching.
             let select_cols = Self::parse_select_columns(s);
             let id_only = select_cols.len() == 1 && select_cols[0] == "id";
-            let g = self.tables.read().map_err(|_| "table lock poisoned")?;
+            let g = self.tables.to_native_map();
             let t = g
                 .get(table)
                 .ok_or(format!("table \"{}\" does not exist", table))?;
@@ -15054,10 +15704,8 @@ impl NativeSqlEngine {
         if let Some(row_ids) = self.indexed_or_eq_row_ids(table, pred_part) {
             let select_cols = Self::parse_select_columns(s);
             let id_only = select_cols.len() == 1 && select_cols[0] == "id";
-            let g = self.tables.read().map_err(|_| "table lock poisoned")?;
-            let t = g
-                .get(table)
-                .ok_or(format!("table \"{}\" does not exist", table))?;
+            let shared = self.table_read_guard(table)?;
+            let t = shared.read();
             let out_cols: Vec<String> =
                 if select_cols.is_empty() || (select_cols.len() == 1 && select_cols[0] == "*") {
                     t.columns.clone()
@@ -15083,7 +15731,7 @@ impl NativeSqlEngine {
             } else {
                 &row_ids
             };
-            let rows_out = Self::materialize_indexed_projection_rows(t, materialize_ids, &out_cols);
+            let rows_out = Self::materialize_indexed_projection_rows(&*t, materialize_ids, &out_cols);
             let row_count = rows_out.len();
             return Ok(QueryResult {
                 columns,
@@ -15101,8 +15749,8 @@ impl NativeSqlEngine {
             if col_name == "id" {
                 if let IndexKey::Integer(id_val) = &idx_key {
                     let select_cols = Self::parse_select_columns(s);
-                    let g = self.tables.read().map_err(|_| "table lock poisoned")?;
-                    if let Some(t) = g.get(table) {
+                    if let Ok(shared) = self.tables.lock_table_read(table) {
+                        let t = shared.read();
                         let out_cols: Vec<String> = if select_cols.is_empty()
                             || (select_cols.len() == 1 && select_cols[0] == "*")
                         {
@@ -15124,9 +15772,12 @@ impl NativeSqlEngine {
                             .collect();
                         let mut rows_out: Vec<Vec<Option<Vec<u8>>>> = Vec::new();
                         if limit != Some(0) {
-                            if let Some(row) = t.rows.get(id_val) {
-                                rows_out
-                                    .push(Self::materialize_projected_row(*id_val, row, &out_cols));
+                            if let Some(row) = self.htap_visible_row(table, *id_val) {
+                                rows_out.push(Self::materialize_projected_row(
+                                    *id_val,
+                                    row.as_ref(),
+                                    &out_cols,
+                                ));
                             }
                         }
                         let row_count = rows_out.len();
@@ -15146,8 +15797,8 @@ impl NativeSqlEngine {
             if let Some(tree) = self.index_mgr.find_index(table, col_name) {
                 self.index_mgr.record_index_use(&tree.name);
                 let row_ids = tree.search(&idx_key);
-                let g = self.tables.read().map_err(|_| "table lock poisoned")?;
-                if let Some(t) = g.get(table) {
+                if let Ok(shared) = self.tables.lock_table_read(table) {
+                    let t = shared.read();
                     let select_cols = Self::parse_select_columns(s);
                     let id_only_query =
                         select_cols.len() == 1 && select_cols[0] == "id";
@@ -15182,7 +15833,7 @@ impl NativeSqlEngine {
                     let rows_out = if id_only {
                         materialize_id_rows(materialize_ids)
                     } else {
-                        Self::materialize_indexed_projection_rows(t, materialize_ids, &out_cols)
+                        Self::materialize_indexed_projection_rows(&*t, materialize_ids, &out_cols)
                     };
                     let row_count = rows_out.len();
                     return Ok(QueryResult {
@@ -15207,10 +15858,8 @@ impl NativeSqlEngine {
             }
         }
         let select_cols = Self::parse_select_columns(s);
-        let g = self.tables.read().map_err(|_| "table lock poisoned")?;
-        let t = g
-            .get(table)
-            .ok_or(format!("table \"{}\" does not exist", table))?;
+        let shared = self.table_read_guard(table)?;
+        let t = shared.read();
         let out_cols: Vec<String> =
             if select_cols.is_empty() || (select_cols.len() == 1 && select_cols[0] == "*") {
                 t.columns.clone()
@@ -15343,13 +15992,7 @@ impl NativeSqlEngine {
         };
 
         const HNSW_ADAPTIVE_MIN_ROWS: usize = 256;
-        let table_row_count = self
-            .tables
-            .read()
-            .map_err(|_| "table lock poisoned")?
-            .get(table.as_str())
-            .map(|t| t.rows.len())
-            .unwrap_or(0);
+        let table_row_count = self.table_row_count(table.as_str());
         if table_row_count < HNSW_ADAPTIVE_MIN_ROWS || limit == 0 {
             return Ok(None);
         }
@@ -15361,9 +16004,7 @@ impl NativeSqlEngine {
             .filter(|dim| *dim > 0)
             .unwrap_or_else(|| {
                 self.tables
-                    .read()
-                    .ok()
-                    .and_then(|g| g.get(table.as_str()).map(|t| Self::vector_column_dim(t, &vec_col)))
+                    .with_read_opt(table.as_str(), |t| Self::vector_column_dim(t, &vec_col))
                     .unwrap_or(0)
             });
         if dim_hint == 0 {
@@ -15535,29 +16176,32 @@ impl NativeSqlEngine {
             0
         };
 
-        let mut table_guard = self.tables.read().map_err(|_| "table lock poisoned")?;
-        let mut t = table_guard
-            .get(&table as &str)
-            .ok_or(format!("table \"{}\" does not exist", table))?;
+        let mut shared = self.table_read_guard(table)?;
+        let table_row_count = shared.read().rows.len();
 
-        let out_cols: Vec<String> =
+        let out_cols: Vec<String> = {
+            let t = shared.read();
             if select_cols.is_empty() || (select_cols.len() == 1 && select_cols[0] == "*") {
                 t.columns.clone()
             } else {
                 select_cols
-            };
-        let columns: Vec<(String, i32, i16)> = out_cols
-            .iter()
-            .map(|c| {
-                let o = t.col_oid(c);
-                let len = match o {
-                    oid::INT8 => 8i16,
-                    oid::FLOAT8 => 8,
-                    _ => -1,
-                };
-                (c.clone(), o, len)
-            })
-            .collect();
+            }
+        };
+        let columns: Vec<(String, i32, i16)> = {
+            let t = shared.read();
+            out_cols
+                .iter()
+                .map(|c| {
+                    let o = t.col_oid(c);
+                    let len = match o {
+                        oid::INT8 => 8i16,
+                        oid::FLOAT8 => 8,
+                        _ => -1,
+                    };
+                    (c.clone(), o, len)
+                })
+                .collect()
+        };
         parse_planner_ms += parse_start.elapsed().as_secs_f64() * 1000.0;
 
         let dist_metric = match op {
@@ -15567,7 +16211,6 @@ impl NativeSqlEngine {
         };
         const HNSW_ADAPTIVE_MIN_ROWS: usize = 256;
         let want = offset + limit;
-        let table_row_count = t.rows.len();
         let id_only_knn = out_cols.len() == 1 && out_cols[0] == "id";
         fn vector_candidate_cmp(a: (f32, i64), b: (f32, i64)) -> std::cmp::Ordering {
             a.0.partial_cmp(&b.0)
@@ -15585,7 +16228,10 @@ impl NativeSqlEngine {
                 .find(&table_owned, &vec_col_owned, dist_metric)
                 .map(|entry| entry.meta.dim)
                 .filter(|dim| *dim > 0)
-                .unwrap_or_else(|| Self::vector_column_dim(t, &vec_col_owned));
+                .unwrap_or_else(|| {
+                    let t = shared.read();
+                    Self::vector_column_dim(&t, &vec_col_owned)
+                });
 
             if dim_hint == 0 {
                 let result = QueryResult {
@@ -15633,7 +16279,7 @@ impl NativeSqlEngine {
                 }
             }
             if hnsw_hits.is_none() {
-                drop(table_guard);
+                drop(shared);
                 if let Ok(entry) = self.ensure_vector_hnsw_index(
                     &table_owned,
                     &vec_col_owned,
@@ -15645,10 +16291,7 @@ impl NativeSqlEngine {
                         hnsw_hits = Some(entry.search(&query_vec, want));
                     }
                 }
-                table_guard = self.tables.read().map_err(|_| "table lock poisoned")?;
-                t = table_guard
-                    .get(&table_owned as &str)
-                    .ok_or(format!("table \"{}\" does not exist", table_owned))?;
+                shared = self.table_read_guard(&table_owned)?;
             }
             if let Some(hits) = hnsw_hits {
                 let build_start = std::time::Instant::now();
@@ -15670,7 +16313,8 @@ impl NativeSqlEngine {
                         .skip(offset)
                         .take(limit)
                         .map(|(_dist, id)| {
-                            let row = t.rows.get(id);
+                            let guard = shared.read();
+                            let row = guard.rows.get(id);
                             out_cols
                                 .iter()
                                 .map(|c| {
@@ -15724,7 +16368,8 @@ impl NativeSqlEngine {
 
         // Exact scan fallback: build flat vector cache only when HNSW is unavailable.
         let cache_start = std::time::Instant::now();
-        let vector_cache = self.cached_vector_column(&table, &vec_col, t);
+        let t = shared.read();
+        let vector_cache = self.cached_vector_column(&table, &vec_col, &t);
         cache_lookup_ms = cache_start.elapsed().as_secs_f64() * 1000.0;
         if vector_cache.dim == 0 {
             let result = QueryResult {
@@ -15796,9 +16441,10 @@ impl NativeSqlEngine {
             std::collections::BinaryHeap::new()
         };
         for (idx, id) in vector_cache.row_ids.iter().enumerate() {
-            let row = t.rows.get(id);
+            let row = self.row_at(table, &t, *id);
             if let Some(ref pred) = where_pred_str {
                 if !row
+                    .as_ref()
                     .map(|r| Self::eval_condition_for_row(*id, r, pred))
                     .unwrap_or(false)
                 {
@@ -16121,10 +16767,9 @@ impl NativeSqlEngine {
             .index_mgr
             .update_selectivity_from_histogram_between(table, col_name, lo as f64, hi as f64);
 
-        let g = self.tables.read().map_err(|_| "table lock poisoned")?;
-        let t = match g.get(table) {
-            Some(t) => t,
-            None => {
+        let shared = match self.tables.lock_table_read(table) {
+            Ok(s) => s,
+            Err(_) => {
                 return Ok(QueryResult {
                     columns: select_cols
                         .iter()
@@ -16135,6 +16780,7 @@ impl NativeSqlEngine {
                 });
             }
         };
+        let t = shared.read();
 
         let out_cols: Vec<String> =
             if select_cols.is_empty() || (select_cols.len() == 1 && select_cols[0] == "*") {
@@ -16161,7 +16807,7 @@ impl NativeSqlEngine {
         // columnar cache to avoid HashMap lookups entirely.
         // Uses chunk-based pipeline: process CHUNK_SIZE rows in parallel.
         if col_name == "id" || col_name == t.columns.first().map(|s| s.as_str()).unwrap_or("") {
-            let cc = self.get_or_build_cols(table, t);
+            let cc = self.get_or_build_cols(table, &*t);
             // Binary search for [lo, hi] range in sorted ids.
             let start = cc.ids.partition_point(|x| *x < lo);
             let end = cc.ids.partition_point(|x| *x <= hi);
@@ -16315,10 +16961,8 @@ impl NativeSqlEngine {
 
     fn handle_select_count(&self, s: &str) -> Result<QueryResult, String> {
         let table = Self::parse_ident_after(s, "FROM").ok_or("Invalid COUNT FROM")?;
-        let g = self.tables.read().map_err(|_| "table lock poisoned")?;
-        let t = g
-            .get(table)
-            .ok_or(format!("table \"{}\" does not exist", table))?;
+        let shared = self.table_read_guard(table)?;
+        let t = shared.read();
 
         // Parse optional WHERE clause
         let up = s.to_ascii_uppercase();
@@ -16362,7 +17006,7 @@ impl NativeSqlEngine {
                         .filter(|row_id| t.rows.contains_key(row_id))
                         .count() as i64
                 } else if let Some(count) =
-                    self.columnar_count_index_key(table, t, &col, &key)
+                    self.columnar_count_index_key(table, &*t, &col, &key)
                 {
                     count
                 } else {
@@ -16371,9 +17015,9 @@ impl NativeSqlEngine {
                         .filter(|(row_id, row)| Self::eval_condition_for_row(**row_id, row, pred))
                         .count() as i64
                 }
-            } else if let Some(count) = self.columnar_count_from_predicate(table, t, pred) {
+            } else if let Some(count) = self.columnar_count_from_predicate(table, &*t, pred) {
                 count
-            } else if let Some(count) = Self::fast_count_predicate(t, pred) {
+            } else if let Some(count) = Self::fast_count_predicate(&*t, pred) {
                 count
             } else {
                 t.rows
@@ -16381,6 +17025,8 @@ impl NativeSqlEngine {
                     .filter(|(row_id, row)| Self::eval_condition_for_row(**row_id, row, pred))
                     .count() as i64
             }
+        } else if self.htap_tx_active() || self.transaction_active() {
+            self.htap_visible_row_count(table) as i64
         } else {
             t.rows.len() as i64
         };
@@ -16447,9 +17093,80 @@ impl NativeSqlEngine {
             None
         };
 
-        let g = self.tables.read().map_err(|_| "table lock poisoned")?;
-        if let Some(t) = g.get(table) {
-            let cc = self.get_or_build_cols(table, t);
+        if let Some((filter_col, lo, hi)) = between_filter {
+            let id_col = if filter_col == "id" {
+                filter_col
+            } else if let Ok(shared) = self.tables.lock_table_read(table) {
+                let t = shared.read();
+                if filter_col == t.columns.first().map(|s| s.as_str()).unwrap_or("") {
+                    filter_col
+                } else {
+                    ""
+                }
+            } else {
+                ""
+            };
+            if !id_col.is_empty() {
+                if let Some((sum, count)) =
+                    self.htap_try_durable_sum_between(table, id_col, &agg_col, lo, hi, s)
+                {
+                    let (columns, rows) = if has_count {
+                        (
+                            vec![
+                                ("sum".to_string(), oid::FLOAT8, 8),
+                                ("count".to_string(), oid::INT8, 8),
+                            ],
+                            vec![vec![
+                                Some(sum.to_string().into_bytes()),
+                                Some(count.to_string().into_bytes()),
+                            ]],
+                        )
+                    } else {
+                        (
+                            vec![("sum".to_string(), oid::FLOAT8, 8)],
+                            vec![vec![Some(sum.to_string().into_bytes())]],
+                        )
+                    };
+                    return Ok(QueryResult {
+                        columns,
+                        rows,
+                        command_tag: "SELECT 1".to_string(),
+                    });
+                }
+            }
+        }
+
+        if between_filter.is_none() && eq_filter.is_none() {
+            if let Some((sum, count)) = self.htap_try_durable_sum(table, &agg_col, s) {
+                let (columns, rows) = if has_count {
+                    (
+                        vec![
+                            ("sum".to_string(), oid::FLOAT8, 8),
+                            ("count".to_string(), oid::INT8, 8),
+                        ],
+                        vec![vec![
+                            Some(sum.to_string().into_bytes()),
+                            Some(count.to_string().into_bytes()),
+                        ]],
+                    )
+                } else {
+                    (
+                        vec![("sum".to_string(), oid::FLOAT8, 8)],
+                        vec![vec![Some(sum.to_string().into_bytes())]],
+                    )
+                };
+                return Ok(QueryResult {
+                    columns,
+                    rows,
+                    command_tag: "SELECT 1".to_string(),
+                });
+            }
+        }
+
+        if let Ok(shared) = self.tables.lock_table_read(table) {
+            let t = shared.read();
+            let _plan = self.htap_plan_sql(s, table);
+            let cc = self.get_or_build_cols(table, &*t);
 
             let (sum, count) = if let Some((filter_col, lo, hi)) = between_filter {
                 // Columnar range filter + sum.
@@ -16461,6 +17178,8 @@ impl NativeSqlEngine {
                     let end = cc.ids.partition_point(|x| *x <= hi);
                     let s = if let Some(fv) = cc.float_cols.get(agg_col.as_str()) {
                         simd_sum_f64(&fv[start..end])
+                    } else if let Some(iv) = cc.int_cols.get(agg_col.as_str()) {
+                        iv[start..end].iter().map(|v| *v as f64).sum()
                     } else {
                         0.0
                     };
@@ -16622,9 +17341,57 @@ impl NativeSqlEngine {
             }
         };
 
-        let g = self.tables.read().map_err(|_| "table lock poisoned")?;
-        if let Some(t) = g.get(table) {
-            let cc = self.get_or_build_cols(table, t);
+        if let Some((sum, count)) = self.htap_try_durable_sum(table, &agg_col, s) {
+            if count > 0 {
+                let avg = sum / count as f64;
+                return Ok(QueryResult {
+                    columns: vec![("avg".to_string(), oid::FLOAT8, 8)],
+                    rows: vec![vec![Some(avg.to_string().into_bytes())]],
+                    command_tag: "SELECT 1".to_string(),
+                });
+            }
+        }
+
+        let up = s.to_ascii_uppercase();
+        let between_filter: Option<(&str, i64, i64)> = if let Some(where_idx) = up.find("WHERE") {
+            let pred = s[where_idx + 5..].trim();
+            let parts: Vec<&str> = pred.split_whitespace().collect();
+            if parts.len() >= 5
+                && parts[1].eq_ignore_ascii_case("BETWEEN")
+                && parts[3].eq_ignore_ascii_case("AND")
+            {
+                let filter_col = parts[0].trim_matches('"');
+                let lo = Self::parse_value(parts[2]).as_i64();
+                let hi = Self::parse_value(parts[4]).as_i64();
+                Some((filter_col, lo, hi))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        if let Ok(shared) = self.tables.lock_table_read(table) {
+            let t = shared.read();
+            let cc = self.get_or_build_cols(table, &*t);
+            if let Some((filter_col, lo, hi)) = between_filter {
+                if let Some(filter_vec) = cc.int_cols.get(filter_col) {
+                    if let Some(fv) = cc.float_cols.get(agg_col.as_str()) {
+                        let start = filter_vec.partition_point(|&x| x < lo);
+                        let end = filter_vec.partition_point(|&x| x <= hi);
+                        let sum = simd_sum_f64(&fv[start..end]);
+                        let cnt = (end - start) as f64;
+                        let avg = if cnt > 0.0 { sum / cnt } else { 0.0 };
+                        return Ok(QueryResult {
+                            columns: vec![("avg".to_string(), oid::FLOAT8, 8)],
+                            rows: vec![vec![Some(avg.to_string().into_bytes())]],
+                            command_tag: "SELECT 1".to_string(),
+                        });
+                    }
+                }
+            }
+            let _plan = self.htap_plan_sql(s, table);
+            let cc = self.get_or_build_cols(table, &*t);
             let (sum, cnt) = if let Some(fv) = cc.float_cols.get(agg_col.as_str()) {
                 (simd_sum_f64(fv), fv.len() as f64)
             } else {
@@ -16739,15 +17506,14 @@ impl NativeSqlEngine {
         };
 
         // ── Load rows and convert to AggValue maps ──
-        let g = self.tables.read().map_err(|_| "table lock poisoned")?;
-        let t = g
-            .get(table)
-            .ok_or(format!("table \"{}\" does not exist", table))?;
+        let shared = self.table_read_guard(table)?;
+        let t = shared.read();
+        let _plan = self.htap_plan_sql(s, table);
 
         // ── Fast columnar GROUP BY: single text group col + SUM/COUNT aggs ──
         if gb_cols.len() == 1 && having_preds.is_empty() {
             let gb_col = &gb_cols[0];
-            let cc = self.get_or_build_cols(table, t);
+            let cc = self.get_or_build_cols(table, &*t);
             if let Some(grp_vals) = cc.text_cols.get(gb_col.as_str()) {
                 let sum_spec = agg_specs.iter().find(|s| s.func == ExecAggFunction::Sum);
                 let sum_fv = sum_spec
@@ -17076,7 +17842,7 @@ impl NativeSqlEngine {
     fn handle_select_join(&self, s: &str) -> Result<QueryResult, String> {
         let plan = JoinPlan::from_sql(s);
 
-        let g = self.tables.read().map_err(|_| "table lock poisoned")?;
+        let g = self.tables.to_native_map();
         let orders_table_name = g
             .keys()
             .find(|k| k.starts_with("bench_orders"))
@@ -17295,7 +18061,7 @@ impl NativeSqlEngine {
             }
         };
 
-        let g = self.tables.read().map_err(|_| "table lock poisoned")?;
+        let g = self.tables.to_native_map();
 
         // Build alias → table name mapping.
         let mut alias_to_table: HashMap<String, String> = HashMap::new();
@@ -17874,7 +18640,7 @@ impl NativeSqlEngine {
 
         // Collect outer rows data, then release lock so subqueries can re-acquire
         let outer_data: Vec<(i64, HashMap<String, Cell>)> = {
-            let g = self.tables.read().map_err(|_| "table lock poisoned")?;
+            let g = self.tables.to_native_map();
             let t = g
                 .get(table.as_str())
                 .ok_or(format!("table \"{}\" does not exist", table))?;
@@ -18116,7 +18882,7 @@ impl NativeSqlEngine {
         }
 
         // Load table data
-        let g = self.tables.read().map_err(|_| "table lock poisoned")?;
+        let g = self.tables.to_native_map();
         let t = g
             .get(&table as &str)
             .ok_or(format!("table \"{}\" does not exist", table))?;
@@ -24376,18 +25142,19 @@ mod tests {
             .execute("INSERT INTO vec_mixed (id, embedding) VALUES (1, '[1,0,0]'::vector)")
             .unwrap();
         {
-            let mut tables = engine.tables.write().unwrap();
-            let table = tables.get_mut("vec_mixed").unwrap();
-            let mut cols = HashMap::new();
-            cols.insert("id".to_string(), Cell::Int(2));
-            cols.insert("embedding".to_string(), Cell::Text("[0,1,0]".to_string()));
-            table.rows.insert(
-                2,
-                NativeRow {
-                    cols,
-                    last_modified_lsn: 0,
-                },
-            );
+            engine.tables.update_all(|tables| {
+                let table = tables.get_mut("vec_mixed").unwrap();
+                let mut cols = HashMap::new();
+                cols.insert("id".to_string(), Cell::Int(2));
+                cols.insert("embedding".to_string(), Cell::Text("[0,1,0]".to_string()));
+                table.rows.insert(
+                    2,
+                    NativeRow {
+                        cols,
+                        last_modified_lsn: 0,
+                    },
+                );
+            });
         }
         engine.buf_pool.invalidate("vec_mixed");
 

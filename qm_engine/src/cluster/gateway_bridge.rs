@@ -154,18 +154,26 @@ pub fn routed_query_handlers(
     attach: &ClusterGatewayAttach,
     engine: Arc<NativeSqlEngine>,
 ) -> (QueryHandler, AuthQueryHandler) {
+    use crate::gateway::session_pool::global_session_pool;
+
     let rt = attach.runtime.clone();
     let local_addr = attach.local_addr;
     let eng = engine.clone();
     let cfg = attach.config.clone();
     let handler: QueryHandler = Arc::new(move |sql: String| {
+        let conn_id = crate::cluster::connection_id();
+        let session = if conn_id != 0 {
+            global_session_pool().session_for_connection(conn_id, &eng)
+        } else {
+            eng.new_session()
+        };
         super::pg_distributed::execute_pg_routed(
             &rt,
             &cfg,
             &eng,
             local_addr,
             &sql,
-            || execute_routed_inner(&rt, &cfg, &eng, local_addr, &sql),
+            || execute_routed_inner(&rt, &cfg, &eng, &session, local_addr, &sql),
         )
     });
 
@@ -173,13 +181,19 @@ pub fn routed_query_handlers(
     let eng2 = engine;
     let cfg2 = attach.config.clone();
     let authed: AuthQueryHandler = Arc::new(move |sql: String, user: String| {
+        let conn_id = crate::cluster::connection_id();
+        let session = if conn_id != 0 {
+            global_session_pool().session_for_connection(conn_id, &eng2)
+        } else {
+            eng2.new_session()
+        };
         super::pg_distributed::execute_pg_routed(
             &rt2,
             &cfg2,
             &eng2,
             local_addr,
             &sql,
-            || execute_routed_as_inner(&rt2, &cfg2, &eng2, local_addr, &sql, &user),
+            || execute_routed_as_inner(&rt2, &cfg2, &eng2, &session, local_addr, &sql, &user),
         )
     });
 
@@ -242,25 +256,26 @@ pub fn execute_routed(
     local_addr: Option<SocketAddr>,
     sql: &str,
 ) -> Result<QueryResult, String> {
-    execute_routed_inner(runtime, cfg, local_engine, local_addr, sql)
+    execute_routed_inner(runtime, cfg, local_engine, local_engine.as_ref(), local_addr, sql)
 }
 
 fn execute_routed_inner(
     runtime: &ClusterRuntime,
     cfg: &ClusterNodeConfig,
-    local_engine: &Arc<NativeSqlEngine>,
+    shared_engine: &Arc<NativeSqlEngine>,
+    session_engine: &NativeSqlEngine,
     local_addr: Option<SocketAddr>,
     sql: &str,
 ) -> Result<QueryResult, String> {
     if !runtime.is_active() {
-        return local_engine.execute(sql);
+        return session_engine.execute(sql);
     }
 
     if super::cross_shard::is_distributed_batch(sql) {
         return super::cross_shard::execute_distributed_batch(
             runtime,
             cfg,
-            local_engine,
+            shared_engine,
             local_addr,
             sql,
         );
@@ -269,21 +284,33 @@ fn execute_routed_inner(
     if super::ddl_fanout::is_cluster_ddl(sql) {
         let targets = super::ddl_fanout::unique_primary_endpoints(runtime);
         if targets.len() > 1 {
-            return execute_ddl_fanout(local_engine, local_addr, sql, &targets);
+            return execute_ddl_fanout(session_engine, local_addr, sql, &targets);
         }
     }
 
     let shard_key = extract_shard_key(sql);
+    let up = sql.trim().to_ascii_uppercase();
+    // HA analytics read path: route SELECT analytics/vector to async replica when available.
+    if up.starts_with("SELECT") {
+        if let Some((plan, Some(replica))) =
+            runtime.route_analytics_read_if_active(sql, shard_key)
+        {
+            if !local_addr.is_some_and(|local| local == replica) {
+                return forward_sql_blocking_with_fallback(replica, &plan.replicas, sql, None);
+            }
+        }
+    }
+
     let Some(plan) = runtime.route_sql_if_active(sql, shard_key) else {
-        return execute_local_primary(cfg, local_engine, sql);
+        return execute_local_primary(cfg, session_engine, sql);
     };
 
     let Some(remote) = plan.primary else {
-        return execute_local_primary(cfg, local_engine, sql);
+        return execute_local_primary(cfg, session_engine, sql);
     };
 
     if local_addr.is_some_and(|local| local == remote) {
-        return execute_local_primary(cfg, local_engine, sql);
+        return execute_local_primary(cfg, session_engine, sql);
     }
 
     forward_sql_blocking_with_fallback(remote, &plan.replicas, sql, None)
@@ -291,7 +318,7 @@ fn execute_routed_inner(
 
 fn execute_local_primary(
     cfg: &ClusterNodeConfig,
-    local_engine: &Arc<NativeSqlEngine>,
+    local_engine: &NativeSqlEngine,
     sql: &str,
 ) -> Result<QueryResult, String> {
     super::stonith::require_write_lease(local_engine.data_dir.as_deref(), cfg)?;
@@ -331,7 +358,7 @@ fn forward_sql_blocking(remote: SocketAddr, sql: &str) -> Result<QueryResult, St
 }
 
 fn execute_ddl_fanout(
-    local_engine: &Arc<NativeSqlEngine>,
+    local_engine: &NativeSqlEngine,
     local_addr: Option<SocketAddr>,
     sql: &str,
     targets: &[SocketAddr],
@@ -383,40 +410,57 @@ pub fn execute_routed_as(
     sql: &str,
     user: &str,
 ) -> Result<QueryResult, String> {
-    execute_routed_as_inner(runtime, cfg, local_engine, local_addr, sql, user)
+    execute_routed_as_inner(runtime, cfg, local_engine, local_engine.as_ref(), local_addr, sql, user)
 }
 
 fn execute_routed_as_inner(
     runtime: &ClusterRuntime,
     cfg: &ClusterNodeConfig,
-    local_engine: &Arc<NativeSqlEngine>,
+    shared_engine: &Arc<NativeSqlEngine>,
+    session_engine: &NativeSqlEngine,
     local_addr: Option<SocketAddr>,
     sql: &str,
     user: &str,
 ) -> Result<QueryResult, String> {
     if !runtime.is_active() {
-        return local_engine.execute_as(sql, user);
+        return session_engine.execute_as(sql, user);
     }
 
     if super::cross_shard::is_distributed_batch(sql) {
         return super::cross_shard::execute_distributed_batch(
             runtime,
             cfg,
-            local_engine,
+            shared_engine,
             local_addr,
             sql,
         );
     }
 
     let shard_key = extract_shard_key(sql);
+    let up = sql.trim().to_ascii_uppercase();
+    if up.starts_with("SELECT") {
+        if let Some((plan, Some(replica))) =
+            runtime.route_analytics_read_if_active(sql, shard_key)
+        {
+            if !local_addr.is_some_and(|local| local == replica) {
+                return forward_sql_blocking_with_fallback(
+                    replica,
+                    &plan.replicas,
+                    sql,
+                    Some(user),
+                );
+            }
+        }
+    }
+
     let Some(plan) = runtime.route_sql_if_active(sql, shard_key) else {
-        return local_engine.execute_as(sql, user);
+        return session_engine.execute_as(sql, user);
     };
     let Some(remote) = plan.primary else {
-        return local_engine.execute_as(sql, user);
+        return session_engine.execute_as(sql, user);
     };
     if local_addr.is_some_and(|local| local == remote) {
-        return local_engine.execute_as(sql, user);
+        return session_engine.execute_as(sql, user);
     }
     forward_sql_blocking_with_fallback(remote, &plan.replicas, sql, Some(user))
 }

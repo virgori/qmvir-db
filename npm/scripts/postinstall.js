@@ -47,6 +47,36 @@ function getArtifactName() {
   return name + ext;
 }
 
+function getBinaryVersion(binaryPath) {
+  try {
+    const out = execSync(`"${binaryPath}" --version`, {
+      encoding: "utf8",
+      timeout: 15000,
+      stdio: ["ignore", "pipe", "ignore"],
+    });
+    const m = out.match(/(\d+\.\d+\.\d+)/);
+    return m ? m[1] : null;
+  } catch {
+    try {
+      const out = execSync(`"${binaryPath}" version`, {
+        encoding: "utf8",
+        timeout: 15000,
+        stdio: ["ignore", "pipe", "ignore"],
+      });
+      const m = out.match(/QMvir v(\d+\.\d+\.\d+)/i);
+      return m ? m[1] : null;
+    } catch {
+      return null;
+    }
+  }
+}
+
+function binaryMatchesPackage(binaryPath) {
+  const installed = getBinaryVersion(binaryPath);
+  if (!installed) return false;
+  return installed === VERSION;
+}
+
 function download(url) {
   return new Promise((resolve, reject) => {
     const get = (u, redirects = 0) => {
@@ -161,19 +191,24 @@ async function main() {
   const artifact = getArtifactName();
   if (!artifact) return;
 
-  // Check if binary is already bundled in the package
+  // Reuse only when version matches package.json (avoid stale 5.x after npm 6.x publish)
   fs.mkdirSync(NATIVE_DIR, { recursive: true });
   const dest = path.join(NATIVE_DIR, artifact);
   if (fs.existsSync(dest)) {
     const stat = fs.statSync(dest);
-    if (stat.size > 1024) {
-      log(`✓ Binary already bundled: ${artifact} (${(stat.size / 1024 / 1024).toFixed(1)} MB)`);
+    if (stat.size > 1024 && binaryMatchesPackage(dest)) {
+      log(`✓ Binary OK: ${artifact} v${VERSION} (${(stat.size / 1024 / 1024).toFixed(1)} MB)`);
       installToPath(dest);
       return;
     }
+    if (stat.size > 1024) {
+      const oldVer = getBinaryVersion(dest);
+      log(`⚠ Stale binary (${oldVer || "unknown"} != ${VERSION}) — re-downloading...`);
+      try { fs.unlinkSync(dest); } catch {}
+    }
   }
 
-  // Fallback: download from GitHub releases
+  // Download from GitHub releases
   const tag = `v${VERSION}`;
   const url = `https://github.com/${REPO}/releases/download/${tag}/${artifact}`;
 
@@ -186,7 +221,14 @@ async function main() {
     fs.chmodSync(dest, 0o755);
 
     const sizeMB = (buffer.length / 1024 / 1024).toFixed(1);
-    log(`✓ Downloaded ${artifact} (${sizeMB} MB)`);
+    const gotVer = getBinaryVersion(dest);
+    if (gotVer && gotVer !== VERSION) {
+      log(`✗ Downloaded ${artifact} but binary reports v${gotVer} (expected v${VERSION})`);
+      log(`  GitHub release ${tag} may have stale assets — rebuild and re-upload binaries.`);
+      try { fs.unlinkSync(dest); } catch {}
+      return;
+    }
+    log(`✓ Downloaded ${artifact} v${gotVer || VERSION} (${sizeMB} MB)`);
 
     // Install to system PATH
     installToPath(dest);

@@ -32,7 +32,8 @@ enterprise-certified
     ↓
 production-multi-dc-full
     ↓
-jepsen-certified          ← roadmap
+    ↓  qm cluster certify --chaos
+jepsen-certified
 ```
 
 | Cấp | Ý nghĩa | Kiểm tra |
@@ -40,7 +41,7 @@ jepsen-certified          ← roadmap
 | **community** | Single-node; cluster không active | Mặc định |
 | **enterprise-certified** | Gate bắt buộc + readiness ≥ 95% | `qm cluster certify` → `certified: YES` |
 | **production-multi-dc-full** | Tất cả gate (kể cả O–R) | `qm cluster certify` → `prod-full: YES` |
-| **jepsen-certified** | Chaos / partition battery | *Roadmap:* `qm cluster certify --chaos` |
+| **jepsen-certified** | Chaos / partition battery | `qm cluster certify --chaos` |
 
 Tách gate bắt buộc / tùy chọn giống triết lý Patroni (HA) vs Cockroach (geo) — khách single-DC không phải gánh chi phí multi-DC.
 

@@ -17,6 +17,7 @@ pub mod cluster;
 pub mod executor;
 pub mod gateway;
 pub mod hub_engine;
+pub mod htap;
 pub mod index;
 pub mod ipc;
 pub mod learned;
@@ -47,6 +48,11 @@ pub use metrics::MetricsRegistry;
 pub use optimizer::{AdaptiveOptimizer, LogicalPlan};
 pub use parser::{ParsedQuery, QueryType, SqlParser};
 pub use statistics::{BloomFilter, CostModel, CountMinSketch, HyperLogLog, TDigest};
+pub use htap::{
+    evaluate_htap_certification, evaluate_htap_engine, replay_wal_to_lsn, run_htap_isolation_battery,
+    wal_lines_to_replay, HtapCertificationReport,
+    HtapRuntime,
+};
 pub use storage::{StorageEngine, Transaction, WalWriter};
 
 /// Python module initialization

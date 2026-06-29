@@ -239,7 +239,7 @@ fn serial_bigserial_and_identity_columns_use_persistent_sequence_metadata() {
             vec![vec![Some("1".to_string())], vec![Some("10".to_string())]]
         );
 
-        let tables = engine.tables.read().unwrap();
+        let tables = engine.tables.to_native_map();
         let serial_seq = tables
             .get("serial_docs")
             .unwrap()

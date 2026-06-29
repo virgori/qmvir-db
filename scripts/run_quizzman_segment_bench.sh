@@ -43,13 +43,13 @@ ensure_qdrant() {
 }
 
 if [[ "${SKIP_BUILD:-0}" != "1" ]]; then
-  (cd qm_engine && cargo clean -q)
   python3 -m maturin build --release --out /tmp/qm_linux_wheels 2>&1 | tail -5
-  WHEEL=$(ls -t /tmp/qm_linux_wheels/qmvir-*.whl /tmp/qm_linux_wheels/qm_engine-*.whl 2>/dev/null | head -1)
+  WHEEL=$(ls -t /tmp/qm_linux_wheels/qm_engine-*.whl /tmp/qm_linux_wheels/qmvir-*.whl 2>/dev/null | head -1)
   echo "installing $WHEEL"
+  pip3 uninstall -y qmvir qm_engine qm-engine 2>/dev/null || true
   pip3 install -q --break-system-packages --force-reinstall "$WHEEL"
 fi
-python3 -c 'import qm_engine; print("qm_engine:", qm_engine.__file__)'
+python3 -c 'import importlib.metadata as m; import qm_engine; print("qm_engine:", m.version("qm_engine"), qm_engine.__file__)'
 echo "benchmark deployment: QM=${QM_DEPLOYMENT} DuckDB=${DUCKDB_DEPLOYMENT} Qdrant=${QDRANT_DEPLOYMENT}"
 
 echo '=== DuckDB OLAP ==='

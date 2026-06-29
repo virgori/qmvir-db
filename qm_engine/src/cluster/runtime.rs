@@ -92,6 +92,24 @@ impl ClusterRuntime {
         }
         self.router.read().as_ref().map(|r| r.catalog().clone())
     }
+
+    /// Analytics read path: return replica endpoint when workload is OLAP/vector.
+    #[inline]
+    pub fn route_analytics_read_if_active(
+        &self,
+        sql: &str,
+        shard_key: u64,
+    ) -> Option<(RoutePlan, Option<std::net::SocketAddr>)> {
+        if !self.armed.load(Ordering::Relaxed) {
+            return None;
+        }
+        if !self.is_active() {
+            return None;
+        }
+        let router = self.router.read();
+        let router = router.as_ref()?;
+        router.route_analytics_read(sql, shard_key).ok()
+    }
 }
 
 /// Gateway helper: env alone is never enough to route off-node.

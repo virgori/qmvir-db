@@ -37,7 +37,7 @@ impl<'a> PredictEngine<'a> {
         const SAMPLE_ROWS: usize = 256;
         let start = Instant::now();
 
-        let tables = self.engine.tables.read().unwrap();
+        let tables = self.engine.tables.to_native_map();
         let table_count = tables.len();
         let mut total_rows = 0u64;
         let mut estimated_compressed = 0u64;

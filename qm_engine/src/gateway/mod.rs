@@ -6,16 +6,24 @@
  */
 
 pub mod auth;
+mod cancel_registry;
 mod connection;
 pub mod native_sql;
+pub mod pg_tls;
 mod protocol;
+pub mod scram;
 mod server;
+pub mod session_pool;
+mod stream;
+pub mod table_store;
 
 pub use auth::AuthManager;
 pub use connection::*;
 pub use native_sql::*;
+pub use pg_tls::PgTlsConfig;
 pub use protocol::*;
 pub use server::*;
+pub use table_store::{SharedTable, TableStore};
 
 #[cfg(feature = "python")]
 use pyo3::exceptions::PyRuntimeError;
@@ -332,12 +340,14 @@ impl PyPostgresGateway {
             self.inner.config.host.as_str(),
             "127.0.0.1" | "::1" | "localhost"
         ) {
-            Ok(())
-        } else {
-            Err(PyRuntimeError::new_err(
-                "remote TCP bindings are disabled until TLS support is implemented; bind to 127.0.0.1/::1/localhost instead",
-            ))
+            return Ok(());
         }
+        if crate::gateway::pg_tls::PgTlsConfig::from_env().acceptor.is_some() {
+            return Ok(());
+        }
+        Err(PyRuntimeError::new_err(
+            "remote TCP bindings require TLS; set QM_TLS_CERT and QM_TLS_KEY (or bind to 127.0.0.1/::1/localhost)",
+        ))
     }
 
     fn _start_native_impl(&self, data_dir: Option<String>) -> PyResult<()> {

@@ -62,7 +62,8 @@ pub use meta_raft_network::{
     bootstrap_catalog_with_network, init_local_meta, networked_meta_ready, propose_with_quorum,
 };
 pub use pg_distributed::{
-    clear_connection_id, execute_pg_routed, pg_distributed_enabled, set_connection_id,
+    clear_connection_id, connection_id, execute_pg_routed, pg_distributed_enabled,
+    set_connection_id,
 };
 pub use stonith::{promote_with_fence, require_write_lease, stonith_enabled};
 pub use witness::{witness_configured, witness_mode_from_env, witness_quorum_ready};

@@ -3,7 +3,7 @@
 use crate::gateway::native_sql::NativeSqlEngine;
 
 pub fn run_stat(engine: &NativeSqlEngine, json: bool) {
-    let tables = engine.tables.read().unwrap();
+    let tables = engine.tables.to_native_map();
     let table_count = tables.len();
     let total_rows: usize = tables.values().map(|t| t.rows.len()).sum();
 

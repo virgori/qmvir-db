@@ -6,6 +6,8 @@
 
 use super::auth::AuthManager;
 use super::connection::{AuthQueryHandler, Connection, QueryHandler, QueryResult};
+use super::pg_tls::PgTlsConfig;
+use super::stream::ServerIo;
 use super::ConnectionConfig;
 use std::future::pending;
 use std::net::SocketAddr;
@@ -42,6 +44,7 @@ pub struct Server {
     query_handler: QueryHandler,
     authed_handler: Option<AuthQueryHandler>,
     auth: Option<AuthManager>,
+    tls: PgTlsConfig,
     running: Arc<AtomicBool>,
     shutdown: Arc<Notify>,
     stats: Arc<ServerStats>,
@@ -54,6 +57,7 @@ impl Server {
             query_handler,
             authed_handler: None,
             auth: None,
+            tls: PgTlsConfig::from_env(),
             running: Arc::new(AtomicBool::new(false)),
             shutdown: Arc::new(Notify::new()),
             stats: Arc::new(ServerStats::default()),
@@ -72,6 +76,41 @@ impl Server {
             query_handler,
             authed_handler: Some(authed_handler),
             auth: Some(auth),
+            tls: PgTlsConfig::from_env(),
+            running: Arc::new(AtomicBool::new(false)),
+            shutdown: Arc::new(Notify::new()),
+            stats: Arc::new(ServerStats::default()),
+        }
+    }
+
+    /// Same as `new_with_auth` but with an explicit TLS config (tests / programmatic setup).
+    pub fn new_with_auth_tls(
+        config: ConnectionConfig,
+        query_handler: QueryHandler,
+        authed_handler: AuthQueryHandler,
+        auth: AuthManager,
+        tls: PgTlsConfig,
+    ) -> Self {
+        Self {
+            config,
+            query_handler,
+            authed_handler: Some(authed_handler),
+            auth: Some(auth),
+            tls,
+            running: Arc::new(AtomicBool::new(false)),
+            shutdown: Arc::new(Notify::new()),
+            stats: Arc::new(ServerStats::default()),
+        }
+    }
+
+    /// Server without auth; optional TLS from env or explicit config.
+    pub fn new_with_tls(config: ConnectionConfig, query_handler: QueryHandler, tls: PgTlsConfig) -> Self {
+        Self {
+            config,
+            query_handler,
+            authed_handler: None,
+            auth: None,
+            tls,
             running: Arc::new(AtomicBool::new(false)),
             shutdown: Arc::new(Notify::new()),
             stats: Arc::new(ServerStats::default()),
@@ -89,7 +128,8 @@ impl Server {
             socket.set_reuseaddr(true)?;
             socket.bind(addr)?;
             let listener = socket.listen(1024)?;
-            return Ok((listener, addr));
+            let bound = listener.local_addr()?;
+            return Ok((listener, bound));
         }
 
         let mut last_error = None;
@@ -105,7 +145,8 @@ impl Server {
             match socket.bind(addr) {
                 Ok(()) => {
                     let listener = socket.listen(1024)?;
-                    return Ok((listener, addr));
+                    let bound = listener.local_addr()?;
+                    return Ok((listener, bound));
                 }
                 Err(err) => {
                     last_error = Some(err);
@@ -215,17 +256,29 @@ impl Server {
                         let handler = self.query_handler.clone();
                         let authed = self.authed_handler.clone();
                         let auth = self.auth.clone();
+                        let tls = self.tls.clone();
                         let stats = self.stats.clone();
 
                         stats.total_connections.fetch_add(1, Ordering::Relaxed);
                         stats.active_connections.fetch_add(1, Ordering::Relaxed);
 
                         tokio::spawn(async move {
+                            let tls_acceptor = tls.acceptor.clone();
                             let mut conn = match (authed, auth) {
-                                (Some(ah), Some(am)) => {
-                                    Connection::new_with_auth(stream, handler, ah, am)
-                                }
-                                _ => Connection::new(stream, handler),
+                                (Some(ah), Some(am)) => Connection::new_with_auth(
+                                    stream,
+                                    handler,
+                                    ah,
+                                    am,
+                                    tls_acceptor,
+                                ),
+                                _ => Connection::new_io(
+                                    ServerIo::from_tcp(stream),
+                                    handler,
+                                    None,
+                                    None,
+                                    tls_acceptor,
+                                ),
                             };
 
                             if let Err(e) = conn.run().await {
@@ -250,6 +303,7 @@ impl Server {
                         let handler = self.query_handler.clone();
                         let authed = self.authed_handler.clone();
                         let auth = self.auth.clone();
+                        let tls = self.tls.clone();
                         let stats = self.stats.clone();
 
                         stats.total_connections.fetch_add(1, Ordering::Relaxed);
@@ -257,10 +311,20 @@ impl Server {
 
                         tokio::spawn(async move {
                             let mut conn = match (authed, auth) {
-                                (Some(ah), Some(am)) => {
-                                    Connection::new_with_auth(stream, handler, ah, am)
-                                }
-                                _ => Connection::new(stream, handler),
+                                (Some(ah), Some(am)) => Connection::new_io(
+                                    ServerIo::from_unix(stream),
+                                    handler,
+                                    Some(ah),
+                                    Some(am),
+                                    None,
+                                ),
+                                _ => Connection::new_io(
+                                    ServerIo::from_unix(stream),
+                                    handler,
+                                    None,
+                                    None,
+                                    None,
+                                ),
                             };
 
                             if let Err(e) = conn.run().await {
@@ -304,17 +368,29 @@ impl Server {
                         let handler = self.query_handler.clone();
                         let authed = self.authed_handler.clone();
                         let auth = self.auth.clone();
+                        let tls = self.tls.clone();
                         let stats = self.stats.clone();
 
                         stats.total_connections.fetch_add(1, Ordering::Relaxed);
                         stats.active_connections.fetch_add(1, Ordering::Relaxed);
 
                         tokio::spawn(async move {
+                            let tls_acceptor = tls.acceptor.clone();
                             let mut conn = match (authed, auth) {
-                                (Some(ah), Some(am)) => {
-                                    Connection::new_with_auth(stream, handler, ah, am)
-                                }
-                                _ => Connection::new(stream, handler),
+                                (Some(ah), Some(am)) => Connection::new_with_auth(
+                                    stream,
+                                    handler,
+                                    ah,
+                                    am,
+                                    tls_acceptor,
+                                ),
+                                _ => Connection::new_io(
+                                    ServerIo::from_tcp(stream),
+                                    handler,
+                                    None,
+                                    None,
+                                    tls_acceptor,
+                                ),
                             };
 
                             if let Err(e) = conn.run().await {

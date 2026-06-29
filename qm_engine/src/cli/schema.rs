@@ -21,8 +21,8 @@ pub struct SchemaDiff {
 
 /// Diff two engines' schemas.
 pub fn diff_schemas(a: &NativeSqlEngine, b: &NativeSqlEngine) -> SchemaDiff {
-    let ta = a.tables.read().unwrap();
-    let tb = b.tables.read().unwrap();
+    let ta = a.tables.to_native_map();
+    let tb = b.tables.to_native_map();
 
     let keys_a: std::collections::HashSet<&String> = ta.keys().collect();
     let keys_b: std::collections::HashSet<&String> = tb.keys().collect();
@@ -90,7 +90,7 @@ pub fn generate_migration_sql(diff: &SchemaDiff, source_b: &NativeSqlEngine) -> 
 
     // New tables
     for name in &diff.added_tables {
-        let tables = source_b.tables.read().unwrap();
+        let tables = source_b.tables.to_native_map();
         if let Some(t) = tables.get(name) {
             let cols: Vec<String> = t
                 .columns
@@ -150,7 +150,7 @@ fn coltype_sql(ct: &crate::gateway::native_sql::ColType) -> String {
 
 /// Export DDL (CREATE TABLE statements) for all tables.
 pub fn export_ddl(engine: &NativeSqlEngine) -> String {
-    let tables = engine.tables.read().unwrap();
+    let tables = engine.tables.to_native_map();
     let mut ddl = String::new();
     let mut names: Vec<&String> = tables.keys().collect();
     names.sort();

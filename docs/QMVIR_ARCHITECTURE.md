@@ -1,8 +1,9 @@
 # QMvir / QM Engine — Kiến trúc hiện tại (Rust `qm_engine`)
 
 **Phạm vi:** crate `qm_engine/` (PostgreSQL wire protocol + `NativeSqlEngine`)  
-**Đồng bộ code:** nhắm tới **`Cargo.toml` v4.8.x** và cấu trúc module như trong `qm_engine/src/lib.rs`  
-**Đọc kèm:** [QMVIR_ALGORITHMS.md](QMVIR_ALGORITHMS.md) (danh mục thuật toán & chỉ dẫn file).
+**Phiên bản:** **6.2.0** — Production Multi-DC Enterprise Certified  
+**Đồng bộ code:** `qm_engine/Cargo.toml`, module tree trong `qm_engine/src/lib.rs`  
+**Đọc kèm:** [QMVIR_ALGORITHMS.md](QMVIR_ALGORITHMS.md) · [BASIC_USAGE.md](BASIC_USAGE.md) · [ENTERPRISE_HA_GUIDE.md](ENTERPRISE_HA_GUIDE.md)
 
 ---
 
@@ -62,7 +63,7 @@ QMvir là một **Rust core** phục vụ:
 | `index/` | B+Tree (mmap page), auto index manager, Roaring, inverted (WAND/BMW), HNSW+PQ, concurrent HNSW, WAL inverted, mmap vector/graph. |
 | `engines/` | **v4.8+** tách pool: `AnalyticsEngine` (Rayon), `VectorEngine` (Tokio worker), `CompactorEngine` — singleton process-wide, bật/tắt env. |
 | `hub_engine/` | Coordinator / planner / point query / vector gate cho mô hình hub–satellite (Rust). |
-| `cluster/` | Shard ring, replica, 2PC, transport TCP — **thư viện**; wiring gateway đầy đủ phụ thuộc lộ trình. |
+| `cluster/` | **Enterprise HA (v6.2):** shard ring, sync WAL replication, failover, fencing, meta Raft, 2PC, STONITH, witness, chaos battery — opt-in via `QM_CLUSTER_*` |
 | `ipc/` | Ring buffer mmap + dispatcher (hub↔satellite); ít dùng khi mọi thứ in-process. |
 | `backup/` | Backup/restore/encrypt/snapshot diff/verify. |
 | `web/` | Axum: API, studio, WebSocket, dashboard. |
@@ -140,13 +141,47 @@ Chi tiết lịch sử rà soát: [CODEBASE_AUDIT_2026_04_01.md](reference/CODEB
 | `qm_web` | HTTP dashboard / API |
 | `libqm_engine` | rlib + cdylib (Python) |
 | `npm/qmvir` | Phân phối binary đa nền + `postinstall` |
-| `qm_engine/scripts/build_release.sh` | Ma trận cross-compile; cố định `CARGO_TARGET_DIR` trong script |
+| `qm_engine/scripts/build_release.sh` | macOS binaries only (local); Linux/Windows via `sync_and_build_release_quizzman.sh` |
 
 ---
 
-## 9. Lộ trình / phần “có code, wiring tùy ngữ cảnh”
+## 9. Enterprise cluster (v6.2.0)
 
-- **Cluster** (`shard`, `replica`, `two_phase_commit`, `transport`): sẵn sàng ở mức thư viện; cần cấu hình gateway & ops để bật cluster thật.
+Cluster mode is **opt-in** (`QM_CLUSTER_ENABLE=1`). Single-node remains the default.
+
+```
+┌─────────────┐     sync WAL      ┌─────────────┐
+│  Node A     │◄─────────────────►│  Node B     │
+│  (primary)  │   TLS transport   │  (standby)  │
+└──────┬──────┘                   └──────┬──────┘
+       │         meta Raft / 2PC          │
+       └──────────────┬───────────────────┘
+                      ▼
+              qm cluster certify
+```
+
+| Layer | Modules | Purpose |
+|-------|---------|---------|
+| Transport | `cluster/transport.rs` | Inter-node TCP + TLS |
+| WAL replication | `cluster/wal_replication.rs`, `wal_buffer.rs` | RPO≈0 sync replicate, write quorum |
+| Failover | `cluster/failover.rs`, `fencing.rs` | Auto promotion, epoch fencing |
+| Meta catalog | `cluster/meta_raft_network.rs` | Networked Raft quorum |
+| Distributed txn | `cluster/two_phase_commit.rs`, `pg_distributed.rs` | Cross-shard atomic batches |
+| STONITH | `cluster/stonith.rs` | Primary lease fencing |
+| Witness | `cluster/witness.rs` | 2-DC tie-break voter |
+| Catch-up | `cluster/wal_catchup.rs` | Durable segment catch-up on standby |
+| Certification | `cluster/certify.rs`, `readiness.rs` | Tier scoring + CLI gates |
+| Chaos | `cluster/chaos_battery.rs` | In-process jepsen-style scenarios |
+
+**Certification tiers:** `community` → `enterprise-certified` → `production-multi-dc-full` → `jepsen-certified` (`qm cluster certify --chaos`).
+
+Full env vars, topology examples, and validation scripts: **[ENTERPRISE_HA_GUIDE.md](ENTERPRISE_HA_GUIDE.md)**.
+
+---
+
+## 10. Lộ trình / phần “có code, wiring tùy ngữ cảnh”
+
+- **Cluster** (`cluster/*`): production-ready at v6.2.0 with certification gates; enable via `QM_CLUSTER_*` env.
 - **IPC** ring + dispatcher: phục vụ kiến trúc multi-process; mặc định single-process dùng `NativeSqlEngine` trực tiếp.
 - **`native_sql_v2_wip.rs`**: biến thể / thử nghiệm — không thay thế file production trừ khi merge có chủ đích.
 
@@ -157,9 +192,9 @@ Chi tiết lịch sử rà soát: [CODEBASE_AUDIT_2026_04_01.md](reference/CODEB
 | Doc | Nội dung |
 |-----|----------|
 | [QMVIR_ALGORITHMS.md](QMVIR_ALGORITHMS.md) | Bảng thuật toán & module |
-| [ARCHITECTURE.md](reference/ARCHITECTURE.md) | Lịch sử dài (timeline, audit cũ, hub join — **đối chiếu ngày**) |
-| [ENGINE_SPLIT_v4.8.0.md](reference/ENGINE_SPLIT_v4.8.0.md) | Engine pool split design |
-| [CODEBASE_AUDIT_2026_04_01.md](reference/CODEBASE_AUDIT_2026_04_01.md) | Audit toàn repo (Python + Rust) |
+| [BASIC_USAGE.md](BASIC_USAGE.md) | Hướng dẫn cơ bản v6.2.0 |
+| [ENTERPRISE_HA_GUIDE.md](ENTERPRISE_HA_GUIDE.md) | HA enterprise / multi-DC |
+| [_archive/legacy/](_archive/legacy/) | Tài liệu lịch sử (không duy trì) |
 
 ---
 

@@ -11,6 +11,7 @@ pub enum GuideTopic {
     Studio,
     Cli,
     Cluster,
+    Htap,
     Notes,
 }
 
@@ -23,6 +24,7 @@ impl GuideTopic {
             "studio" | "desktop" | "gui" => Some(Self::Studio),
             "cli" | "commands" => Some(Self::Cli),
             "cluster" | "ha" | "enterprise" | "multi-dc" => Some(Self::Cluster),
+            "htap" | "olap" | "mvcc" | "pitr" => Some(Self::Htap),
             "notes" | "caveats" | "warnings" | "luu-y" => Some(Self::Notes),
             _ => None,
         }
@@ -33,7 +35,7 @@ pub fn run_guide(lang: &Lang, topic: &str) {
     let version = env!("CARGO_PKG_VERSION");
     let Some(topic) = GuideTopic::from_str(topic) else {
         eprintln!("unknown guide topic: {topic}");
-        eprintln!("topics: all | quickstart | backup | studio | cli | cluster | notes");
+        eprintln!("topics: all | quickstart | backup | studio | cli | cluster | htap | notes");
         std::process::exit(2);
     };
 
@@ -59,6 +61,7 @@ TOPICS
   studio       QMvir Studio desktop admin app
   cli          QMvir-exclusive CLI commands (not in psql)
   cluster      Enterprise HA & production multi-DC deploy
+  htap         HTAP: MVCC, column segments, PITR, certification
   notes        Important caveats and upgrade tips
 
 QUICK START
@@ -75,8 +78,10 @@ ESSENTIAL COMMANDS
   qm checkpoint
   qm guide notes                # read before production
   qm guide cluster              # HA / multi-DC deploy
+  qm guide htap                 # HTAP / MVCC / PITR
 
 Full docs: USAGE_GUIDE_EN.md in the source repo
+HTAP: docs/HTAP_GUIDE.md | docs/HTAP_GUIDE_VI.md
 Performance: docs/QMVIR_PERFORMANCE_GUIDE_VI.md
 HA: docs/ENTERPRISE_HA_GUIDE.md | docs/ENTERPRISE_HA_GUIDE_VI.md
 "
@@ -212,11 +217,19 @@ CLUSTER HA (env-driven, opt-in)
   qm cluster status | health | readiness | certify | lag | metrics
   qm cluster guide    # enterprise HA / production multi-DC
 
+HTAP (hybrid OLTP+OLAP)
+  qm htap certify [--isolation]           # MVCC + column segment gates
+  qm pitr plan --timestamp <unix>         # point-in-time recovery plan
+  qm pitr restore --timestamp <unix> -o ./pitr_out
+  qm guide htap                           # full HTAP guide
+  EXPLAIN SELECT ...                      # shows Index/Column/HNSW path
+
 TIP: run `qm guide notes` before production deployments.
 TIP: run `qm guide cluster` before HA / multi-DC deploy.
 "
         ),
         GuideTopic::Cluster => cluster_guide::cluster_guide_body(&Lang::En),
+        GuideTopic::Htap => guide_htap_en(version),
         GuideTopic::Notes => format!(
             "\
 QMvir v{version} — Important notes & caveats
@@ -273,6 +286,7 @@ CHU DE
   studio       Ung dung QMvir Studio (desktop)
   cli          Lenh chi co trong qm (khong co trong psql)
   cluster      Enterprise HA & production multi-DC
+  htap         HTAP: MVCC, column segment, PITR
   notes        Luu y quan trong truoc production
 
 BAT DAU NHANH
@@ -290,11 +304,12 @@ LENH THUONG DUNG
   qm guide notes
   qm guide cluster
 
-Tai lieu day du: USAGE_GUIDE_EN.md (tieng Anh)
+Tai lieu HTAP: docs/HTAP_GUIDE_VI.md
 HA: docs/ENTERPRISE_HA_GUIDE_VI.md
 "
         ),
         GuideTopic::Cluster => cluster_guide::cluster_guide_body(&Lang::Vi),
+        GuideTopic::Htap => guide_htap_vi(version),
         GuideTopic::Notes => format!(
             "\
 QMvir v{version} — Luu y quan trong
@@ -354,6 +369,7 @@ QMvir v{version} — 使用指南（內建）
 "
         .to_string(),
         GuideTopic::Cluster => cluster_guide::cluster_guide_body(&Lang::Zht),
+        GuideTopic::Htap => guide_htap_en(version),
         _ => guide_en(topic, version),
     }
 }
@@ -383,6 +399,98 @@ QMvir v{version} — 使用指南（内置）
 "
         .to_string(),
         GuideTopic::Cluster => cluster_guide::cluster_guide_body(&Lang::Zh),
+        GuideTopic::Htap => guide_htap_en(version),
         _ => guide_en(topic, version),
     }
+}
+
+fn guide_htap_en(version: &str) -> String {
+    format!(
+        "\
+QMvir v{version} — HTAP (Hybrid OLTP + OLAP)
+
+OVERVIEW
+  HTAP layer combines row-store OLTP with durable column segments for analytics.
+  MVCC provides real transactions (BEGIN/COMMIT/ROLLBACK + autocommit).
+  Planner picks row vs column vs index vs HNSW path (see EXPLAIN).
+
+MVCC TRANSACTIONS
+  BEGIN;
+  INSERT / UPDATE / DELETE ...   -- version chain tracked
+  COMMIT;                        -- publishes + columnizes at commit LSN
+  ROLLBACK;                      -- aborts uncommitted versions
+
+  Autocommit DML uses implicit per-statement transactions (not WAL-only fake commit).
+
+ANALYTICS PATHS
+  SELECT COUNT(*) / SUM(col) / AVG(col) / GROUP BY
+    → Column Scan when table ≥ 4096 rows and durable column_segments exist
+    → reads mmap QMCS segments (no full catalog clone)
+
+  SELECT ... WHERE id = ?        → Index Scan (MVCC-aware row_at)
+  SELECT ... ORDER BY emb <-> q  → HNSW Vector Scan (unchanged by HTAP)
+
+EXPLAIN
+  qm sql \"EXPLAIN SELECT SUM(val) FROM t WHERE id BETWEEN 1 AND 1000\"
+  Shows: Index Scan | Seq Scan | Column Scan | HNSW Vector Scan | GIN/Inverted Scan
+
+CERTIFICATION
+  qm htap certify                    # functional gates (data_dir, WAL archive)
+  qm htap certify --isolation        # + Jepsen-style MVCC battery
+
+POINT-IN-TIME RECOVERY (PITR)
+  qm backup -o snap.qmvb --pitr      # include WAL in backup
+  qm pitr plan --timestamp <unix>    # compute target LSN from wal_archive.json
+  qm pitr restore --timestamp <unix> -o ./pitr_out
+  qm pitr restore --lsn 42 -o ./pitr_out
+
+MIXED WORKLOAD BENCHMARK
+  python3 scripts/htap_mixed_benchmark.py --engine-bin qm
+
+CLUSTER ANALYTICS READS (HA)
+  Analytics SELECT can route to async replica when QM_CLUSTER_* is set.
+  See: qm guide cluster
+
+FILES (under --data-dir)
+  native_sql.wal          mutation log
+  wal_archive.json        PITR LSN index (updated on commit)
+  column_segments/        QMCS durable column files
+  pitr_manifest.json      last PITR plan output
+
+Full reference: docs/HTAP_GUIDE.md
+"
+    )
+}
+
+fn guide_htap_vi(version: &str) -> String {
+    format!(
+        "\
+QMvir v{version} — HTAP (OLTP + OLAP tich hop)
+
+TONG QUAN
+  Tang HTAP ket hop row-store OLTP voi column segment ben vung cho analytics.
+  MVCC cung cap transaction thuc (BEGIN/COMMIT/ROLLBACK + autocommit).
+  Planner chon row / column / index / HNSW (xem EXPLAIN).
+
+GIAO DICH MVCC
+  BEGIN;
+  INSERT / UPDATE / DELETE ...
+  COMMIT;      -- publish + columnize tai commit LSN
+  ROLLBACK;    -- huy version chua commit
+
+DUONG DAN ANALYTICS
+  SELECT COUNT(*) / SUM(col) / AVG(col) / GROUP BY
+    → Column Scan khi bang ≥ 4096 dong va co column_segments
+
+  SELECT ... WHERE id = ?        → Index Scan (MVCC row_at)
+  SELECT ... ORDER BY emb <-> q  → HNSW Vector Scan (khong doi boi HTAP)
+
+CHUNG NHAN & PITR
+  qm htap certify [--isolation]
+  qm pitr plan --timestamp <unix>
+  qm pitr restore --timestamp <unix> -o ./pitr_out
+
+Tai lieu day du: docs/HTAP_GUIDE_VI.md
+"
+    )
 }

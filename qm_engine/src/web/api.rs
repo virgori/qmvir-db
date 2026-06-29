@@ -203,7 +203,7 @@ pub async fn api_stats(State(s): State<Arc<WebState>>) -> Json<StatsResponse> {
 }
 
 pub async fn api_tables(State(s): State<Arc<WebState>>) -> Json<Vec<TableInfo>> {
-    let tables = s.engine.tables.read().unwrap();
+    let tables = s.engine.tables.to_native_map();
     let infos: Vec<TableInfo> = tables
         .iter()
         .map(|(name, t)| TableInfo {
@@ -220,7 +220,7 @@ pub async fn api_table_detail(
     State(s): State<Arc<WebState>>,
     Path(name): Path<String>,
 ) -> Result<Json<TableDetail>, StatusCode> {
-    let tables = s.engine.tables.read().unwrap();
+    let tables = s.engine.tables.to_native_map();
     let table = tables.get(&name).ok_or(StatusCode::NOT_FOUND)?;
 
     let sample_rows: Vec<Vec<String>> = table

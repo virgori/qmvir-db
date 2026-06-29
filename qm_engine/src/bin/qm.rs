@@ -12,7 +12,7 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use qm_engine::cli::i18n::Lang;
-use qm_engine::cli::{Cli, Commands, SchemaAction};
+use qm_engine::cli::{Cli, Commands, HtapAction, PitrAction, SchemaAction};
 use qm_engine::NativeSqlEngine;
 
 fn load_engine(data_dir: &PathBuf, lang: &Lang) -> NativeSqlEngine {
@@ -632,6 +632,31 @@ fn main() {
         Commands::Status => {
             qm_engine::cli::server::run_status(&cli.data_dir);
         }
+
+        Commands::Pitr { action } => match action {
+            PitrAction::Plan { timestamp } => {
+                qm_engine::cli::pitr_cmd::run_pitr_plan(&cli.data_dir, timestamp);
+            }
+            PitrAction::Restore {
+                timestamp,
+                lsn,
+                output,
+            } => {
+                qm_engine::cli::pitr_cmd::run_pitr_restore(
+                    &cli.data_dir,
+                    &output,
+                    timestamp,
+                    lsn,
+                );
+            }
+        },
+
+        Commands::Htap { action } => match action {
+            HtapAction::Certify { table, isolation } => {
+                let engine = load_engine(&cli.data_dir, &lang);
+                qm_engine::cli::htap_cmd::run_certify(&engine, Some(&table), isolation);
+            }
+        },
 
         Commands::Cluster { action } => match action {
             qm_engine::cli::ClusterAction::Status => {

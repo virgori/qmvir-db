@@ -1,109 +1,75 @@
 # qmvir
 
-**QMvir v4.3.4** — Hybrid AI-Native Database combining OLTP + OLAP + Full-text Search + Vector Search + Smart Cache in one platform. Pure Rust engine, zero Python dependency.
+**QMvir v6.2.0** — Hybrid AI-native database: OLTP + OLAP + full-text search + vector search in one Rust engine. PostgreSQL wire protocol. **Production Multi-DC Enterprise Certified** (optional HA cluster).
 
 ## Install
 
 ```bash
-# npm
-npm install qmvir
-
-# pnpm
-pnpm add qmvir
-
-# Global CLI (auto-downloads native Rust binary)
+npm install qmvir@6.2.0
+# or global CLI
 npm install -g qmvir
+qm --version   # qm 6.2.0
 ```
 
-The package auto-downloads the correct native Rust binary (~7–8 MB) for your platform during `postinstall`.
+Postinstall downloads the native binary (~8–13 MB) for your platform from [GitHub releases](https://github.com/virgori/qmvir-releases/releases/tag/v6.2.0).
 
-## SDK Usage (JavaScript / TypeScript)
+## Quick start
+
+```bash
+qm --data-dir ./data start --admin-password secret
+psql -h 127.0.0.1 -p 55433 -U admin -d qm
+```
+
+```sql
+CREATE TABLE users (id INT PRIMARY KEY, name TEXT);
+INSERT INTO users VALUES (1, 'Alice');
+SELECT * FROM users;
+```
+
+## SDK (JavaScript / TypeScript)
 
 ```typescript
 import { QMClient } from "qmvir";
 
 const qm = new QMClient("http://localhost:8400", { apiKey: "your-key" });
-
-// CRUD
-const users = await qm.find("users", {
-  where: { status: "active" },
-  orderBy: [{ created_at: "desc" }],
-  limit: 10,
-});
-
-await qm.insert("users", { name: "Alice", balance: 150.5 });
-await qm.update("users", "user-123", { balance: 200.0 });
-await qm.delete("users", "user-456");
-
-// Full-text + Vector hybrid search
-const results = await qm.search("articles", "machine learning", {
-  strategy: "hybrid", // lexical | vector | hybrid | rerank
-  limit: 20,
-});
-
-// Analytics aggregation
-const stats = await qm.aggregate("orders", {
-  groupBy: ["region", "category"],
-  metrics: [{ total: "SUM(amount)" }, { count: "COUNT(*)" }],
-  where: { year: 2026 },
-});
+const rows = await qm.find("users", { where: { status: "active" }, limit: 10 });
+const hits = await qm.search("articles", "machine learning", { strategy: "hybrid", limit: 20 });
 ```
 
-## CLI Usage
+## CLI highlights
 
 ```bash
-# Start QMvir server (PostgreSQL wire protocol)
-qmvir --data-dir ./data start --host 127.0.0.1 --port 55433
-
-# Connect via psql
-psql -h 127.0.0.1 -p 55433 -U admin -d qm
-
-# SQL queries
-CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, balance DOUBLE PRECISION);
-INSERT INTO users VALUES (1, 'Alice', 150.50);
-SELECT * FROM users WHERE balance > 100;
-
-# Backup & Restore
-qmvir --data-dir ./data backup -o backup.qmvb
-qmvir --data-dir ./data restore backup.qmvb
-
-# Inspect
-qmvir --data-dir ./data inspect --tables
-qmvir --data-dir ./data stat --json
+qm --data-dir ./data backup -o backup.qmvb
+qm --data-dir ./data inspect --tables
+qm cluster status              # when QM_CLUSTER_ENABLE=1
+qm cluster certify             # enterprise HA certification
+qm cluster guide               # HA setup walkthrough
+qm guide quickstart
 ```
 
-## Benchmark Results (v4.3.4, VPS Contabo 24GB RAM, Linux x86_64)
+## Platforms
 
-| Benchmark | ops/s | Time |
-|-----------|------:|-----:|
-| Ring Buffer IPC (1KB) | **266.2K** | 15.4 ms |
-| LSN Sequencer | **190.48M** | 525 μs |
-| B+Tree point lookup | **6.30M** | 1.6 ms |
-| Roaring Bitmap contains | **416.67M** | 24 μs |
-| Bloom Filter lookup | **2.50G** | 4 μs |
-| HNSW search top-10 (128d) | **30.4K** | 32.9 ms |
-| SQL SELECT by PK (e2e) | **753.8K** | 6.6 ms |
-| SQL INSERT (e2e) | **1.1K** | 9.39 s |
-| SQL COUNT(\*) aggregation | **574.7K** | 174 μs |
+| Platform | Binary |
+|----------|--------|
+| macOS Apple Silicon | `qm-macos-arm64` |
+| macOS Intel | `qm-macos-x86_64` |
+| Linux x86_64 | `qm-linux-x86_64` |
+| Linux ARM64 | `qm-linux-aarch64` |
+| Windows x86_64 | `qm-windows-x86_64.exe` |
+| Windows ARM64 | `qm-windows-aarch64.exe` |
 
-**Linux production features:** io_uring WAL, AVX-512F SIMD, O_DIRECT, madvise, fdatasync.
+## Documentation
 
-## Supported Platforms
+Full docs in the source repository:
 
-| Platform | Architecture | Binary | Size |
-| -------- | ------------ | ------ | ---- |
-| macOS | ARM64 (M1+) | `qm-macos-arm64` | 7.4 MB |
-| Linux | x86_64 | `qm-linux-x86_64` | 8.4 MB |
-| Linux | ARM64 | `qm-linux-aarch64` | 6.9 MB |
-| Windows | x86_64 | `qm-windows-x86_64.exe` | 8.2 MB |
-
-## Alternative Install
-
-```bash
-# Shell script (auto-detect platform)
-curl -fsSL https://raw.githubusercontent.com/virgori/qmvir-releases/main/install.sh | bash
-```
+| Topic | Link |
+|-------|------|
+| Architecture | [docs/QMVIR_ARCHITECTURE.md](https://github.com/virgori/qmvir-db/blob/main/docs/QMVIR_ARCHITECTURE.md) |
+| Algorithms | [docs/QMVIR_ALGORITHMS.md](https://github.com/virgori/qmvir-db/blob/main/docs/QMVIR_ALGORITHMS.md) |
+| Basic usage | [docs/BASIC_USAGE.md](https://github.com/virgori/qmvir-db/blob/main/docs/BASIC_USAGE.md) |
+| Enterprise HA | [docs/ENTERPRISE_HA_GUIDE.md](https://github.com/virgori/qmvir-db/blob/main/docs/ENTERPRISE_HA_GUIDE.md) |
+| Doc index | [docs/README.md](https://github.com/virgori/qmvir-db/blob/main/docs/README.md) |
 
 ## License
 
-MIT
+See [LICENSE](LICENSE) in this package.

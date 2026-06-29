@@ -240,6 +240,14 @@ pub fn run_start(
     // Build engine.
     let engine = Arc::new(NativeSqlEngine::with_data_dir(data_dir.clone()));
 
+    if let Ok(policy) = std::env::var("QMVIR_WAL_SYNC_POLICY") {
+        if let Err(err) = engine.set_wal_sync_policy(&policy) {
+            eprintln!("warning: invalid QMVIR_WAL_SYNC_POLICY ({err}); using default");
+        } else {
+            eprintln!("[WAL] sync policy: {}", policy);
+        }
+    }
+
     // SEC-02: Override default admin password.
     if let Some(ref pw) = admin_password {
         if pw != "admin" {
@@ -247,12 +255,13 @@ pub fn run_start(
         }
     }
 
-    // pgwire is loopback-only in this build until TLS is wired in.
+    // pgwire: allow remote bind when TLS is configured.
+    let tls = crate::gateway::pg_tls::PgTlsConfig::from_env();
     let is_loopback = is_loopback_host(host);
-    if !is_loopback {
+    if !is_loopback && !tls.enabled {
         eprintln!(
-            "error: Binding pgwire to non-loopback address {} is disabled in this build.\n\
-             TLS is not configured yet, so use 127.0.0.1/::1/localhost or a Unix socket.",
+            "error: Binding pgwire to non-loopback address {} requires TLS.\n\
+             Set QM_TLS_CERT and QM_TLS_KEY (or QM_PG_TLS_CERT / QM_PG_TLS_KEY).",
             host
         );
         remove_pid(data_dir);

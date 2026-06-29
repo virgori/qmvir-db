@@ -295,6 +295,15 @@ impl TransactionManager {
         self.registry.read().get(&tx_id).cloned()
     }
 
+    /// Tables modified by an active or recently committed transaction.
+    pub fn touched_tables_for(&self, tx_id: TxId) -> Vec<String> {
+        self.registry
+            .read()
+            .get(&tx_id)
+            .map(|record| record.touched_tables.iter().cloned().collect())
+            .unwrap_or_default()
+    }
+
     /// Update touched tables for transaction.
     pub fn touch_table(&self, tx_id: TxId, table_name: String) -> Result<(), String> {
         let mut registry = self.registry.write();
@@ -369,6 +378,38 @@ impl TransactionManager {
             .map(|record| record.start_ts)
             .min()
             .unwrap_or_else(|| self.current_commit_ts())
+    }
+
+    /// Expose registry for visibility checks (HTAP layer).
+    pub fn registry_snapshot(&self) -> AHashMap<TxId, TransactionRecord> {
+        self.registry.read().clone()
+    }
+
+    /// Allocate monotonic session id (gateway compatibility).
+    pub fn allocate_session_id(&self) -> SessionId {
+        static NEXT_SESSION: AtomicU64 = AtomicU64::new(1);
+        NEXT_SESSION.fetch_add(1, Ordering::Relaxed)
+    }
+
+    pub fn active_tx_for_session(&self, session_id: SessionId) -> Option<TxId> {
+        self.sessions.read().get(&session_id).copied().flatten()
+    }
+
+    pub fn active_count(&self) -> usize {
+        self.registry
+            .read()
+            .values()
+            .filter(|r| matches!(r.state, TxState::Active))
+            .count()
+    }
+
+    pub fn transaction_state(&self, tx_id: TxId) -> Option<TxState> {
+        self.registry.read().get(&tx_id).map(|r| r.state.clone())
+    }
+
+    /// READ COMMITTED snapshot for autocommit SELECT (no active txn).
+    pub fn autocommit_read_snapshot(&self) -> Snapshot {
+        Snapshot::read_committed(self.current_commit_ts(), 0, self.get_active_tx_ids())
     }
 
     /// Cleanup transaction records (for testing/debugging).

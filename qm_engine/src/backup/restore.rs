@@ -189,12 +189,10 @@ impl<'a> RestoreEngine<'a> {
                 sequences: HashMap::new(),
             };
 
-            let mut tables_guard = self.engine.tables.write().unwrap();
             if config.drop_existing {
-                tables_guard.remove(&table_name);
+                self.engine.tables.remove(&table_name);
             }
-            tables_guard.insert(table_name, table);
-            drop(tables_guard);
+            self.engine.tables.insert_native(table_name, table);
 
             tables_restored += 1;
         }
@@ -345,29 +343,27 @@ impl<'a> RestoreEngine<'a> {
 
             total_rows += changed_rows.len() as u64;
 
-            // Upsert into existing table (or create if it doesn't exist yet).
-            let mut tables_guard = self.engine.tables.write().unwrap();
-
-            let t = tables_guard
-                .entry(table_name.clone())
-                .or_insert_with(|| NativeTable {
+            self.engine.tables.with_write_or_create(
+                &table_name,
+                || NativeTable {
                     columns: entry.columns.clone(),
-                    column_types,
+                    column_types: column_types.clone(),
                     rows: HashMap::new(),
                     next_auto_id: 1,
                     foreign_keys: Vec::new(),
                     constraints: Vec::new(),
                     table_checks: Vec::new(),
                     sequences: HashMap::new(),
-                });
-
-            for (id, row) in changed_rows {
-                if id >= t.next_auto_id {
-                    t.next_auto_id = id.saturating_add(1);
-                }
-                t.rows.insert(id, row);
-            }
-            drop(tables_guard);
+                },
+                |t| {
+                    for (id, row) in changed_rows {
+                        if id >= t.next_auto_id {
+                            t.next_auto_id = id.saturating_add(1);
+                        }
+                        t.rows.insert(id, row);
+                    }
+                },
+            );
 
             tables_restored += 1;
         }
@@ -403,14 +399,13 @@ impl<'a> RestoreEngine<'a> {
             .map(|names| names.iter().map(|name| name.as_str()).collect());
 
         if config.drop_existing {
-            let mut tables = self.engine.tables.write().unwrap();
             for table in &dump.tables {
                 if filter
                     .as_ref()
                     .map(|set| set.contains(table.name.as_str()))
                     .unwrap_or(true)
                 {
-                    tables.remove(&table.name);
+                    self.engine.tables.remove(&table.name);
                 }
             }
         }
@@ -537,7 +532,7 @@ mod tests {
         assert_eq!(result.tables_restored, 1);
         assert_eq!(result.total_rows, 1);
 
-        let tables = restored.tables.read().unwrap();
+        let tables = restored.tables.to_native_map();
         let docs = tables.get("docs").unwrap();
         assert_eq!(docs.column_types[1], ColType::Vector(3));
         let row = docs.rows.get(&1).unwrap();
@@ -581,7 +576,7 @@ mod tests {
         assert_eq!(result.tables_restored, 1);
         assert_eq!(result.total_rows, 3);
 
-        let tables = engine.tables.read().unwrap();
+        let tables = engine.tables.to_native_map();
         let users = tables.get("users").unwrap();
         assert_eq!(users.rows.len(), 3);
         assert!(matches!(

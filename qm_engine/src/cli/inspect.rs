@@ -4,7 +4,7 @@ use crate::gateway::native_sql::NativeSqlEngine;
 
 /// List all tables.
 pub fn run_list_tables(engine: &NativeSqlEngine) {
-    let tables = engine.tables.read().unwrap();
+    let tables = engine.tables.to_native_map();
     if tables.is_empty() {
         println!("No tables found.");
         return;
@@ -29,7 +29,7 @@ pub fn run_list_tables(engine: &NativeSqlEngine) {
 
 /// Show details for a specific table.
 pub fn run_inspect_table(engine: &NativeSqlEngine, table_name: &str) {
-    let tables = engine.tables.read().unwrap();
+    let tables = engine.tables.to_native_map();
     let Some(table) = tables.get(table_name) else {
         eprintln!("error: table '{table_name}' not found");
         std::process::exit(1);
