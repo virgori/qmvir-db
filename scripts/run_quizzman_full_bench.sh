@@ -44,7 +44,7 @@ if [[ "${SKIP_BUILD:-0}" != "1" ]]; then
   pip3 uninstall -y qmvir qm_engine qm-engine 2>/dev/null || true
   pip3 install -q --break-system-packages --force-reinstall "$WHEEL"
 fi
-python3 -c 'import importlib.metadata as m; import qm_engine; print("qm_engine:", m.version("qm_engine"), qm_engine.__file__)'
+python3 -c 'import importlib.metadata as m; import qm_engine; print("qm_engine:", m.version("qmvir"), qm_engine.__file__)'
 
 summarize_json() {
   local path="$1" label="$2"
