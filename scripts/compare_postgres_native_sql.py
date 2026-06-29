@@ -149,6 +149,17 @@ To emit setup SQL:
 """
 
 
+def outer_txn_iterations(iterations: int, batch_size: int) -> int:
+    """Outer transaction loop count — keep total rows inserted ~O(iterations).
+
+    batch_size=10  -> iterations/10 outer loops (not iterations/1).
+    batch_size=100 -> iterations/10
+    batch_size=1000 -> iterations/100
+    """
+    unit = batch_size if batch_size < 100 else batch_size // 10
+    return max(1, min(iterations, iterations // max(1, unit)))
+
+
 def bench(name: str, iterations: int, fn: Callable[[], Any]) -> dict[str, Any]:
     latencies = []
     errors = 0
@@ -442,7 +453,7 @@ def run_qm(
         return item
 
     def batch_iterations(batch_size: int) -> int:
-        return max(1, min(iterations, iterations // max(1, batch_size // 10)))
+        return outer_txn_iterations(iterations, batch_size)
 
     def insert() -> None:
         nonlocal next_id
@@ -693,7 +704,7 @@ def run_pg(dsn: str, iterations: int, durability_mode: str) -> tuple[dict[str, d
     batch_id = next_id + 100_000
 
     def batch_iterations(batch_size: int) -> int:
-        return max(1, min(iterations, iterations // max(1, batch_size // 10)))
+        return outer_txn_iterations(iterations, batch_size)
 
     def transaction_batch_insert_commit(batch_size: int) -> Callable[[], None]:
         def run() -> None:

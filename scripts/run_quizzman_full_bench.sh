@@ -79,7 +79,7 @@ OLT_OUT="/tmp/qm_pg_oltp_${STAMP}.json"
 if python3 scripts/compare_postgres_native_sql.py \
   --qm-mode persistent-wal \
   --qm-sync-policy group-commit-sync \
-  --iterations 500 \
+  --iterations 200 \
   --output "$OLT_OUT" 2>&1; then
   summarize_json "$OLT_OUT" "PostgreSQL OLTP"
 else
