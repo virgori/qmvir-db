@@ -333,6 +333,14 @@ def _engine_sync_count(engine: Any) -> int:
     return 0
 
 
+def _qm_execute_batch(engine: Any, sqls: list[str]) -> None:
+    if hasattr(engine, "execute_batch"):
+        engine.execute_batch(sqls)
+        return
+    for sql in sqls:
+        engine.execute(sql)
+
+
 def durability_sanity_checks(qm_engine: Any, data_dir: Path) -> dict[str, Any]:
     def reopen() -> Any:
         return qm_engine.NativeSqlEngine(str(data_dir))
@@ -515,12 +523,15 @@ def run_qm(
     def transaction_batch_insert_commit(batch_size: int) -> Callable[[], None]:
         def run() -> None:
             nonlocal batch_id
-            engine.execute("BEGIN")
+            stmts: list[str] = []
             for _ in range(batch_size):
                 batch_id += 1
-                engine.execute(
+                stmts.append(
                     f"INSERT INTO cmp (id, v, score, name, category) VALUES ({batch_id}, {batch_id % 17}, {batch_id % 101}, 'batch{batch_id}', 'batch')"
                 )
+            engine.execute("BEGIN")
+            _qm_execute_batch(engine, stmts)
+            for _ in range(batch_size):
                 sync.after_transaction_mutation(engine)
             engine.execute("COMMIT")
             sync.after_transaction_commit(engine)
@@ -537,18 +548,23 @@ def run_qm(
 
     def transaction_mixed_dml_100_commit() -> None:
         nonlocal batch_id
-        engine.execute("BEGIN")
+        insert_stmts: list[str] = []
         for _ in range(40):
             batch_id += 1
-            engine.execute(
+            insert_stmts.append(
                 f"INSERT INTO cmp (id, v, score, name, category) VALUES ({batch_id}, {batch_id % 17}, {batch_id % 101}, 'mixed{batch_id}', 'mixed')"
             )
+        update_stmts = [f"UPDATE cmp SET v = v + 1 WHERE id = {row_id}" for row_id in range(1, 41)]
+        engine.execute("BEGIN")
+        _qm_execute_batch(engine, insert_stmts)
+        for _ in range(40):
             sync.after_transaction_mutation(engine)
-        for row_id in range(1, 41):
-            engine.execute(f"UPDATE cmp SET v = v + 1 WHERE id = {row_id}")
+        _qm_execute_batch(engine, update_stmts)
+        for _ in range(40):
             sync.after_transaction_mutation(engine)
-        for row_id in range(41, 61):
-            engine.execute(f"DELETE FROM cmp WHERE id = {row_id}")
+        delete_stmts = [f"DELETE FROM cmp WHERE id = {row_id}" for row_id in range(41, 61)]
+        _qm_execute_batch(engine, delete_stmts)
+        for _ in range(20):
             sync.after_transaction_mutation(engine)
         engine.execute("COMMIT")
         sync.after_transaction_commit(engine)
@@ -562,9 +578,10 @@ def run_qm(
     )
 
     def transaction_rollback_100() -> None:
+        update_stmts = [f"UPDATE cmp SET v = v + 1 WHERE id = {row_id}" for row_id in range(1, 101)]
         engine.execute("BEGIN")
-        for row_id in range(1, 101):
-            engine.execute(f"UPDATE cmp SET v = v + 1 WHERE id = {row_id}")
+        _qm_execute_batch(engine, update_stmts)
+        for _ in range(100):
             sync.after_transaction_mutation(engine)
         engine.execute("ROLLBACK")
 
@@ -709,12 +726,16 @@ def run_pg(dsn: str, iterations: int, durability_mode: str) -> tuple[dict[str, d
     def transaction_batch_insert_commit(batch_size: int) -> Callable[[], None]:
         def run() -> None:
             nonlocal batch_id
+            rows: list[tuple[Any, ...]] = []
             for _ in range(batch_size):
                 batch_id += 1
-                cur.execute(
-                    "INSERT INTO qm_cmp (id, v, score, name, category) VALUES (%s, %s, %s, %s, %s)",
-                    (batch_id, batch_id % 17, batch_id % 101, f"batch{batch_id}", "batch"),
+                rows.append(
+                    (batch_id, batch_id % 17, batch_id % 101, f"batch{batch_id}", "batch")
                 )
+            cur.executemany(
+                "INSERT INTO qm_cmp (id, v, score, name, category) VALUES (%s, %s, %s, %s, %s)",
+                rows,
+            )
             conn.commit()
         return run
 
@@ -729,14 +750,20 @@ def run_pg(dsn: str, iterations: int, durability_mode: str) -> tuple[dict[str, d
 
     def transaction_mixed_dml_100_commit() -> None:
         nonlocal batch_id
+        insert_rows: list[tuple[Any, ...]] = []
         for _ in range(40):
             batch_id += 1
-            cur.execute(
-                "INSERT INTO qm_cmp (id, v, score, name, category) VALUES (%s, %s, %s, %s, %s)",
-                (batch_id, batch_id % 17, batch_id % 101, f"mixed{batch_id}", "mixed"),
+            insert_rows.append(
+                (batch_id, batch_id % 17, batch_id % 101, f"mixed{batch_id}", "mixed")
             )
-        for row_id in range(1, 41):
-            cur.execute("UPDATE qm_cmp SET v = v + 1 WHERE id = %s", (row_id,))
+        cur.executemany(
+            "INSERT INTO qm_cmp (id, v, score, name, category) VALUES (%s, %s, %s, %s, %s)",
+            insert_rows,
+        )
+        cur.executemany(
+            "UPDATE qm_cmp SET v = v + 1 WHERE id = %s",
+            [(row_id,) for row_id in range(1, 41)],
+        )
         for row_id in range(41, 61):
             cur.execute("DELETE FROM qm_cmp WHERE id = %s", (row_id,))
         conn.commit()
@@ -750,8 +777,10 @@ def run_pg(dsn: str, iterations: int, durability_mode: str) -> tuple[dict[str, d
     )
 
     def transaction_rollback_100() -> None:
-        for row_id in range(1, 101):
-            cur.execute("UPDATE qm_cmp SET v = v + 1 WHERE id = %s", (row_id,))
+        cur.executemany(
+            "UPDATE qm_cmp SET v = v + 1 WHERE id = %s",
+            [(row_id,) for row_id in range(1, 101)],
+        )
         conn.rollback()
 
     results.append(

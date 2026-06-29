@@ -2362,7 +2362,7 @@ pub struct ColumnConstraint {
     pub check_exprs: Vec<String>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct NativeTable {
     pub columns: Vec<String>,
     /// Per-column declared type (same order as `columns`).
@@ -2392,6 +2392,16 @@ struct TransactionState {
     row_undo: HashMap<String, HashMap<i64, Option<NativeRow>>>,
     /// Row ids inserted in this txn (rollback removes without per-row undo map).
     inserted_rows: HashMap<String, Vec<i64>>,
+    /// B+Tree index row ids to apply at COMMIT (insert-only fast path in explicit txn).
+    deferred_index_inserts: HashMap<String, Vec<i64>>,
+    /// Old row snapshots for btree delete before re-insert at COMMIT (UPDATE in txn).
+    deferred_index_replacements: HashMap<String, Vec<(i64, NativeRow)>>,
+    /// Old row snapshots for btree delete at COMMIT (DELETE in txn).
+    deferred_index_deletes: HashMap<String, Vec<(i64, NativeRow)>>,
+    /// When true, btree/inverted side indexes are flushed at COMMIT/ROLLBACK without per-row work.
+    defer_btree_indexes: bool,
+    /// Skip per-statement WAL staging; materialize batched INSERT WAL at COMMIT.
+    compact_wal_on_commit: bool,
     tombstone_snapshot: Option<Vec<(String, i64, u64)>>,
     index_snapshot: Option<IndexManagerSnapshot>,
     inverted_snapshot: Option<InvertedCatalogSnapshot>,
@@ -2401,6 +2411,32 @@ struct TransactionState {
     mvcc_tx_id: TxId,
     dirty: bool,
     wal_sql: Vec<String>,
+    /// Cached once per txn: does the hot table have btree indexes?
+    cached_has_btree: Option<bool>,
+    /// Cached INSERT column list for repeated single-row inserts in this txn.
+    cached_insert: Option<(String, Vec<String>)>,
+    /// When set, batched INSERT WAL cannot be reordered to commit time.
+    txn_has_non_insert_mutations: bool,
+    /// Rows already copied from `inserted_rows` into `wal_sql` for interleaved txns.
+    insert_wal_staged: HashMap<String, usize>,
+}
+
+struct ParsedTxnInsert {
+    table: String,
+    id: i64,
+    row: NativeRow,
+}
+
+struct ParsedTxnUpdate {
+    table: String,
+    col: String,
+    delta: i64,
+    row_id: i64,
+}
+
+struct ParsedTxnDelete {
+    table: String,
+    row_id: i64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2646,7 +2682,6 @@ struct WalTraceCounters {
     sync_calls: AtomicU64,
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Default)]
 struct NativeSqlProfileCounters {
     parse_ns: AtomicU64,
@@ -2682,6 +2717,40 @@ struct NativeSqlProfileCounters {
     row_undo_count: AtomicU64,
     wal_record_count: AtomicU64,
     tx_sync_count: AtomicU64,
+    /// COMMIT path breakdown (enabled via QMVIR_COMMIT_PROFILE=1).
+    commit_prepare_ns: AtomicU64,
+    commit_publish_ns: AtomicU64,
+    commit_dirty_mark_ns: AtomicU64,
+    commit_wal_batch_ns: AtomicU64,
+    commit_wal_sync_ns: AtomicU64,
+    commit_archive_ns: AtomicU64,
+    commit_vacuum_ns: AtomicU64,
+    commit_checkpoint_ns: AtomicU64,
+    columnize_clone_ns: AtomicU64,
+    columnize_sync_native_ns: AtomicU64,
+    columnize_write_ns: AtomicU64,
+    columnize_collect_ns: AtomicU64,
+    columnize_sort_ns: AtomicU64,
+    columnize_extract_ns: AtomicU64,
+    columnize_write_segments_ns: AtomicU64,
+    rollback_rebuild_ns: AtomicU64,
+    rollback_undo_ns: AtomicU64,
+    /// TXN path breakdown (QMVIR_TXN_PROFILE=1 or QMVIR_COMMIT_PROFILE=1).
+    txn_record_change_ns: AtomicU64,
+    rollback_snapshot_restore_ns: AtomicU64,
+    rollback_revert_rows_ns: AtomicU64,
+    rollback_revert_indexes_ns: AtomicU64,
+    rollback_mvcc_abort_ns: AtomicU64,
+    commit_publish_mvcc_ns: AtomicU64,
+    commit_deferred_index_ns: AtomicU64,
+    /// Granular record_change breakdown (QMVIR_TXN_PROFILE=1).
+    txn_record_clone_row_ns: AtomicU64,
+    txn_record_undo_push_ns: AtomicU64,
+    txn_record_tombstone_snap_ns: AtomicU64,
+    txn_record_index_snap_ns: AtomicU64,
+    txn_record_deferred_push_ns: AtomicU64,
+    txn_record_heap_mutate_ns: AtomicU64,
+    txn_record_tx_lock_ns: AtomicU64,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -3843,6 +3912,13 @@ impl PyNativeSqlEngine {
         Ok((columns, rows, result.command_tag))
     }
 
+    pub fn execute_batch(&self, py: Python<'_>, sqls: Vec<String>) -> PyResult<String> {
+        let refs: Vec<&str> = sqls.iter().map(String::as_str).collect();
+        py.allow_threads(|| self.inner.execute_batch(&refs))
+            .map_err(pyo3::exceptions::PyRuntimeError::new_err)?;
+        Ok("OK".to_string())
+    }
+
     #[pyo3(signature = (table, column, query, top_k, ef_search))]
     pub fn bench_hnsw_knn_l2(
         &self,
@@ -4065,6 +4141,10 @@ impl PyNativeSqlEngine {
             let profile = &self.inner.native_profile;
             let dict = pyo3::types::PyDict::new_bound(py);
             dict.set_item("enabled", NativeSqlEngine::native_profile_enabled())?;
+            dict.set_item(
+                "commit_profile_enabled",
+                NativeSqlEngine::commit_profile_enabled(),
+            )?;
             dict.set_item("parse_ns", profile.parse_ns.load(Ordering::Relaxed))?;
             dict.set_item("plan_ns", 0u64)?;
             dict.set_item("execute_ns", profile.execute_ns.load(Ordering::Relaxed))?;
@@ -4161,6 +4241,134 @@ impl PyNativeSqlEngine {
             dict.set_item(
                 "tx_sync_count",
                 profile.tx_sync_count.load(Ordering::Relaxed),
+            )?;
+            dict.set_item(
+                "commit_prepare_ns",
+                profile.commit_prepare_ns.load(Ordering::Relaxed),
+            )?;
+            dict.set_item(
+                "commit_publish_ns",
+                profile.commit_publish_ns.load(Ordering::Relaxed),
+            )?;
+            dict.set_item(
+                "commit_dirty_mark_ns",
+                profile.commit_dirty_mark_ns.load(Ordering::Relaxed),
+            )?;
+            dict.set_item(
+                "commit_wal_batch_ns",
+                profile.commit_wal_batch_ns.load(Ordering::Relaxed),
+            )?;
+            dict.set_item(
+                "commit_wal_sync_ns",
+                profile.commit_wal_sync_ns.load(Ordering::Relaxed),
+            )?;
+            dict.set_item(
+                "commit_archive_ns",
+                profile.commit_archive_ns.load(Ordering::Relaxed),
+            )?;
+            dict.set_item(
+                "commit_vacuum_ns",
+                profile.commit_vacuum_ns.load(Ordering::Relaxed),
+            )?;
+            dict.set_item(
+                "commit_checkpoint_ns",
+                profile.commit_checkpoint_ns.load(Ordering::Relaxed),
+            )?;
+            dict.set_item(
+                "columnize_clone_ns",
+                profile.columnize_clone_ns.load(Ordering::Relaxed),
+            )?;
+            dict.set_item(
+                "columnize_sync_native_ns",
+                profile.columnize_sync_native_ns.load(Ordering::Relaxed),
+            )?;
+            dict.set_item(
+                "columnize_write_ns",
+                profile.columnize_write_ns.load(Ordering::Relaxed),
+            )?;
+            dict.set_item(
+                "columnize_collect_ns",
+                profile.columnize_collect_ns.load(Ordering::Relaxed),
+            )?;
+            dict.set_item(
+                "columnize_sort_ns",
+                profile.columnize_sort_ns.load(Ordering::Relaxed),
+            )?;
+            dict.set_item(
+                "columnize_extract_ns",
+                profile.columnize_extract_ns.load(Ordering::Relaxed),
+            )?;
+            dict.set_item(
+                "columnize_write_segments_ns",
+                profile.columnize_write_segments_ns.load(Ordering::Relaxed),
+            )?;
+            dict.set_item(
+                "rollback_rebuild_ns",
+                profile.rollback_rebuild_ns.load(Ordering::Relaxed),
+            )?;
+            dict.set_item(
+                "rollback_undo_ns",
+                profile.rollback_undo_ns.load(Ordering::Relaxed),
+            )?;
+            dict.set_item(
+                "txn_profile_enabled",
+                NativeSqlEngine::txn_profile_enabled(),
+            )?;
+            dict.set_item(
+                "txn_record_change_ns",
+                profile.txn_record_change_ns.load(Ordering::Relaxed),
+            )?;
+            dict.set_item(
+                "rollback_snapshot_restore_ns",
+                profile.rollback_snapshot_restore_ns.load(Ordering::Relaxed),
+            )?;
+            dict.set_item(
+                "rollback_revert_rows_ns",
+                profile.rollback_revert_rows_ns.load(Ordering::Relaxed),
+            )?;
+            dict.set_item(
+                "rollback_revert_indexes_ns",
+                profile.rollback_revert_indexes_ns.load(Ordering::Relaxed),
+            )?;
+            dict.set_item(
+                "rollback_mvcc_abort_ns",
+                profile.rollback_mvcc_abort_ns.load(Ordering::Relaxed),
+            )?;
+            dict.set_item(
+                "commit_publish_mvcc_ns",
+                profile.commit_publish_mvcc_ns.load(Ordering::Relaxed),
+            )?;
+            dict.set_item(
+                "commit_deferred_index_ns",
+                profile.commit_deferred_index_ns.load(Ordering::Relaxed),
+            )?;
+            dict.set_item(
+                "txn_record_clone_row_ns",
+                profile.txn_record_clone_row_ns.load(Ordering::Relaxed),
+            )?;
+            dict.set_item(
+                "txn_record_undo_push_ns",
+                profile.txn_record_undo_push_ns.load(Ordering::Relaxed),
+            )?;
+            dict.set_item(
+                "txn_record_tombstone_snap_ns",
+                profile.txn_record_tombstone_snap_ns.load(Ordering::Relaxed),
+            )?;
+            dict.set_item(
+                "txn_record_index_snap_ns",
+                profile.txn_record_index_snap_ns.load(Ordering::Relaxed),
+            )?;
+            dict.set_item(
+                "txn_record_deferred_push_ns",
+                profile.txn_record_deferred_push_ns.load(Ordering::Relaxed),
+            )?;
+            dict.set_item(
+                "txn_record_heap_mutate_ns",
+                profile.txn_record_heap_mutate_ns.load(Ordering::Relaxed),
+            )?;
+            dict.set_item(
+                "txn_record_tx_lock_ns",
+                profile.txn_record_tx_lock_ns.load(Ordering::Relaxed),
             )?;
             Ok(dict.into())
         })
@@ -4905,22 +5113,6 @@ impl NativeSqlEngine {
         self.tables.row_count(table).unwrap_or(0)
     }
 
-    /// Fast OLTP commit: MVCC vacuum (throttled) + cached WAL archive append.
-    fn htap_publish_commit(&self, commit_ts: u64) {
-        let wal_path = self
-            .data_dir
-            .as_ref()
-            .map(|d| d.join("native_sql.wal"))
-            .unwrap_or_default();
-        let wal_bytes = self.wal_file_bytes.load(Ordering::Relaxed);
-        self.htap.after_commit(
-            commit_ts,
-            &wal_path,
-            wal_bytes,
-            self.htap.tx_mgr.oldest_active_snapshot(),
-        );
-    }
-
     fn htap_needs_column_refresh(&self, table: &str) -> bool {
         if self.data_dir.is_none() {
             return false;
@@ -4943,27 +5135,89 @@ impl NativeSqlEngine {
         if self.data_dir.is_none() {
             return;
         }
+        let profile = Self::commit_profile_enabled();
         let Ok(shared) = self.tables.lock_table_read(table) else {
             return;
         };
-        let mut native = shared.read().clone();
-        self.htap.mvcc.sync_native_table(
-            &self.htap.tx_mgr,
-            self.session_id,
-            table,
-            &mut native,
-        );
-        let _ = self.htap.columnizer.columnize_table(
-            &self.htap.column_segments,
-            table,
-            &native,
-            commit_ts,
-        );
+        let clone_start = profile.then(Instant::now);
+        let mut native = if Self::htap_skip_native_clone() {
+            NativeTable::default()
+        } else {
+            shared.read().clone()
+        };
+        if let Some(start) = clone_start {
+            Self::profile_ns(&self.native_profile.columnize_clone_ns, start.elapsed());
+        }
+        if !Self::htap_skip_sync_native() {
+            let sync_start = profile.then(Instant::now);
+            self.htap.mvcc.sync_native_table(
+                &self.htap.tx_mgr,
+                self.session_id,
+                table,
+                &mut native,
+            );
+            if let Some(start) = sync_start {
+                Self::profile_ns(&self.native_profile.columnize_sync_native_ns, start.elapsed());
+            }
+        }
+        if !Self::htap_skip_columnize() {
+            let col_start = profile.then(Instant::now);
+            let phase_profile = profile.then(|| crate::htap::columnizer::ColumnizePhaseProfile {
+                collect_rows_ns: &self.native_profile.columnize_collect_ns,
+                sort_rows_ns: &self.native_profile.columnize_sort_ns,
+                extract_columns_ns: &self.native_profile.columnize_extract_ns,
+                write_segments_ns: &self.native_profile.columnize_write_segments_ns,
+            });
+            let _ = self.htap.columnizer.columnize_table(
+                &self.htap.column_segments,
+                table,
+                &native,
+                commit_ts,
+                phase_profile.as_ref(),
+            );
+            if let Some(start) = col_start {
+                Self::profile_ns(&self.native_profile.columnize_write_ns, start.elapsed());
+            }
+        }
         drop(shared);
-        if let Ok(shared) = self.tables.lock_table_write(table) {
-            *shared.write() = native;
+        if !Self::htap_skip_native_clone() {
+            if let Ok(shared) = self.tables.lock_table_write(table) {
+                *shared.write() = native;
+            }
         }
         self.htap.clear_column_dirty(table);
+    }
+
+    fn htap_publish_commit(&self, commit_ts: u64) {
+        let profile = Self::commit_profile_enabled();
+        let publish_start = profile.then(Instant::now);
+        let wal_path = self
+            .data_dir
+            .as_ref()
+            .map(|d| d.join("native_sql.wal"))
+            .unwrap_or_default();
+        let wal_bytes = self.wal_file_bytes.load(Ordering::Relaxed);
+        self.htap.after_commit_profiled(
+            commit_ts,
+            &wal_path,
+            wal_bytes,
+            self.htap.tx_mgr.oldest_active_snapshot(),
+            if profile {
+                Some(&self.native_profile.commit_archive_ns)
+            } else {
+                None
+            },
+            if profile {
+                Some(&self.native_profile.commit_vacuum_ns)
+            } else {
+                None
+            },
+            Self::htap_skip_wal_archive(),
+            Self::htap_skip_vacuum(),
+        );
+        if let Some(start) = publish_start {
+            Self::profile_ns(&self.native_profile.commit_publish_ns, start.elapsed());
+        }
     }
 
     pub fn new() -> Self {
@@ -5148,6 +5402,211 @@ impl NativeSqlEngine {
         std::env::var_os("QMVIR_NATIVE_SQL_PROFILE").is_some()
     }
 
+    fn commit_profile_enabled() -> bool {
+        std::env::var_os("QMVIR_COMMIT_PROFILE").is_some()
+    }
+
+    fn txn_profile_enabled() -> bool {
+        std::env::var_os("QMVIR_TXN_PROFILE").is_some()
+            || Self::commit_profile_enabled()
+    }
+
+    fn txn_skip_publish() -> bool {
+        std::env::var_os("QMVIR_TXN_SKIP_PUBLISH").is_some()
+    }
+
+    fn txn_skip_rollback_undo() -> bool {
+        std::env::var_os("QMVIR_TXN_SKIP_ROLLBACK_UNDO").is_some()
+    }
+
+    fn vector_skip_hnsw_maintain() -> bool {
+        std::env::var_os("QMVIR_VECTOR_SKIP_HNSW_MAINTAIN").is_some()
+    }
+
+    fn htap_skip_columnize() -> bool {
+        std::env::var_os("QMVIR_HTAP_SKIP_COLUMNIZE").is_some()
+    }
+
+    fn htap_skip_sync_native() -> bool {
+        std::env::var_os("QMVIR_HTAP_SKIP_SYNC_NATIVE").is_some()
+    }
+
+    fn htap_skip_native_clone() -> bool {
+        std::env::var_os("QMVIR_HTAP_SKIP_NATIVE_CLONE").is_some()
+    }
+
+    fn htap_skip_wal_archive() -> bool {
+        std::env::var_os("QMVIR_HTAP_SKIP_WAL_ARCHIVE").is_some()
+    }
+
+    fn htap_skip_vacuum() -> bool {
+        std::env::var_os("QMVIR_HTAP_SKIP_VACUUM").is_some()
+    }
+
+    fn log_commit_profile(&self) {
+        if !Self::commit_profile_enabled() {
+            return;
+        }
+        let p = &self.native_profile;
+        eprintln!(
+            "COMMIT PROFILE (us)\n\
+             prepare={}\n\
+             publish={}\n\
+             dirty_mark={}\n\
+             wal_batch={}\n\
+             wal_sync={}\n\
+             archive={}\n\
+             vacuum={}\n\
+             checkpoint={}\n\
+             columnize_clone={}\n\
+             columnize_sync={}\n\
+             columnize_write={}\n\
+             columnize_collect={}\n\
+             columnize_sort={}\n\
+             columnize_extract={}\n\
+             columnize_write_segments={}",
+            p.commit_prepare_ns.load(Ordering::Relaxed) / 1000,
+            p.commit_publish_ns.load(Ordering::Relaxed) / 1000,
+            p.commit_dirty_mark_ns.load(Ordering::Relaxed) / 1000,
+            p.commit_wal_batch_ns.load(Ordering::Relaxed) / 1000,
+            p.commit_wal_sync_ns.load(Ordering::Relaxed) / 1000,
+            p.commit_archive_ns.load(Ordering::Relaxed) / 1000,
+            p.commit_vacuum_ns.load(Ordering::Relaxed) / 1000,
+            p.commit_checkpoint_ns.load(Ordering::Relaxed) / 1000,
+            p.columnize_clone_ns.load(Ordering::Relaxed) / 1000,
+            p.columnize_sync_native_ns.load(Ordering::Relaxed) / 1000,
+            p.columnize_write_ns.load(Ordering::Relaxed) / 1000,
+            p.columnize_collect_ns.load(Ordering::Relaxed) / 1000,
+            p.columnize_sort_ns.load(Ordering::Relaxed) / 1000,
+            p.columnize_extract_ns.load(Ordering::Relaxed) / 1000,
+            p.columnize_write_segments_ns.load(Ordering::Relaxed) / 1000,
+        );
+    }
+
+    fn log_rollback_profile(&self) {
+        if !Self::txn_profile_enabled() {
+            return;
+        }
+        let p = &self.native_profile;
+        eprintln!(
+            "ROLLBACK PROFILE (us)\n\
+             snapshot_restore={}\n\
+             revert_rows={}\n\
+             revert_indexes={}\n\
+             mvcc_abort={}\n\
+             undo_total={}\n\
+             rebuild={}",
+            p.rollback_snapshot_restore_ns.load(Ordering::Relaxed) / 1000,
+            p.rollback_revert_rows_ns.load(Ordering::Relaxed) / 1000,
+            p.rollback_revert_indexes_ns.load(Ordering::Relaxed) / 1000,
+            p.rollback_mvcc_abort_ns.load(Ordering::Relaxed) / 1000,
+            p.rollback_undo_ns.load(Ordering::Relaxed) / 1000,
+            p.rollback_rebuild_ns.load(Ordering::Relaxed) / 1000,
+        );
+    }
+
+    fn log_txn_profile(&self) {
+        if !Self::txn_profile_enabled() {
+            return;
+        }
+        let p = &self.native_profile;
+        let rc_clone = p.txn_record_clone_row_ns.load(Ordering::Relaxed);
+        let rc_undo = p.txn_record_undo_push_ns.load(Ordering::Relaxed);
+        let rc_tomb = p.txn_record_tombstone_snap_ns.load(Ordering::Relaxed);
+        let rc_idx = p.txn_record_index_snap_ns.load(Ordering::Relaxed);
+        let rc_def = p.txn_record_deferred_push_ns.load(Ordering::Relaxed);
+        let rc_heap = p.txn_record_heap_mutate_ns.load(Ordering::Relaxed);
+        let rc_lock = p.txn_record_tx_lock_ns.load(Ordering::Relaxed);
+        let rc_total = rc_clone + rc_undo + rc_tomb + rc_idx + rc_def + rc_heap + rc_lock;
+        let pct = |part: u64| {
+            if rc_total == 0 {
+                0u64
+            } else {
+                (part * 100) / rc_total
+            }
+        };
+        eprintln!(
+            "TXN PROFILE record_change (us, total={})\n\
+             clone_row={} ({}%)\n\
+             undo_push={} ({}%)\n\
+             tombstone_snap={} ({}%)\n\
+             index_snap={} ({}%)\n\
+             deferred_push={} ({}%)\n\
+             heap_mutate={} ({}%)\n\
+             tx_lock={} ({}%)",
+            rc_total / 1000,
+            rc_clone / 1000,
+            pct(rc_clone),
+            rc_undo / 1000,
+            pct(rc_undo),
+            rc_tomb / 1000,
+            pct(rc_tomb),
+            rc_idx / 1000,
+            pct(rc_idx),
+            rc_def / 1000,
+            pct(rc_def),
+            rc_heap / 1000,
+            pct(rc_heap),
+            rc_lock / 1000,
+            pct(rc_lock),
+        );
+        let commit_total = p.tx_commit_ns.load(Ordering::Relaxed);
+        let publish = p.commit_publish_mvcc_ns.load(Ordering::Relaxed);
+        let index_flush = p.commit_deferred_index_ns.load(Ordering::Relaxed);
+        let wal_batch = p.commit_wal_batch_ns.load(Ordering::Relaxed);
+        let wal_sync = p.commit_wal_sync_ns.load(Ordering::Relaxed);
+        let wal = wal_batch + wal_sync;
+        let prepare = p.commit_prepare_ns.load(Ordering::Relaxed);
+        let dirty = p.commit_dirty_mark_ns.load(Ordering::Relaxed);
+        let other = commit_total.saturating_sub(publish + index_flush + wal + prepare + dirty);
+        let cp_total = if commit_total > 0 {
+            commit_total
+        } else {
+            publish + index_flush + wal + prepare + dirty + other
+        };
+        let cpct = |part: u64| {
+            if cp_total == 0 {
+                0u64
+            } else {
+                (part * 100) / cp_total
+            }
+        };
+        eprintln!(
+            "TXN PROFILE commit (us, total={})\n\
+             publish={} ({}%)\n\
+             index_flush={} ({}%)\n\
+             wal={} ({}%)\n\
+             prepare={} ({}%)\n\
+             dirty_mark={} ({}%)\n\
+             other={} ({}%)\n\
+             rollback_total={}",
+            cp_total / 1000,
+            publish / 1000,
+            cpct(publish),
+            index_flush / 1000,
+            cpct(index_flush),
+            wal / 1000,
+            cpct(wal),
+            prepare / 1000,
+            cpct(prepare),
+            dirty / 1000,
+            cpct(dirty),
+            other / 1000,
+            cpct(other),
+            p.tx_rollback_ns.load(Ordering::Relaxed) / 1000,
+        );
+    }
+
+    fn profile_txn_row_clone(&self, row: &NativeRow) -> NativeRow {
+        let start = Self::txn_profile_enabled().then(Instant::now);
+        let cloned = row.clone();
+        if let Some(s) = start {
+            Self::profile_ns(&self.native_profile.txn_record_clone_row_ns, s.elapsed());
+            Self::profile_ns(&self.native_profile.row_clone_ns, s.elapsed());
+        }
+        cloned
+    }
+
     fn profile_ns(counter: &AtomicU64, elapsed: std::time::Duration) {
         counter.fetch_add(
             elapsed.as_nanos().min(u128::from(u64::MAX)) as u64,
@@ -5224,7 +5683,6 @@ impl NativeSqlEngine {
         Ok(())
     }
 
-    #[allow(dead_code)]
     fn reset_profile_snapshot(&self) {
         let profile = &self.native_profile;
         profile.parse_ns.store(0, Ordering::Relaxed);
@@ -5260,6 +5718,37 @@ impl NativeSqlEngine {
         profile.row_undo_count.store(0, Ordering::Relaxed);
         profile.wal_record_count.store(0, Ordering::Relaxed);
         profile.tx_sync_count.store(0, Ordering::Relaxed);
+        profile.commit_prepare_ns.store(0, Ordering::Relaxed);
+        profile.commit_publish_ns.store(0, Ordering::Relaxed);
+        profile.commit_dirty_mark_ns.store(0, Ordering::Relaxed);
+        profile.commit_wal_batch_ns.store(0, Ordering::Relaxed);
+        profile.commit_wal_sync_ns.store(0, Ordering::Relaxed);
+        profile.commit_archive_ns.store(0, Ordering::Relaxed);
+        profile.commit_vacuum_ns.store(0, Ordering::Relaxed);
+        profile.commit_checkpoint_ns.store(0, Ordering::Relaxed);
+        profile.columnize_clone_ns.store(0, Ordering::Relaxed);
+        profile.columnize_sync_native_ns.store(0, Ordering::Relaxed);
+        profile.columnize_write_ns.store(0, Ordering::Relaxed);
+        profile.columnize_collect_ns.store(0, Ordering::Relaxed);
+        profile.columnize_sort_ns.store(0, Ordering::Relaxed);
+        profile.columnize_extract_ns.store(0, Ordering::Relaxed);
+        profile.columnize_write_segments_ns.store(0, Ordering::Relaxed);
+        profile.rollback_rebuild_ns.store(0, Ordering::Relaxed);
+        profile.rollback_undo_ns.store(0, Ordering::Relaxed);
+        profile.txn_record_change_ns.store(0, Ordering::Relaxed);
+        profile.rollback_snapshot_restore_ns.store(0, Ordering::Relaxed);
+        profile.rollback_revert_rows_ns.store(0, Ordering::Relaxed);
+        profile.rollback_revert_indexes_ns.store(0, Ordering::Relaxed);
+        profile.rollback_mvcc_abort_ns.store(0, Ordering::Relaxed);
+        profile.commit_publish_mvcc_ns.store(0, Ordering::Relaxed);
+        profile.commit_deferred_index_ns.store(0, Ordering::Relaxed);
+        profile.txn_record_clone_row_ns.store(0, Ordering::Relaxed);
+        profile.txn_record_undo_push_ns.store(0, Ordering::Relaxed);
+        profile.txn_record_tombstone_snap_ns.store(0, Ordering::Relaxed);
+        profile.txn_record_index_snap_ns.store(0, Ordering::Relaxed);
+        profile.txn_record_deferred_push_ns.store(0, Ordering::Relaxed);
+        profile.txn_record_heap_mutate_ns.store(0, Ordering::Relaxed);
+        profile.txn_record_tx_lock_ns.store(0, Ordering::Relaxed);
     }
 
     pub fn new_session(&self) -> Self {
@@ -5859,9 +6348,10 @@ impl NativeSqlEngine {
                 Ok(q)
             }
             Err(e) => {
+                let touched = self.htap.tx_mgr.touched_tables_for(tx_id);
                 self.htap.mvcc.abort_transaction(tx_id);
                 let _ = self.htap.tx_mgr.abort_transaction(tx_id);
-                for name in self.tables.table_names() {
+                for name in touched {
                     if let Ok(shared) = self.tables.lock_table_read(&name) {
                         self.htap.mvcc.rebuild_table(&name, &shared.read());
                     }
@@ -5907,6 +6397,11 @@ impl NativeSqlEngine {
             tables_snapshot: None,
             row_undo: HashMap::new(),
             inserted_rows: HashMap::new(),
+            deferred_index_inserts: HashMap::new(),
+            deferred_index_replacements: HashMap::new(),
+            deferred_index_deletes: HashMap::new(),
+            defer_btree_indexes: false,
+            compact_wal_on_commit: false,
             tombstone_snapshot: None,
             index_snapshot: None,
             inverted_snapshot: None,
@@ -5915,12 +6410,54 @@ impl NativeSqlEngine {
             vector_hnsw_snapshot: None,
             mvcc_tx_id,
             dirty: false,
-            wal_sql: Vec::with_capacity(256),
+            wal_sql: Vec::with_capacity(2048),
+            cached_has_btree: None,
+            cached_insert: None,
+            txn_has_non_insert_mutations: false,
+            insert_wal_staged: HashMap::new(),
         });
         if let Some(start) = profile_start {
             Self::profile_ns(&self.native_profile.tx_begin_ns, start.elapsed());
         }
         Ok(Self::empty_ok("BEGIN"))
+    }
+
+    fn record_deferred_index_replacement(
+        &self,
+        table: &str,
+        row_id: i64,
+        old_row: NativeRow,
+    ) -> Result<(), String> {
+        let mut tx = self.transaction.write();
+        let Some(state) = tx.as_mut() else {
+            return Ok(());
+        };
+        state.defer_btree_indexes = true;
+        state
+            .deferred_index_replacements
+            .entry(table.to_string())
+            .or_default()
+            .push((row_id, old_row));
+        Ok(())
+    }
+
+    fn record_deferred_index_delete(
+        &self,
+        table: &str,
+        row_id: i64,
+        old_row: NativeRow,
+    ) -> Result<(), String> {
+        let mut tx = self.transaction.write();
+        let Some(state) = tx.as_mut() else {
+            return Ok(());
+        };
+        state.defer_btree_indexes = true;
+        state
+            .deferred_index_deletes
+            .entry(table.to_string())
+            .or_default()
+            .push((row_id, old_row));
+        Ok(())
     }
 
     fn record_transaction_insert_undo(&self, table: &str, row_id: i64) -> Result<(), String> {
@@ -5937,13 +6474,241 @@ impl NativeSqlEngine {
         Ok(())
     }
 
+    fn txn_should_defer_btree(&self) -> bool {
+        self.transaction
+            .read()
+            .as_ref()
+            .is_some_and(|state| state.defer_btree_indexes)
+    }
+
+    fn enable_txn_defer_btree(&self) {
+        if let Some(state) = self.transaction.write().as_mut() {
+            state.defer_btree_indexes = true;
+        }
+    }
+
+    fn txn_cached_has_btree(&self, table: &str) -> bool {
+        if let Some(tx) = self.transaction.read().as_ref() {
+            if let Some(has) = tx.cached_has_btree {
+                return has;
+            }
+        }
+        let has = !self.table_btree_indexes(table).is_empty();
+        if let Some(state) = self.transaction.write().as_mut() {
+            state.cached_has_btree = Some(has);
+            if has {
+                state.defer_btree_indexes = true;
+                state.compact_wal_on_commit = true;
+            }
+        }
+        has
+    }
+
+    fn sql_prefix_ci(s: &str, prefix: &str) -> bool {
+        s.as_bytes()
+            .get(..prefix.len())
+            .is_some_and(|head| head.eq_ignore_ascii_case(prefix.as_bytes()))
+    }
+
+    fn sql_contains_ci(s: &str, needle: &str) -> bool {
+        let up = s.as_bytes();
+        let n = needle.as_bytes();
+        if n.is_empty() || up.len() < n.len() {
+            return false;
+        }
+        up.windows(n.len())
+            .any(|w| w.eq_ignore_ascii_case(n))
+    }
+
+    fn find_ascii_ci(haystack: &str, needle: &str) -> Option<usize> {
+        let up = haystack.as_bytes();
+        let n = needle.as_bytes();
+        if n.is_empty() {
+            return Some(0);
+        }
+        up.windows(n.len())
+            .position(|w| w.eq_ignore_ascii_case(n))
+    }
+
+    fn btree_flush_insert_ids(
+        &self,
+        native: &NativeTable,
+        row_ids: &[i64],
+        indexes: &[std::sync::Arc<crate::index::BPlusTree>],
+    ) {
+        for tree in indexes {
+            let mut batch: Vec<(IndexKey, i64)> = Vec::with_capacity(row_ids.len());
+            for row_id in row_ids {
+                let Some(row) = native.rows.get(row_id) else {
+                    continue;
+                };
+                for col in &tree.columns {
+                    if let Some(val) = row.cols.get(col) {
+                        if let Some(key) = Self::index_key_for_cell(val) {
+                            batch.push((key, *row_id));
+                        }
+                    }
+                }
+            }
+            batch.sort_by(|a, b| a.0.cmp(&b.0));
+            for (key, row_id) in batch {
+                tree.insert(key, row_id);
+            }
+        }
+    }
+
+    fn btree_apply_row_insert(
+        &self,
+        table: &str,
+        row_id: i64,
+        row: &NativeRow,
+        indexes: &[std::sync::Arc<crate::index::BPlusTree>],
+    ) {
+        for tree in indexes {
+            for col in &tree.columns {
+                if let Some(val) = row.cols.get(col) {
+                    if let Some(idx_key) = Self::index_key_for_cell(val) {
+                        tree.insert(idx_key, row_id);
+                    }
+                }
+            }
+        }
+    }
+
+    fn btree_apply_row_delete(
+        &self,
+        table: &str,
+        row_id: i64,
+        row: &NativeRow,
+        indexes: &[std::sync::Arc<crate::index::BPlusTree>],
+    ) {
+        for tree in indexes {
+            for col in &tree.columns {
+                if let Some(val) = row.cols.get(col) {
+                    if let Some(idx_key) = Self::index_key_for_cell(val) {
+                        tree.delete(&idx_key, row_id);
+                    }
+                }
+            }
+        }
+    }
+
+    fn btree_apply_row_replace(
+        &self,
+        table: &str,
+        row_id: i64,
+        old_row: &NativeRow,
+        new_row: &NativeRow,
+        indexes: &[std::sync::Arc<crate::index::BPlusTree>],
+    ) {
+        self.btree_apply_row_delete(table, row_id, old_row, indexes);
+        self.btree_apply_row_insert(table, row_id, new_row, indexes);
+    }
+
+    fn table_btree_indexes(&self, table: &str) -> Vec<std::sync::Arc<crate::index::BPlusTree>> {
+        let indexes = self.index_mgr.indexes.read();
+        indexes
+            .values()
+            .filter(|tree| tree.table == table)
+            .cloned()
+            .collect()
+    }
+
+    fn log_txn_state_sizes(tx_state: &TransactionState) {
+        if !NativeSqlEngine::txn_profile_enabled() {
+            return;
+        }
+        let undo_rows: usize = tx_state.row_undo.values().map(|m| m.len()).sum();
+        let def_ins: usize = tx_state
+            .deferred_index_inserts
+            .values()
+            .map(|v| v.len())
+            .sum();
+        let def_rep: usize = tx_state
+            .deferred_index_replacements
+            .values()
+            .map(|v| v.len())
+            .sum();
+        let def_del: usize = tx_state
+            .deferred_index_deletes
+            .values()
+            .map(|v| v.len())
+            .sum();
+        let ins_rows: usize = tx_state.inserted_rows.values().map(|v| v.len()).sum();
+        eprintln!(
+            "TXN STATE sizes: undo_rows={undo_rows} inserted={ins_rows} \
+             deferred_ins={def_ins} deferred_rep={def_rep} deferred_del={def_del} \
+             defer_btree={} compact_wal={}",
+            tx_state.defer_btree_indexes,
+            tx_state.compact_wal_on_commit,
+        );
+    }
+
+    fn flush_deferred_txn_indexes(&self, tx_state: &TransactionState) {
+        let profile_start = if Self::txn_profile_enabled() || Self::native_profile_enabled() {
+            Some(Instant::now())
+        } else {
+            None
+        };
+        for (table, row_ids) in &tx_state.deferred_index_inserts {
+            if row_ids.is_empty() {
+                continue;
+            }
+            let indexes = self.table_btree_indexes(table);
+            if indexes.is_empty() {
+                continue;
+            }
+            let _ = self.tables.with_read(table, |native| {
+                self.btree_flush_insert_ids(native, row_ids, &indexes);
+            });
+        }
+        for (table, rows) in &tx_state.deferred_index_replacements {
+            if rows.is_empty() {
+                continue;
+            }
+            let indexes = self.table_btree_indexes(table);
+            if indexes.is_empty() {
+                continue;
+            }
+            let _ = self.tables.with_read(table, |table_ref| {
+                for (row_id, old_row) in rows {
+                    if let Some(new_row) = table_ref.rows.get(row_id) {
+                        self.btree_apply_row_replace(table, *row_id, old_row, new_row, &indexes);
+                    }
+                }
+            });
+        }
+        for (table, rows) in &tx_state.deferred_index_deletes {
+            if rows.is_empty() {
+                continue;
+            }
+            let indexes = self.table_btree_indexes(table);
+            if indexes.is_empty() {
+                continue;
+            }
+            for (row_id, old_row) in rows {
+                self.btree_apply_row_delete(table, *row_id, old_row, &indexes);
+            }
+        }
+        if let Some(start) = profile_start {
+            Self::profile_ns(&self.native_profile.index_update_ns, start.elapsed());
+            if Self::txn_profile_enabled() {
+                Self::profile_ns(&self.native_profile.commit_deferred_index_ns, start.elapsed());
+            }
+        }
+    }
+
+    fn flush_deferred_txn_index_inserts(&self, tx_state: &TransactionState) {
+        self.flush_deferred_txn_indexes(tx_state);
+    }
+
     fn record_transaction_row_undos(
         &self,
         table: &str,
         rows: Vec<(i64, Option<NativeRow>)>,
         snapshot_indexes: bool,
     ) -> Result<(), String> {
-        let profile_start = if Self::native_profile_enabled() {
+        let profile_start = if Self::txn_profile_enabled() || Self::native_profile_enabled() {
             Some(Instant::now())
         } else {
             None
@@ -5953,34 +6718,53 @@ impl NativeSqlEngine {
             return Ok(());
         }
         let needs_tombstone = rows.iter().any(|(_, before)| before.is_some());
+        let lock_start = Self::txn_profile_enabled().then(Instant::now);
         let mut tx = self.transaction.write();
+        if let Some(s) = lock_start {
+            Self::profile_ns(&self.native_profile.txn_record_tx_lock_ns, s.elapsed());
+        }
         let Some(state) = tx.as_mut() else {
             return Ok(());
         };
         if needs_tombstone && state.tombstone_snapshot.is_none() {
+            let snap_start = Self::txn_profile_enabled().then(Instant::now);
             state.tombstone_snapshot = Some(
                 self.tombstone_log
                     .read()
                     .map_err(|_| "tombstone lock poisoned")?
                     .clone(),
             );
+            if let Some(s) = snap_start {
+                Self::profile_ns(&self.native_profile.txn_record_tombstone_snap_ns, s.elapsed());
+            }
         }
         if snapshot_indexes && state.index_snapshot.is_none() {
+            let snap_start = Self::txn_profile_enabled().then(Instant::now);
             state.index_snapshot = Some(self.index_mgr.snapshot());
             state.inverted_snapshot = Some(self.inverted_catalog.snapshot());
             state.json_path_snapshot = Some(self.json_path_catalog.snapshot());
             state.trigram_snapshot = Some(self.trigram_catalog.snapshot());
             state.vector_hnsw_snapshot = Some(self.vector_hnsw_catalog.snapshot());
+            if let Some(s) = snap_start {
+                Self::profile_ns(&self.native_profile.txn_record_index_snap_ns, s.elapsed());
+            }
         }
+        let undo_start = Self::txn_profile_enabled().then(Instant::now);
         let table_undo = state.row_undo.entry(table.to_string()).or_default();
         for (row_id, before) in rows {
             table_undo.entry(row_id).or_insert(before);
         }
         state.dirty = true;
+        if let Some(s) = undo_start {
+            Self::profile_ns(&self.native_profile.txn_record_undo_push_ns, s.elapsed());
+        }
+        drop(tx);
         if let Some(start) = profile_start {
             let elapsed = start.elapsed();
-            Self::profile_ns(&self.native_profile.row_clone_ns, elapsed);
             Self::profile_ns(&self.native_profile.tx_stage_ns, elapsed);
+            if Self::txn_profile_enabled() {
+                Self::profile_ns(&self.native_profile.txn_record_change_ns, elapsed);
+            }
             self.native_profile
                 .row_undo_count
                 .fetch_add(undo_count, Ordering::Relaxed);
@@ -6069,6 +6853,66 @@ impl NativeSqlEngine {
         })
     }
 
+    fn catalog_table_has_fk_side_effects(&self, table: &str, on_delete: bool) -> bool {
+        let mut found = false;
+        self.tables.for_each_read(|_, child_table| {
+            if found {
+                return;
+            }
+            if child_table.foreign_keys.iter().any(|fk| {
+                fk.ref_table == table
+                    && if on_delete {
+                        matches!(
+                            fk.on_delete,
+                            FkAction::Cascade | FkAction::SetNull | FkAction::SetDefault
+                        )
+                    } else {
+                        matches!(
+                            fk.on_update,
+                            FkAction::Cascade | FkAction::SetNull | FkAction::SetDefault
+                        )
+                    }
+            }) {
+                found = true;
+            }
+        });
+        found
+    }
+
+    fn catalog_table_has_fk_references(&self, table: &str, on_delete: bool) -> bool {
+        let mut found = false;
+        self.tables.for_each_read(|_, child_table| {
+            if found {
+                return;
+            }
+            if child_table.foreign_keys.iter().any(|fk| {
+                fk.ref_table == table
+                    && if on_delete {
+                        matches!(
+                            fk.on_delete,
+                            FkAction::Cascade
+                                | FkAction::SetNull
+                                | FkAction::SetDefault
+                                | FkAction::Restrict
+                                | FkAction::NoAction
+                        )
+                    } else {
+                        matches!(
+                            fk.on_update,
+                            FkAction::Cascade
+                                | FkAction::SetNull
+                                | FkAction::SetDefault
+                                | FkAction::Restrict
+                                | FkAction::NoAction
+                        )
+                    }
+            }) {
+                found = true;
+            }
+        });
+        found
+    }
+
     fn commit_transaction(&self, with_wal: bool) -> Result<QueryResult, String> {
         let profile_enabled = Self::native_profile_enabled();
         let profile_start = if profile_enabled {
@@ -6076,11 +6920,12 @@ impl NativeSqlEngine {
         } else {
             None
         };
-        let tx_state = self
+        let mut tx_state = self
             .transaction
             .write()
             .take()
             .ok_or_else(|| "COMMIT without active transaction".to_string())?;
+        Self::log_txn_state_sizes(&tx_state);
 
         if tx_state.dirty {
             self.buf_pool.clear_all_caches();
@@ -6089,6 +6934,8 @@ impl NativeSqlEngine {
         if tx_state.dirty {
             self.validate_internal_state()?;
         }
+        let profile = Self::commit_profile_enabled();
+        let prepare_start = profile.then(Instant::now);
         self.htap
             .mvcc
             .apply_deferred_touches(tx_state.mvcc_tx_id);
@@ -6100,11 +6947,26 @@ impl NativeSqlEngine {
             .htap
             .tx_mgr
             .commit_transaction(tx_state.mvcc_tx_id)?;
-        self.htap
-            .mvcc
-            .publish_transaction(tx_state.mvcc_tx_id, commit_ts)?;
+        if !Self::txn_skip_publish() {
+            let publish_start = if Self::txn_profile_enabled() {
+                Some(Instant::now())
+            } else {
+                None
+            };
+            self.htap
+                .mvcc
+                .publish_transaction(tx_state.mvcc_tx_id, commit_ts)?;
+            if let Some(start) = publish_start {
+                Self::profile_ns(&self.native_profile.commit_publish_mvcc_ns, start.elapsed());
+            }
+        }
+        if let Some(start) = prepare_start {
+            Self::profile_ns(&self.native_profile.commit_prepare_ns, start.elapsed());
+        }
+        let dirty_start = profile.then(Instant::now);
         for table in touched {
             self.htap.mark_column_dirty(&table);
+            self.mark_table_data_dirty(&table, 1);
         }
         for table in tx_state
             .row_undo
@@ -6112,20 +6974,44 @@ impl NativeSqlEngine {
             .chain(tx_state.inserted_rows.keys())
         {
             self.htap.mark_column_dirty(table);
+            self.mark_table_data_dirty(table, 1);
         }
-        self.htap_publish_commit(commit_ts);
+        if let Some(start) = dirty_start {
+            Self::profile_ns(&self.native_profile.commit_dirty_mark_ns, start.elapsed());
+        }
+        if !Self::txn_skip_publish() {
+            self.htap_publish_commit(commit_ts);
+        }
+        self.flush_deferred_txn_indexes(&tx_state);
         if with_wal {
-            let wal_statement_count = tx_state.wal_sql.len() as u64;
+            if tx_state.txn_has_non_insert_mutations {
+                self.stage_pending_inserts_for_interleaved_wal(&mut tx_state)?;
+            }
+            let mut wal_lines = tx_state.wal_sql.clone();
+            if tx_state.compact_wal_on_commit
+                && !tx_state.txn_has_non_insert_mutations
+                && !tx_state.inserted_rows.is_empty()
+            {
+                wal_lines = self.materialize_txn_insert_wal(&tx_state)?;
+            } else if wal_lines.is_empty() && !tx_state.inserted_rows.is_empty() {
+                wal_lines = self.materialize_txn_insert_wal(&tx_state)?;
+            }
+            let wal_statement_count = wal_lines.len() as u64;
             if wal_statement_count > 0 {
                 if profile_enabled {
                     self.native_profile
                         .wal_record_count
                         .fetch_add(wal_statement_count, Ordering::Relaxed);
                 }
-                self.wal_append_batch(&tx_state.wal_sql)?;
+                let wal_batch_start = profile.then(Instant::now);
+                self.wal_append_batch(&wal_lines)?;
+                if let Some(start) = wal_batch_start {
+                    Self::profile_ns(&self.native_profile.commit_wal_batch_ns, start.elapsed());
+                }
                 let previous = self
                     .wal_mutations
                     .fetch_add(wal_statement_count, Ordering::Relaxed);
+                let wal_sync_start = profile.then(Instant::now);
                 match WalSyncPolicy::from_code(self.wal_sync_policy.load(Ordering::Relaxed) as u8) {
                     WalSyncPolicy::PerMutationSync | WalSyncPolicy::PerCommitSync => {
                         if profile_enabled {
@@ -6161,14 +7047,23 @@ impl NativeSqlEngine {
                     }
                     WalSyncPolicy::AppendOnlyProfile => {}
                 }
+                if let Some(start) = wal_sync_start {
+                    Self::profile_ns(&self.native_profile.commit_wal_sync_ns, start.elapsed());
+                }
                 if previous + wal_statement_count >= CHECKPOINT_INTERVAL {
+                    let ck_start = profile.then(Instant::now);
                     self.checkpoint();
+                    if let Some(start) = ck_start {
+                        Self::profile_ns(&self.native_profile.commit_checkpoint_ns, start.elapsed());
+                    }
                 }
             }
         }
         if let Some(start) = profile_start {
             Self::profile_ns(&self.native_profile.tx_commit_ns, start.elapsed());
         }
+        self.log_commit_profile();
+        self.log_txn_profile();
         Ok(Self::empty_ok("COMMIT"))
     }
 
@@ -6183,8 +7078,21 @@ impl NativeSqlEngine {
             .write()
             .take()
             .ok_or_else(|| "ROLLBACK without active transaction".to_string())?;
-        if tx_state.dirty {
+        Self::log_txn_state_sizes(&tx_state);
+        let rebuild_tables: std::collections::HashSet<String> = tx_state
+            .row_undo
+            .keys()
+            .chain(tx_state.inserted_rows.keys())
+            .cloned()
+            .collect();
+        let insert_only_rollback = tx_state.defer_btree_indexes
+            && tx_state.row_undo.is_empty()
+            && !tx_state.inserted_rows.is_empty();
+        let defer_rollback = tx_state.defer_btree_indexes;
+        let txn_prof = Self::txn_profile_enabled();
+        if tx_state.dirty && !Self::txn_skip_rollback_undo() {
             if let Some(tables_snapshot) = tx_state.tables_snapshot {
+                let snap_start = txn_prof.then(Instant::now);
                 self.tables.update_all(|tables| {
                     let mut restored = tables_snapshot;
                     for (table_name, current_table) in tables.iter() {
@@ -6218,7 +7126,14 @@ impl NativeSqlEngine {
                         .restore_snapshot(vector_hnsw_snapshot);
                 }
                 self.buf_pool.clear_all_caches();
+                if let Some(start) = snap_start {
+                    Self::profile_ns(
+                        &self.native_profile.rollback_snapshot_restore_ns,
+                        start.elapsed(),
+                    );
+                }
             } else if let Some(index_snapshot) = tx_state.index_snapshot {
+                let snap_start = txn_prof.then(Instant::now);
                 self.index_mgr.restore_snapshot(index_snapshot);
                 if let Some(inverted_snapshot) = tx_state.inverted_snapshot {
                     self.inverted_catalog.restore_snapshot(inverted_snapshot);
@@ -6254,7 +7169,56 @@ impl NativeSqlEngine {
                     self.buf_pool.invalidate(&table_name);
                 }
                 self.buf_pool.clear_all_caches();
+                if let Some(start) = snap_start {
+                    Self::profile_ns(&self.native_profile.rollback_revert_rows_ns, start.elapsed());
+                }
+            } else if insert_only_rollback {
+                let undo_start = txn_prof.then(Instant::now);
+                for (table_name, row_ids) in tx_state.inserted_rows {
+                    let _ = self.tables.with_write(&table_name, |table| {
+                        for row_id in row_ids {
+                            table.rows.remove(&row_id);
+                        }
+                    });
+                    self.buf_pool.invalidate(&table_name);
+                }
+                self.buf_pool.clear_all_caches();
+                if let Some(start) = undo_start {
+                    Self::profile_ns(&self.native_profile.rollback_revert_rows_ns, start.elapsed());
+                    Self::profile_ns(&self.native_profile.rollback_undo_ns, start.elapsed());
+                }
+            } else if defer_rollback {
+                let undo_start = txn_prof.then(Instant::now);
+                for (table_name, row_undos) in tx_state.row_undo {
+                    let _ = self.tables.with_write(&table_name, |table| {
+                        for (row_id, before) in row_undos {
+                            match before {
+                                Some(row) => {
+                                    table.rows.insert(row_id, row);
+                                }
+                                None => {
+                                    table.rows.remove(&row_id);
+                                }
+                            }
+                        }
+                    });
+                    self.buf_pool.invalidate(&table_name);
+                }
+                for (table_name, row_ids) in tx_state.inserted_rows {
+                    let _ = self.tables.with_write(&table_name, |table| {
+                        for row_id in row_ids {
+                            table.rows.remove(&row_id);
+                        }
+                    });
+                    self.buf_pool.invalidate(&table_name);
+                }
+                self.buf_pool.clear_all_caches();
+                if let Some(start) = undo_start {
+                    Self::profile_ns(&self.native_profile.rollback_revert_rows_ns, start.elapsed());
+                    Self::profile_ns(&self.native_profile.rollback_undo_ns, start.elapsed());
+                }
             } else {
+                let undo_start = txn_prof.then(Instant::now);
                 let mut tables = self.tables.write();
                 for (table_name, row_undos) in tx_state.row_undo {
                     if let Some(table) = tables.get_mut(&table_name) {
@@ -6287,6 +7251,13 @@ impl NativeSqlEngine {
                     self.buf_pool.invalidate(&table_name);
                 }
                 self.buf_pool.clear_all_caches();
+                if let Some(start) = undo_start {
+                    Self::profile_ns(
+                        &self.native_profile.rollback_revert_indexes_ns,
+                        start.elapsed(),
+                    );
+                    Self::profile_ns(&self.native_profile.rollback_undo_ns, start.elapsed());
+                }
             }
             if let Some(tombstone_snapshot) = tx_state.tombstone_snapshot {
                 let mut tombstones = self
@@ -6300,27 +7271,135 @@ impl NativeSqlEngine {
         if tx_state.dirty {
             self.validate_internal_state()?;
         }
+        let mvcc_start = txn_prof.then(Instant::now);
         self.htap.mvcc.abort_transaction(tx_state.mvcc_tx_id);
         let _ = self.htap.tx_mgr.abort_transaction(tx_state.mvcc_tx_id);
-        for name in self.tables.table_names() {
-            if let Ok(shared) = self.tables.lock_table_read(&name) {
-                self.htap.mvcc.rebuild_table(&name, &shared.read());
+        if let Some(start) = mvcc_start {
+            Self::profile_ns(&self.native_profile.rollback_mvcc_abort_ns, start.elapsed());
+        }
+        if !Self::txn_skip_rollback_undo()
+            && !insert_only_rollback
+            && !rebuild_tables.is_empty()
+            && !defer_rollback
+        {
+            let rebuild_start = txn_prof.then(Instant::now);
+            for name in rebuild_tables {
+                if let Ok(shared) = self.tables.lock_table_read(&name) {
+                    self.htap.mvcc.rebuild_table(&name, &shared.read());
+                }
+            }
+            if let Some(start) = rebuild_start {
+                Self::profile_ns(&self.native_profile.rollback_rebuild_ns, start.elapsed());
             }
         }
         if let Some(start) = profile_start {
             Self::profile_ns(&self.native_profile.tx_rollback_ns, start.elapsed());
         }
+        self.log_rollback_profile();
+        self.log_txn_profile();
         Ok(Self::empty_ok("ROLLBACK"))
+    }
+
+    fn stage_pending_inserts_for_interleaved_wal(
+        &self,
+        state: &mut TransactionState,
+    ) -> Result<(), String> {
+        let tables: Vec<String> = state.inserted_rows.keys().cloned().collect();
+        let mut staged_any = false;
+        for table in tables {
+            let ids = state
+                .inserted_rows
+                .get(&table)
+                .cloned()
+                .unwrap_or_default();
+            let staged = state.insert_wal_staged.entry(table.clone()).or_insert(0);
+            while *staged < ids.len() {
+                let row_id = ids[*staged];
+                state
+                    .wal_sql
+                    .push(self.wal_line_for_inserted_row(&table, row_id)?);
+                *staged += 1;
+                staged_any = true;
+            }
+        }
+        if staged_any {
+            state.txn_has_non_insert_mutations = true;
+        }
+        Ok(())
+    }
+
+    /// Build batched INSERT WAL lines from rows inserted during an explicit txn.
+    fn wal_line_for_inserted_row(&self, table: &str, row_id: i64) -> Result<String, String> {
+        self.tables.with_read(table, |native| {
+            let row = native
+                .rows
+                .get(&row_id)
+                .ok_or_else(|| format!("row {row_id} missing from table {table}"))?;
+            let mut vals = Vec::with_capacity(native.columns.len());
+            for col in &native.columns {
+                let lit = match row.cols.get(col.as_str()) {
+                    Some(cell) => Self::cell_sql_literal_for_wal(cell),
+                    None => "NULL".to_string(),
+                };
+                vals.push(lit);
+            }
+            Ok(format!(
+                "INSERT INTO {table} ({}) VALUES ({})",
+                native.columns.join(", "),
+                vals.join(", ")
+            ))
+        })?
+    }
+
+    fn materialize_txn_insert_wal(&self, tx_state: &TransactionState) -> Result<Vec<String>, String> {
+        const BATCH: usize = 100;
+        let mut lines = Vec::new();
+        for (table, ids) in &tx_state.inserted_rows {
+            self.tables.with_read(table, |native| {
+                let mut batch: Vec<String> = Vec::new();
+                for row_id in ids {
+                    let Some(row) = native.rows.get(row_id) else {
+                        continue;
+                    };
+                    let mut vals = Vec::with_capacity(native.columns.len());
+                    for col in &native.columns {
+                        let lit = match row.cols.get(col.as_str()) {
+                            Some(cell) => Self::cell_sql_literal_for_wal(cell),
+                            None => "NULL".to_string(),
+                        };
+                        vals.push(lit);
+                    }
+                    batch.push(format!("({})", vals.join(", ")));
+                    if batch.len() >= BATCH {
+                        lines.push(format!(
+                            "INSERT INTO {} ({}) VALUES {}",
+                            table,
+                            native.columns.join(", "),
+                            batch.join(", ")
+                        ));
+                        batch.clear();
+                    }
+                }
+                if !batch.is_empty() {
+                    lines.push(format!(
+                        "INSERT INTO {} ({}) VALUES {}",
+                        table,
+                        native.columns.join(", "),
+                        batch.join(", ")
+                    ));
+                }
+            })?;
+        }
+        Ok(lines)
     }
 
     fn record_transaction_wal(&self, sql: &str) -> Result<(), String> {
         let mut tx = self.transaction.write();
-        if let Some(state) = tx.as_mut() {
-            state.wal_sql.push(sql.to_string());
-            Ok(())
-        } else {
-            Err("no active transaction".to_string())
-        }
+        let Some(state) = tx.as_mut() else {
+            return Err("no active transaction".to_string());
+        };
+        state.wal_sql.push(sql.to_string());
+        Ok(())
     }
 
     fn wal_trace_enabled() -> bool {
@@ -7286,6 +8365,7 @@ impl NativeSqlEngine {
         profile.wal_bytes_after_checkpoint = fs::metadata(&wal_path).map(|m| m.len()).unwrap_or(0);
         self.wal_mutations.store(0, Ordering::Relaxed);
         self.dirty_tracker.clear_after_checkpoint();
+        self.htap.flush_wal_archive();
         profile.checkpoint_total_ms = checkpoint_start.elapsed().as_secs_f64() * 1000.0;
         let _ = profile.observed_sync_ms();
         if profile_enabled {
@@ -7462,6 +8542,20 @@ impl NativeSqlEngine {
         } else {
             self.execute_inner(sql, true)
         }
+    }
+
+    /// Run many statements with one GIL release; batches txn INSERT/UPDATE hot paths.
+    pub fn execute_batch(&self, sqls: &[&str]) -> Result<(), String> {
+        if sqls.is_empty() {
+            return Ok(());
+        }
+        if !self.transaction_active() {
+            for sql in sqls {
+                self.execute(sql)?;
+            }
+            return Ok(());
+        }
+        self.execute_batch_in_transaction(sqls)
     }
 
     pub fn execute_columnar_internal(&self, sql: &str) -> Result<NativeColumnarBatch, String> {
@@ -8609,15 +9703,50 @@ impl NativeSqlEngine {
         with_wal: bool,
         username: &str,
     ) -> Result<QueryResult, String> {
+        let s = sql.trim().trim_end_matches(';').trim();
+        if s.is_empty() {
+            return Ok(Self::empty_ok("OK"));
+        }
+
+        if Self::sql_prefix_ci(s, "BEGIN") || Self::sql_prefix_ci(s, "START TRANSACTION") {
+            return self.begin_transaction();
+        }
+        if Self::sql_prefix_ci(s, "COMMIT") {
+            return self.commit_transaction(with_wal);
+        }
+        if (Self::sql_prefix_ci(s, "ROLLBACK") || Self::sql_prefix_ci(s, "ABORT"))
+            && !Self::sql_contains_ci(s, "SAVEPOINT")
+        {
+            return self.rollback_transaction();
+        }
+
+        if self.transaction_active() {
+            if Self::sql_prefix_ci(s, "INSERT INTO") {
+                let tbl = Self::parse_ident_after(s, "INSERT INTO").unwrap_or("");
+                self.auth.check_privilege(username, tbl, Privilege::Insert)?;
+                if let Some(result) = self.try_transaction_insert_fast(s) {
+                    return result;
+                }
+            } else if Self::sql_prefix_ci(s, "UPDATE ") {
+                let tbl = Self::parse_ident_after(s, "UPDATE").unwrap_or("");
+                self.auth.check_privilege(username, tbl, Privilege::Update)?;
+                if let Some(result) = self.try_transaction_update_fast(s) {
+                    return result;
+                }
+            } else if Self::sql_prefix_ci(s, "DELETE FROM ") {
+                let tbl = Self::parse_ident_after(s, "DELETE FROM").unwrap_or("");
+                self.auth.check_privilege(username, tbl, Privilege::Delete)?;
+                if let Some(result) = self.try_transaction_delete_fast(s) {
+                    return result;
+                }
+            }
+        }
+
         let parse_start = if Self::native_profile_enabled() {
             Some(Instant::now())
         } else {
             None
         };
-        let s = sql.trim().trim_end_matches(';').trim();
-        if s.is_empty() {
-            return Ok(Self::empty_ok("OK"));
-        }
         let up = s.to_ascii_uppercase();
         if let Some(start) = parse_start {
             Self::profile_ns(&self.native_profile.parse_ns, start.elapsed());
@@ -8763,7 +9892,8 @@ impl NativeSqlEngine {
             }
         }
         let tx_active_at_start = self.transaction_active();
-        let autocommit_wal_mutation = is_mutation && with_wal && !tx_active_at_start;
+        let autocommit_wal_mutation =
+            is_mutation && with_wal && !tx_active_at_start && self.data_dir.is_some();
 
         if up.starts_with("CREATE TABLE") {
             let tbl = Self::parse_ident_after(s, "CREATE TABLE").unwrap_or("");
@@ -8831,15 +9961,30 @@ impl NativeSqlEngine {
             let tbl = Self::parse_ident_after(s, "DELETE FROM").unwrap_or("");
             self.auth
                 .check_privilege(username, tbl, Privilege::Delete)?;
-            let result = if autocommit_wal_mutation {
+            let result = if tx_active_at_start {
+                if let Some(fast) = self.try_transaction_delete_fast(s) {
+                    fast
+                } else if autocommit_wal_mutation {
+                    self.htap_autocommit_mutation(s, |e| e.handle_delete(s))
+                } else {
+                    self.handle_delete(s)
+                }
+            } else if autocommit_wal_mutation {
                 self.htap_autocommit_mutation(s, |e| e.handle_delete(s))
             } else {
                 self.handle_delete(s)
             };
-            if result.is_ok() && with_wal && tx_active_at_start {
+            let used_fast_txn_delete = tx_active_at_start
+                && result.is_ok()
+                && self
+                    .transaction
+                    .read()
+                    .as_ref()
+                    .is_some_and(|t| t.compact_wal_on_commit);
+            if result.is_ok() && with_wal && tx_active_at_start && !used_fast_txn_delete {
                 self.record_transaction_wal(s)?;
             }
-            if result.is_ok() {
+            if result.is_ok() && !tx_active_at_start {
                 self.mark_table_data_dirty(tbl, 1);
                 self.htap.mark_column_dirty(tbl);
             }
@@ -8849,15 +9994,30 @@ impl NativeSqlEngine {
             let tbl = Self::parse_ident_after(s, "INSERT INTO").unwrap_or("");
             self.auth
                 .check_privilege(username, tbl, Privilege::Insert)?;
-            let result = if autocommit_wal_mutation {
+            let result = if tx_active_at_start {
+                if let Some(fast) = self.try_transaction_insert_fast(s) {
+                    fast
+                } else if autocommit_wal_mutation {
+                    self.htap_autocommit_mutation(s, |e| e.handle_insert(s))
+                } else {
+                    self.handle_insert(s)
+                }
+            } else if autocommit_wal_mutation {
                 self.htap_autocommit_mutation(s, |e| e.handle_insert(s))
             } else {
                 self.handle_insert(s)
             };
-            if result.is_ok() && with_wal && tx_active_at_start {
+            let used_fast_txn_insert = tx_active_at_start
+                && result.is_ok()
+                && self
+                    .transaction
+                    .read()
+                    .as_ref()
+                    .is_some_and(|t| t.compact_wal_on_commit);
+            if result.is_ok() && with_wal && tx_active_at_start && !used_fast_txn_insert {
                 self.record_transaction_wal(s)?;
             }
-            if result.is_ok() {
+            if result.is_ok() && !tx_active_at_start {
                 self.mark_table_data_dirty(tbl, 1);
                 self.htap.mark_column_dirty(tbl);
             }
@@ -8867,15 +10027,30 @@ impl NativeSqlEngine {
             let tbl = Self::parse_ident_after(s, "UPDATE").unwrap_or("");
             self.auth
                 .check_privilege(username, tbl, Privilege::Update)?;
-            let result = if autocommit_wal_mutation {
+            let result = if tx_active_at_start {
+                if let Some(fast) = self.try_transaction_update_fast(s) {
+                    fast
+                } else if autocommit_wal_mutation {
+                    self.htap_autocommit_mutation(s, |e| e.handle_update(s))
+                } else {
+                    self.handle_update(s)
+                }
+            } else if autocommit_wal_mutation {
                 self.htap_autocommit_mutation(s, |e| e.handle_update(s))
             } else {
                 self.handle_update(s)
             };
-            if result.is_ok() && with_wal && tx_active_at_start {
+            let used_fast_txn_update = tx_active_at_start
+                && result.is_ok()
+                && self
+                    .transaction
+                    .read()
+                    .as_ref()
+                    .is_some_and(|t| t.compact_wal_on_commit);
+            if result.is_ok() && with_wal && tx_active_at_start && !used_fast_txn_update {
                 self.record_transaction_wal(s)?;
             }
-            if result.is_ok() {
+            if result.is_ok() && !tx_active_at_start {
                 self.mark_table_data_dirty(tbl, 1);
                 self.htap.mark_column_dirty(tbl);
             }
@@ -10826,6 +12001,9 @@ impl NativeSqlEngine {
     }
 
     fn maintain_vector_hnsw_indexes_for_row(&self, table: &str, row_id: i64, row: &NativeRow) {
+        if Self::vector_skip_hnsw_maintain() {
+            return;
+        }
         for entry in self.vector_hnsw_catalog.indexes_for_table(table) {
             let col = &entry.meta.key.column;
             if let Some(cell) = row.cols.get(col.as_str()) {
@@ -10841,7 +12019,7 @@ impl NativeSqlEngine {
         table: &str,
         rows: &[(i64, &NativeRow)],
     ) {
-        if rows.is_empty() {
+        if rows.is_empty() || Self::vector_skip_hnsw_maintain() {
             return;
         }
         for entry in self.vector_hnsw_catalog.indexes_for_table(table) {
@@ -12508,7 +13686,17 @@ impl NativeSqlEngine {
             }
 
             // DP-05: Remove from B+Tree indexes before deleting rows.
-            if let Some(t) = g.get(table) {
+            let defer_delete_indexes = tx_active && !self.table_btree_indexes(table).is_empty();
+            if defer_delete_indexes {
+                self.enable_txn_defer_btree();
+                if let Some(t) = g.get(table) {
+                    for &id in &to_delete {
+                        if let Some(row) = t.rows.get(&id) {
+                            self.record_deferred_index_delete(table, id, row.clone())?;
+                        }
+                    }
+                }
+            } else if let Some(t) = g.get(table) {
                 for &id in &to_delete {
                     if let Some(row) = t.rows.get(&id) {
                         self.remove_from_indexes(table, id, row);
@@ -12572,7 +13760,17 @@ impl NativeSqlEngine {
             }
 
             // DP-05: Remove all rows from indexes before mutable operations.
-            if let Some(t) = g.get(table) {
+            let defer_delete_indexes = tx_active && !self.table_btree_indexes(table).is_empty();
+            if defer_delete_indexes {
+                self.enable_txn_defer_btree();
+                if let Some(t) = g.get(table) {
+                    for &row_id in &row_ids {
+                        if let Some(row) = t.rows.get(&row_id) {
+                            self.record_deferred_index_delete(table, row_id, row.clone())?;
+                        }
+                    }
+                }
+            } else if let Some(t) = g.get(table) {
                 for &row_id in &row_ids {
                     if let Some(row) = t.rows.get(&row_id) {
                         self.remove_from_indexes(table, row_id, row);
@@ -12611,7 +13809,7 @@ impl NativeSqlEngine {
         }
         drop(g);
 
-        if deleted > 0 {
+        if deleted > 0 && !tx_active {
             self.buf_pool.invalidate(table);
             for child in &fk_affected {
                 self.buf_pool.invalidate(child);
@@ -12760,6 +13958,599 @@ impl NativeSqlEngine {
         let wal = format!("COPY {} FROM STDIN QM_INLINE {}", table, hex::encode(data));
         let count = self.bulk_insert_rows_fast(table, &cols, rows, &wal)?;
         Ok(count as u64)
+    }
+
+    fn execute_batch_in_transaction(&self, sqls: &[&str]) -> Result<(), String> {
+        let mut insert_run: Vec<ParsedTxnInsert> = Vec::new();
+        let mut update_run: Vec<ParsedTxnUpdate> = Vec::new();
+        let mut delete_run: Vec<ParsedTxnDelete> = Vec::new();
+
+        let flush_inserts = |this: &Self, run: &mut Vec<ParsedTxnInsert>| -> Result<(), String> {
+            if run.is_empty() {
+                return Ok(());
+            }
+            if run.len() == 1 {
+                let parsed = run.pop().expect("insert run");
+                this.apply_txn_inserts_batch(vec![parsed])?;
+            } else {
+                this.apply_txn_inserts_batch(std::mem::take(run))?;
+            }
+            Ok(())
+        };
+
+        let flush_updates = |this: &Self, run: &mut Vec<ParsedTxnUpdate>| -> Result<(), String> {
+            if run.is_empty() {
+                return Ok(());
+            }
+            if run.len() == 1 {
+                let parsed = run.pop().expect("update run");
+                this.apply_txn_updates_batch(&[parsed])?;
+            } else {
+                let taken = std::mem::take(run);
+                this.apply_txn_updates_batch(&taken)?;
+            }
+            Ok(())
+        };
+
+        let flush_deletes = |this: &Self, run: &mut Vec<ParsedTxnDelete>| -> Result<(), String> {
+            if run.is_empty() {
+                return Ok(());
+            }
+            let taken = std::mem::take(run);
+            this.apply_txn_deletes_batch(&taken)?;
+            Ok(())
+        };
+
+        for sql in sqls {
+            let s = sql.trim();
+            if Self::sql_prefix_ci(s, "INSERT INTO") {
+                flush_deletes(self, &mut delete_run)?;
+                flush_updates(self, &mut update_run)?;
+                match self.parse_txn_insert_statement(s) {
+                    Some(Ok(parsed)) => {
+                        if !insert_run.is_empty() && insert_run[0].table != parsed.table {
+                            flush_inserts(self, &mut insert_run)?;
+                        }
+                        insert_run.push(parsed);
+                    }
+                    Some(Err(err)) => return Err(err),
+                    None => {
+                        flush_inserts(self, &mut insert_run)?;
+                        self.execute_inner_authed(s, true, "admin")?;
+                    }
+                }
+                continue;
+            }
+            if Self::sql_prefix_ci(s, "UPDATE ") {
+                flush_deletes(self, &mut delete_run)?;
+                flush_inserts(self, &mut insert_run)?;
+                match self.parse_txn_update_statement(s) {
+                    Some(Ok(parsed)) => {
+                        if !update_run.is_empty()
+                            && (update_run[0].table != parsed.table
+                                || update_run[0].col != parsed.col
+                                || update_run[0].delta != parsed.delta)
+                        {
+                            flush_updates(self, &mut update_run)?;
+                        }
+                        update_run.push(parsed);
+                    }
+                    Some(Err(err)) => return Err(err),
+                    None => {
+                        flush_updates(self, &mut update_run)?;
+                        if let Some(result) = self.try_transaction_update_fast(s) {
+                            result?;
+                        } else {
+                            self.execute_inner_authed(s, true, "admin")?;
+                        }
+                    }
+                }
+                continue;
+            }
+            if Self::sql_prefix_ci(s, "DELETE FROM ") {
+                flush_inserts(self, &mut insert_run)?;
+                flush_updates(self, &mut update_run)?;
+                match self.parse_txn_delete_statement(s) {
+                    Some(Ok(parsed)) => {
+                        if !delete_run.is_empty() && delete_run[0].table != parsed.table {
+                            flush_deletes(self, &mut delete_run)?;
+                        }
+                        delete_run.push(parsed);
+                    }
+                    Some(Err(err)) => return Err(err),
+                    None => {
+                        flush_deletes(self, &mut delete_run)?;
+                        if let Some(result) = self.try_transaction_delete_fast(s) {
+                            result?;
+                        } else {
+                            self.execute_inner_authed(s, true, "admin")?;
+                        }
+                    }
+                }
+                continue;
+            }
+            flush_inserts(self, &mut insert_run)?;
+            flush_updates(self, &mut update_run)?;
+            flush_deletes(self, &mut delete_run)?;
+            self.execute_inner_authed(s, true, "admin")?;
+        }
+        flush_inserts(self, &mut insert_run)?;
+        flush_updates(self, &mut update_run)?;
+        flush_deletes(self, &mut delete_run)?;
+        Ok(())
+    }
+
+    fn parse_txn_insert_statement(&self, s: &str) -> Option<Result<ParsedTxnInsert, String>> {
+        if !self.transaction_active() {
+            return None;
+        }
+        let s = s.trim().trim_end_matches(';');
+        if !Self::sql_prefix_ci(s, "INSERT INTO ")
+            || Self::sql_contains_ci(s, " ON CONFLICT")
+            || Self::sql_contains_ci(s, " RETURNING ")
+            || Self::sql_contains_ci(s, "SELECT")
+        {
+            return None;
+        }
+        let table = Self::parse_ident_after(s, "INSERT INTO")?.to_string();
+        let values_pos = Self::find_ascii_ci(s, "VALUES")?;
+        let values_part = s[values_pos + 6..].trim_start();
+        if !values_part.starts_with('(') {
+            return None;
+        }
+        let vals = Self::parse_single_values_group(values_part)?;
+        if vals.is_empty() {
+            return None;
+        }
+        let cols: Vec<String> = {
+            let cached = self
+                .transaction
+                .read()
+                .as_ref()
+                .and_then(|state| state.cached_insert.clone());
+            if let Some((cached_table, cached_cols)) = cached {
+                if cached_table == table && cached_cols.len() == vals.len() {
+                    cached_cols
+                } else {
+                    let cols = self.parse_txn_insert_columns(s, &table, values_pos)?;
+                    self.cache_txn_insert_columns(&table, &cols);
+                    cols
+                }
+            } else {
+                let cols = self.parse_txn_insert_columns(s, &table, values_pos)?;
+                self.cache_txn_insert_columns(&table, &cols);
+                cols
+            }
+        };
+        if cols.len() != vals.len() {
+            return None;
+        }
+        let mut row_map: HashMap<String, Cell> = HashMap::with_capacity(cols.len());
+        for (col, val) in cols.iter().zip(vals.iter()) {
+            row_map.insert(col.clone(), val.clone());
+        }
+        let row_id = row_map.get("id").map(|v| v.as_i64()).unwrap_or(0);
+        if row_id <= 0 {
+            return None;
+        }
+        Some(Ok(ParsedTxnInsert {
+            table,
+            id: row_id,
+            row: NativeRow {
+                cols: row_map,
+                last_modified_lsn: 0,
+            },
+        }))
+    }
+
+    fn parse_txn_update_statement(&self, s: &str) -> Option<Result<ParsedTxnUpdate, String>> {
+        if !self.transaction_active() {
+            return None;
+        }
+        let s = s.trim().trim_end_matches(';');
+        if !Self::sql_prefix_ci(s, "UPDATE ")
+            || Self::sql_contains_ci(s, " RETURNING ")
+            || Self::sql_contains_ci(s, " JOIN ")
+        {
+            return None;
+        }
+        let table = Self::parse_ident_after(s, "UPDATE")?.to_string();
+        let set_idx = Self::find_ascii_ci(s, " SET ")?;
+        let after_set = &s[set_idx + 5..];
+        let where_idx = Self::find_ascii_ci(after_set, "WHERE")?;
+        let set_part = after_set[..where_idx].trim();
+        let where_part = after_set[where_idx + 5..].trim();
+        let row_id = Self::parse_simple_id_eq_predicate(where_part)?;
+        let eq_idx = set_part.find('=')?;
+        let col = set_part[..eq_idx].trim().trim_matches('"').to_string();
+        let rhs = set_part[eq_idx + 1..].trim();
+        let delta = Self::parse_col_increment(rhs, &col)?;
+        if self.catalog_table_has_fk_side_effects(&table, false)
+            || self.catalog_table_has_fk_references(&table, false)
+        {
+            return None;
+        }
+        Some(Ok(ParsedTxnUpdate {
+            table,
+            col,
+            delta,
+            row_id,
+        }))
+    }
+
+    fn apply_txn_inserts_batch(&self, inserts: Vec<ParsedTxnInsert>) -> Result<(), String> {
+        if inserts.is_empty() {
+            return Ok(());
+        }
+        let table = inserts[0].table.clone();
+        if inserts.iter().any(|ins| ins.table != table) {
+            return Err("execute_batch: mixed-table INSERT batch not supported".to_string());
+        }
+        let has_table_indexes = self.txn_cached_has_btree(&table);
+        let heap_start = Self::txn_profile_enabled().then(Instant::now);
+        self.tables.with_write(&table, |t| -> Result<(), String> {
+            t.ensure_auto_id_initialized();
+            for ins in &inserts {
+                if ins.id <= 0 {
+                    return Err("execute_batch INSERT requires explicit positive id".to_string());
+                }
+                if t.rows.contains_key(&ins.id) {
+                    return Err(format!(
+                        "duplicate key value violates unique constraint: {}",
+                        ins.id
+                    ));
+                }
+                if ins.id >= t.next_auto_id {
+                    t.next_auto_id = ins.id.saturating_add(1);
+                }
+                t.rows.insert(ins.id, ins.row.clone());
+            }
+            Ok(())
+        })?;
+        if let Some(start) = heap_start {
+            Self::profile_ns(&self.native_profile.txn_record_heap_mutate_ns, start.elapsed());
+        }
+        let ids: Vec<i64> = inserts.iter().map(|ins| ins.id).collect();
+        let undo_start = Self::txn_profile_enabled().then(Instant::now);
+        let mut tx = self.transaction.write();
+        let Some(state) = tx.as_mut() else {
+            return Err("no active transaction".to_string());
+        };
+        state.compact_wal_on_commit = true;
+        state.dirty = true;
+        state
+            .inserted_rows
+            .entry(table.clone())
+            .or_default()
+            .extend(ids.iter().copied());
+        if has_table_indexes {
+            state.defer_btree_indexes = true;
+            state
+                .deferred_index_inserts
+                .entry(table.clone())
+                .or_default()
+                .extend(ids.iter().copied());
+        }
+        if state.txn_has_non_insert_mutations {
+            for row_id in &ids {
+                if let Ok(line) = self.wal_line_for_inserted_row(&table, *row_id) {
+                    state.wal_sql.push(line);
+                }
+            }
+            *state
+                .insert_wal_staged
+                .entry(table.clone())
+                .or_insert(0) += ids.len();
+        }
+        if let Some(start) = undo_start {
+            Self::profile_ns(&self.native_profile.txn_record_undo_push_ns, start.elapsed());
+            if has_table_indexes {
+                Self::profile_ns(&self.native_profile.txn_record_deferred_push_ns, start.elapsed());
+            }
+        }
+        Ok(())
+    }
+
+    fn apply_txn_updates_batch(&self, updates: &[ParsedTxnUpdate]) -> Result<(), String> {
+        if updates.is_empty() {
+            return Ok(());
+        }
+        let table = &updates[0].table;
+        let col = &updates[0].col;
+        let delta = updates[0].delta;
+        if updates
+            .iter()
+            .any(|u| u.table != *table || u.col != *col || u.delta != delta)
+        {
+            return Err("execute_batch: heterogeneous UPDATE batch not supported".to_string());
+        }
+        let has_table_indexes = self.txn_cached_has_btree(table);
+        let mut undo_entries: Vec<(i64, Option<NativeRow>)> = Vec::with_capacity(updates.len());
+        let mut replacements: Vec<(i64, NativeRow)> = Vec::new();
+        let heap_start = Self::txn_profile_enabled().then(Instant::now);
+        self.tables.with_write(table.as_str(), |t| -> Result<(), String> {
+            let col_idx = t
+                .columns
+                .iter()
+                .position(|c| c == col)
+                .ok_or_else(|| format!("column \"{col}\" does not exist"))?;
+            if !matches!(t.column_types.get(col_idx), Some(ColType::Integer)) {
+                return Err(format!("execute_batch UPDATE requires integer column {col}"));
+            }
+            for upd in updates {
+                let Some(row) = t.rows.get_mut(&upd.row_id) else {
+                    continue;
+                };
+                let old_row = row.clone();
+                let current = row.cols.get(col.as_str()).map(|c| c.as_i64()).unwrap_or(0);
+                row.cols
+                    .insert(col.clone(), Cell::Int(current.saturating_add(delta)));
+                if has_table_indexes {
+                    replacements.push((upd.row_id, old_row.clone()));
+                }
+                undo_entries.push((upd.row_id, Some(old_row)));
+            }
+            Ok(())
+        })?;
+        if let Some(start) = heap_start {
+            Self::profile_ns(&self.native_profile.txn_record_heap_mutate_ns, start.elapsed());
+        }
+        let undo_start = Self::txn_profile_enabled().then(Instant::now);
+        let mut tx = self.transaction.write();
+        let Some(state) = tx.as_mut() else {
+            return Err("no active transaction".to_string());
+        };
+        self.stage_pending_inserts_for_interleaved_wal(state)?;
+        state.compact_wal_on_commit = true;
+        state.txn_has_non_insert_mutations = true;
+        state.dirty = true;
+        let undo_map = state.row_undo.entry(table.clone()).or_default();
+        for (row_id, before) in undo_entries {
+            undo_map.entry(row_id).or_insert(before);
+        }
+        if has_table_indexes {
+            state.defer_btree_indexes = true;
+            state
+                .deferred_index_replacements
+                .entry(table.clone())
+                .or_default()
+                .extend(replacements);
+        }
+        for upd in updates {
+            state.wal_sql.push(format!(
+                "UPDATE {table} SET {col} = {col} + {delta} WHERE id = {}",
+                upd.row_id
+            ));
+        }
+        if let Some(start) = undo_start {
+            Self::profile_ns(&self.native_profile.txn_record_undo_push_ns, start.elapsed());
+            if has_table_indexes {
+                Self::profile_ns(&self.native_profile.txn_record_deferred_push_ns, start.elapsed());
+            }
+        }
+        Ok(())
+    }
+
+    fn parse_txn_delete_statement(&self, s: &str) -> Option<Result<ParsedTxnDelete, String>> {
+        if !self.transaction_active() {
+            return None;
+        }
+        let s = s.trim().trim_end_matches(';');
+        if !Self::sql_prefix_ci(s, "DELETE FROM ") || Self::sql_contains_ci(s, " RETURNING ") {
+            return None;
+        }
+        let table = Self::parse_ident_after(s, "DELETE FROM")?.to_string();
+        let where_pos = Self::find_ascii_ci(s, "WHERE")?;
+        let pred = s[where_pos + 5..].trim().trim_end_matches(';');
+        if Self::sql_contains_ci(pred, " AND ") || Self::sql_contains_ci(pred, " OR ") {
+            return None;
+        }
+        let row_id = Self::parse_simple_id_eq_predicate(pred)?;
+        if self.catalog_table_has_fk_side_effects(&table, true)
+            || self.catalog_table_has_fk_references(&table, true)
+        {
+            return None;
+        }
+        Some(Ok(ParsedTxnDelete { table, row_id }))
+    }
+
+    fn apply_txn_deletes_batch(&self, deletes: &[ParsedTxnDelete]) -> Result<(), String> {
+        if deletes.is_empty() {
+            return Ok(());
+        }
+        let table = &deletes[0].table;
+        if deletes.iter().any(|del| del.table != *table) {
+            return Err("execute_batch: mixed-table DELETE batch not supported".to_string());
+        }
+        let has_table_indexes = self.txn_cached_has_btree(table);
+        let mut removed: Vec<(i64, NativeRow)> = Vec::with_capacity(deletes.len());
+        let heap_start = Self::txn_profile_enabled().then(Instant::now);
+        self.tables.with_write(table.as_str(), |t| {
+            for del in deletes {
+                if let Some(old_row) = t.rows.remove(&del.row_id) {
+                    removed.push((del.row_id, old_row));
+                }
+            }
+        })?;
+        if let Some(start) = heap_start {
+            Self::profile_ns(&self.native_profile.txn_record_heap_mutate_ns, start.elapsed());
+        }
+        if removed.is_empty() {
+            return Ok(());
+        }
+        let undo_start = Self::txn_profile_enabled().then(Instant::now);
+        let mut tx = self.transaction.write();
+        let Some(state) = tx.as_mut() else {
+            return Err("no active transaction".to_string());
+        };
+        let _ = self.stage_pending_inserts_for_interleaved_wal(state)?;
+        state.compact_wal_on_commit = true;
+        state.txn_has_non_insert_mutations = true;
+        state.dirty = true;
+        let undo_map = state.row_undo.entry(table.clone()).or_default();
+        let mut deferred_deletes = Vec::new();
+        for (row_id, old_row) in removed {
+            undo_map.entry(row_id).or_insert(Some(old_row.clone()));
+            state
+                .wal_sql
+                .push(format!("DELETE FROM {table} WHERE id = {row_id}"));
+            if has_table_indexes {
+                deferred_deletes.push((row_id, old_row));
+            }
+        }
+        if has_table_indexes {
+            state.defer_btree_indexes = true;
+            state
+                .deferred_index_deletes
+                .entry(table.clone())
+                .or_default()
+                .extend(deferred_deletes);
+        }
+        if let Some(start) = undo_start {
+            Self::profile_ns(&self.native_profile.txn_record_undo_push_ns, start.elapsed());
+            if has_table_indexes {
+                Self::profile_ns(&self.native_profile.txn_record_deferred_push_ns, start.elapsed());
+            }
+        }
+        Ok(())
+    }
+
+    /// Fast path for single-row INSERT inside an explicit transaction (benchmark hot path).
+    fn try_transaction_insert_fast(&self, s: &str) -> Option<Result<QueryResult, String>> {
+        if let Some(result) = self.try_transaction_insert_multi_values(s) {
+            return Some(result);
+        }
+        let parsed = match self.parse_txn_insert_statement(s)? {
+            Ok(p) => p,
+            Err(e) => return Some(Err(e)),
+        };
+        Some(
+            self.apply_txn_inserts_batch(vec![parsed])
+                .map(|_| Self::empty_ok("INSERT 0 1")),
+        )
+    }
+
+    fn try_transaction_insert_multi_values(&self, s: &str) -> Option<Result<QueryResult, String>> {
+        if !self.transaction_active() {
+            return None;
+        }
+        let s = s.trim().trim_end_matches(';');
+        if !Self::sql_prefix_ci(s, "INSERT INTO ")
+            || Self::sql_contains_ci(s, " ON CONFLICT")
+            || Self::sql_contains_ci(s, " RETURNING ")
+            || Self::sql_contains_ci(s, "SELECT")
+        {
+            return None;
+        }
+        let table = Self::parse_ident_after(s, "INSERT INTO")?.to_string();
+        let values_pos = Self::find_ascii_ci(s, "VALUES")?;
+        let values_part = s[values_pos + 6..].trim_start();
+        let groups = Self::parse_multi_value_groups(values_part);
+        if groups.len() <= 1 {
+            return None;
+        }
+        let cols = self.parse_txn_insert_columns(s, &table, values_pos)?;
+        self.cache_txn_insert_columns(&table, &cols);
+        let mut batch = Vec::with_capacity(groups.len());
+        for vals in groups {
+            if cols.len() != vals.len() {
+                return Some(Err("INSERT column/value count mismatch".to_string()));
+            }
+            let mut row_map: HashMap<String, Cell> = HashMap::with_capacity(cols.len());
+            for (col, val) in cols.iter().zip(vals.iter()) {
+                row_map.insert(col.clone(), val.clone());
+            }
+            let row_id = row_map.get("id").map(|v| v.as_i64()).unwrap_or(0);
+            if row_id <= 0 {
+                return None;
+            }
+            batch.push(ParsedTxnInsert {
+                table: table.clone(),
+                id: row_id,
+                row: NativeRow {
+                    cols: row_map,
+                    last_modified_lsn: 0,
+                },
+            });
+        }
+        let count = batch.len();
+        Some(
+            self.apply_txn_inserts_batch(batch)
+                .map(|_| Self::empty_ok(&format!("INSERT 0 {count}"))),
+        )
+    }
+
+    /// Fast path: `UPDATE tbl SET col = col + N WHERE id = ?` inside an explicit txn.
+    fn try_transaction_update_fast(&self, s: &str) -> Option<Result<QueryResult, String>> {
+        let parsed = match self.parse_txn_update_statement(s)? {
+            Ok(p) => p,
+            Err(e) => return Some(Err(e)),
+        };
+        Some(
+            self.apply_txn_updates_batch(&[parsed])
+                .map(|_| Self::empty_ok("UPDATE 1")),
+        )
+    }
+
+    fn cache_txn_insert_columns(&self, table: &str, cols: &[String]) {
+        if let Some(state) = self.transaction.write().as_mut() {
+            state.cached_insert = Some((table.to_string(), cols.to_vec()));
+        }
+    }
+
+    fn parse_txn_insert_columns(
+        &self,
+        s: &str,
+        table: &str,
+        values_pos: usize,
+    ) -> Option<Vec<String>> {
+        let first_paren = s.find('(')?;
+        if first_paren < values_pos {
+            let col_close = s[first_paren + 1..]
+                .find(')')
+                .map(|i| i + first_paren + 1)?;
+            let cols_part = &s[first_paren + 1..col_close];
+            Some(
+                cols_part
+                    .split(',')
+                    .map(|x| x.trim().trim_matches('"').to_string())
+                    .collect(),
+            )
+        } else {
+            self.tables.with_read(table, |t| t.columns.clone()).ok()
+        }
+    }
+
+    /// Fast path: `DELETE FROM tbl WHERE id = ?` inside an explicit txn.
+    fn try_transaction_delete_fast(&self, s: &str) -> Option<Result<QueryResult, String>> {
+        let parsed = match self.parse_txn_delete_statement(s)? {
+            Ok(p) => p,
+            Err(e) => return Some(Err(e)),
+        };
+        let count = 1usize;
+        Some(
+            self.apply_txn_deletes_batch(&[parsed])
+                .map(|_| Self::empty_ok(&format!("DELETE {count}"))),
+        )
+    }
+
+    fn parse_col_increment(rhs: &str, col: &str) -> Option<i64> {
+        let rhs = rhs.trim();
+        let col_up = col.to_ascii_uppercase();
+        let rhs_up = rhs.to_ascii_uppercase();
+        if let Some(rest) = rhs_up.strip_prefix(&(col_up.clone() + " + ")) {
+            return match Self::parse_value(rest.trim()) {
+                Cell::Int(n) => Some(n),
+                _ => None,
+            };
+        }
+        if let Some(rest) = rhs_up.strip_prefix(&(col_up + " - ")) {
+            return match Self::parse_value(rest.trim()) {
+                Cell::Int(n) => Some(-n),
+                _ => None,
+            };
+        }
+        None
     }
 
     fn handle_insert(&self, s: &str) -> Result<QueryResult, String> {
@@ -12977,22 +14768,26 @@ impl NativeSqlEngine {
         }
 
         // Record write stats once per column under a single stats lock.
-        self.index_mgr
-            .record_writes(table, cols.iter().map(|c| c.as_str()));
+        if !tx_active {
+            self.index_mgr
+                .record_writes(table, cols.iter().map(|c| c.as_str()));
+        }
 
         // Feed numeric samples into histogram stats
         let mut numeric_samples: Vec<(&str, f64)> = Vec::new();
-        for (_id, row) in &prepared_rows {
-            for (cv, v) in &row.cols {
-                match v {
-                    Cell::Int(x) => numeric_samples.push((cv.as_str(), *x as f64)),
-                    Cell::Float(x) => numeric_samples.push((cv.as_str(), *x)),
-                    _ => {}
+        if !tx_active {
+            for (_id, row) in &prepared_rows {
+                for (cv, v) in &row.cols {
+                    match v {
+                        Cell::Int(x) => numeric_samples.push((cv.as_str(), *x as f64)),
+                        Cell::Float(x) => numeric_samples.push((cv.as_str(), *x)),
+                        _ => {}
+                    }
                 }
             }
+            self.index_mgr
+                .record_numeric_values(table, numeric_samples.into_iter());
         }
-        self.index_mgr
-            .record_numeric_values(table, numeric_samples.into_iter());
 
         // H-08: Insert rows FIRST under table lock so they're visible,
         // THEN update indexes — no window where index points to absent rows.
@@ -13076,7 +14871,8 @@ impl NativeSqlEngine {
 
             if matches!(conflict_action, ConflictAction::None) && returning_cols.is_empty() {
                 inserted_count = prepared_rows.len();
-                if has_table_indexes {
+                let defer_indexes = tx_active && has_table_indexes;
+                if has_table_indexes && !defer_indexes {
                     for (id, row) in &prepared_rows {
                         t.rows.insert(*id, row.clone());
                         if self.htap_tx_active() {
@@ -13102,6 +14898,26 @@ impl NativeSqlEngine {
                     if let Some(start) = index_start {
                         Self::profile_ns(&self.native_profile.index_update_ns, start.elapsed());
                     }
+                } else if defer_indexes {
+                    self.txn_cached_has_btree(table);
+                    let mut inserted_ids = Vec::with_capacity(prepared_rows.len());
+                    for (id, row) in &prepared_rows {
+                        t.rows.insert(*id, row.clone());
+                        inserted_ids.push(*id);
+                    }
+                    drop(g);
+                    let mut tx = self.transaction.write();
+                    if let Some(state) = tx.as_mut() {
+                        state
+                            .deferred_index_inserts
+                            .entry(table.to_string())
+                            .or_default()
+                            .extend(inserted_ids);
+                    }
+                    if !tx_active {
+                        self.buf_pool.invalidate(table);
+                    }
+                    return Ok(Self::empty_ok(&format!("INSERT 0 {}", inserted_count)));
                 } else {
                     for (id, row) in prepared_rows.drain(..) {
                         t.rows.insert(id, row.clone());
@@ -13258,7 +15074,9 @@ impl NativeSqlEngine {
             }
         }
 
-        self.buf_pool.invalidate(table);
+        if !tx_active {
+            self.buf_pool.invalidate(table);
+        }
 
         if !returning_cols.is_empty() {
             let columns: Vec<(String, i32, i16)> = returning_cols
@@ -13350,6 +15168,17 @@ impl NativeSqlEngine {
 
     /// Parse multi-row VALUES clause: (v1,v2),(v3,v4),...
     /// Returns a vector of value groups.
+    fn parse_single_values_group(values_part: &str) -> Option<Vec<Cell>> {
+        let trimmed = values_part.trim().trim_end_matches(';');
+        let open = trimmed.find('(')?;
+        let close = trimmed.rfind(')')?;
+        if close <= open {
+            return None;
+        }
+        let content = &trimmed[open + 1..close];
+        Some(Self::split_values_quoted(content))
+    }
+
     fn parse_multi_value_groups(values_part: &str) -> Vec<Vec<Cell>> {
         let trimmed = values_part.trim().trim_end_matches(';');
         let mut depth = 0;
@@ -13629,11 +15458,24 @@ impl NativeSqlEngine {
 
             // Apply the update to parent rows.
             if let Some(t) = g.get_mut(table) {
+                let has_table_indexes = !self.table_btree_indexes(table).is_empty();
+                let defer_indexes = tx_active && has_table_indexes;
+                if defer_indexes {
+                    self.enable_txn_defer_btree();
+                }
                 for row_id in &row_ids {
                     let snapshot = if let Some(row) = t.rows.get_mut(row_id) {
-                        self.update_indexes(table, *row_id, row, &assignments);
-                        for (col, val) in &assignments {
-                            row.cols.insert(col.clone(), val.clone());
+                        if defer_indexes {
+                            let old_row = row.clone();
+                            self.record_deferred_index_replacement(table, *row_id, old_row)?;
+                            for (col, val) in &assignments {
+                                row.cols.insert(col.clone(), val.clone());
+                            }
+                        } else {
+                            self.update_indexes(table, *row_id, row, &assignments);
+                            for (col, val) in &assignments {
+                                row.cols.insert(col.clone(), val.clone());
+                            }
                         }
                         count += 1;
                         if !ret_cols_expanded.is_empty() {
@@ -13650,7 +15492,7 @@ impl NativeSqlEngine {
             }
         }
 
-        if count > 0 {
+        if count > 0 && !tx_active {
             self.buf_pool.invalidate(table);
         }
 

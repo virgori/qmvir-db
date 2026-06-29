@@ -100,38 +100,62 @@ impl HtapRuntime {
         wal_bytes: u64,
         oldest_snapshot: u64,
     ) {
-        let seq = self.commit_seq.fetch_add(1, Ordering::Relaxed);
-        if let Some(ref dir) = self.data_dir {
-            let wall_time = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs() as i64)
-                .unwrap_or(0);
-            let mut idx = self.wal_archive.write();
-            idx.record_with_bytes(commit_ts, wall_time, wal_path, wal_bytes);
-            self.wal_archive_dirty.store(1, Ordering::Relaxed);
-            if seq % 64 == 0 {
-                let _ = idx.save(dir);
-                self.wal_archive_dirty.store(0, Ordering::Relaxed);
-            }
-        }
-        if seq % 32 == 0 {
-            self.mvcc.vacuum(oldest_snapshot);
-        }
+        self.after_commit_profiled(
+            commit_ts,
+            wal_path,
+            wal_bytes,
+            oldest_snapshot,
+            None,
+            None,
+            false,
+            false,
+        );
     }
 
-    #[allow(dead_code)]
-    pub fn record_commit_wal_archive(
+    pub fn after_commit_profiled(
         &self,
         commit_ts: u64,
         wal_path: &Path,
         wal_bytes: u64,
+        oldest_snapshot: u64,
+        archive_ns: Option<&std::sync::atomic::AtomicU64>,
+        vacuum_ns: Option<&std::sync::atomic::AtomicU64>,
+        skip_archive: bool,
+        skip_vacuum: bool,
     ) {
-        self.after_commit(
-            commit_ts,
-            wal_path,
-            wal_bytes,
-            self.tx_mgr.oldest_active_snapshot(),
-        );
+        let seq = self.commit_seq.fetch_add(1, Ordering::Relaxed);
+        if let Some(ref dir) = self.data_dir {
+            if !skip_archive {
+                let archive_start = archive_ns.map(|_| std::time::Instant::now());
+                let wall_time = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs() as i64)
+                    .unwrap_or(0);
+                let mut idx = self.wal_archive.write();
+                idx.record_with_bytes(commit_ts, wall_time, wal_path, wal_bytes);
+                self.wal_archive_dirty.store(1, Ordering::Relaxed);
+                if seq % 64 == 0 {
+                    let _ = idx.save(dir);
+                    self.wal_archive_dirty.store(0, Ordering::Relaxed);
+                }
+                if let (Some(counter), Some(start)) = (archive_ns, archive_start) {
+                    counter.fetch_add(
+                        start.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64,
+                        Ordering::Relaxed,
+                    );
+                }
+            }
+        }
+        if !skip_vacuum && seq % 32 == 0 {
+            let vacuum_start = vacuum_ns.map(|_| std::time::Instant::now());
+            self.mvcc.vacuum(oldest_snapshot);
+            if let (Some(counter), Some(start)) = (vacuum_ns, vacuum_start) {
+                counter.fetch_add(
+                    start.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64,
+                    Ordering::Relaxed,
+                );
+            }
+        }
     }
 
     pub fn flush_wal_archive(&self) {
