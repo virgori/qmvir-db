@@ -2390,6 +2390,8 @@ pub struct NativeTable {
 struct TransactionState {
     tables_snapshot: Option<HashMap<String, NativeTable>>,
     row_undo: HashMap<String, HashMap<i64, Option<NativeRow>>>,
+    /// Row ids inserted in this txn (rollback removes without per-row undo map).
+    inserted_rows: HashMap<String, Vec<i64>>,
     tombstone_snapshot: Option<Vec<(String, i64, u64)>>,
     index_snapshot: Option<IndexManagerSnapshot>,
     inverted_snapshot: Option<InvertedCatalogSnapshot>,
@@ -5719,6 +5721,9 @@ impl NativeSqlEngine {
     }
 
     fn htap_track_row_write(&self, table: &str, t: &NativeTable, row_id: i64, row: &NativeRow) {
+        if self.transaction_active() {
+            return;
+        }
         if let Some(tx_id) = self.htap.tx_mgr.active_tx_for_session(self.session_id) {
             self.htap.bootstrap_table_engine(&self.tables, table);
             let _ = self
@@ -5730,6 +5735,9 @@ impl NativeSqlEngine {
     }
 
     fn htap_track_row_delete(&self, table: &str, t: &NativeTable, row_id: i64) {
+        if self.transaction_active() {
+            return;
+        }
         if let Some(tx_id) = self.htap.tx_mgr.active_tx_for_session(self.session_id) {
             self.htap.bootstrap_table_engine(&self.tables, table);
             let _ = self.htap.mvcc.delete_row(tx_id, table, t, row_id);
@@ -5898,6 +5906,7 @@ impl NativeSqlEngine {
         *tx = Some(TransactionState {
             tables_snapshot: None,
             row_undo: HashMap::new(),
+            inserted_rows: HashMap::new(),
             tombstone_snapshot: None,
             index_snapshot: None,
             inverted_snapshot: None,
@@ -5906,12 +5915,26 @@ impl NativeSqlEngine {
             vector_hnsw_snapshot: None,
             mvcc_tx_id,
             dirty: false,
-            wal_sql: Vec::with_capacity(128),
+            wal_sql: Vec::with_capacity(256),
         });
         if let Some(start) = profile_start {
             Self::profile_ns(&self.native_profile.tx_begin_ns, start.elapsed());
         }
         Ok(Self::empty_ok("BEGIN"))
+    }
+
+    fn record_transaction_insert_undo(&self, table: &str, row_id: i64) -> Result<(), String> {
+        let mut tx = self.transaction.write();
+        let Some(state) = tx.as_mut() else {
+            return Ok(());
+        };
+        state
+            .inserted_rows
+            .entry(table.to_string())
+            .or_default()
+            .push(row_id);
+        state.dirty = true;
+        Ok(())
     }
 
     fn record_transaction_row_undos(
@@ -6083,6 +6106,13 @@ impl NativeSqlEngine {
         for table in touched {
             self.htap.mark_column_dirty(&table);
         }
+        for table in tx_state
+            .row_undo
+            .keys()
+            .chain(tx_state.inserted_rows.keys())
+        {
+            self.htap.mark_column_dirty(table);
+        }
         self.htap_publish_commit(commit_ts);
         if with_wal {
             let wal_statement_count = tx_state.wal_sql.len() as u64;
@@ -6241,6 +6271,17 @@ impl NativeSqlEngine {
                                     table.rows.remove(&row_id);
                                 }
                             }
+                        }
+                    }
+                    self.buf_pool.invalidate(&table_name);
+                }
+                for (table_name, row_ids) in tx_state.inserted_rows {
+                    if let Some(table) = tables.get_mut(&table_name) {
+                        for row_id in row_ids {
+                            if let Some(current) = table.rows.get(&row_id) {
+                                self.remove_from_indexes(&table_name, row_id, current);
+                            }
+                            table.rows.remove(&row_id);
                         }
                     }
                     self.buf_pool.invalidate(&table_name);
@@ -8241,11 +8282,7 @@ impl NativeSqlEngine {
                 ));
             }
             if self.transaction_active() {
-                self.record_transaction_row_undos(
-                    table,
-                    vec![(id, t.rows.get(&id).cloned())],
-                    false,
-                )?;
+                self.record_transaction_insert_undo(table, id)?;
             }
             let (_, row) = rows.pop().unwrap();
             t.rows.insert(id, row.clone());
@@ -8261,7 +8298,9 @@ impl NativeSqlEngine {
         }
         self.index_mgr
             .record_writes(table, columns.iter().map(|c| c.as_str()));
-        self.buf_pool.invalidate(table);
+        if !self.transaction_active() {
+            self.buf_pool.invalidate(table);
+        }
         Ok(Self::empty_ok("INSERT 0 1"))
     }
 
@@ -13022,11 +13061,17 @@ impl NativeSqlEngine {
                 return Err(err);
             }
             if tx_active {
-                let undo_rows = prepared_rows
-                    .iter()
-                    .map(|(id, _)| (*id, t.rows.get(id).cloned()))
-                    .collect();
-                self.record_transaction_row_undos(table, undo_rows, false)?;
+                let mut undo_rows = Vec::new();
+                for (id, _) in &prepared_rows {
+                    if t.rows.contains_key(id) {
+                        undo_rows.push((*id, t.rows.get(id).cloned()));
+                    } else {
+                        self.record_transaction_insert_undo(table, *id)?;
+                    }
+                }
+                if !undo_rows.is_empty() {
+                    self.record_transaction_row_undos(table, undo_rows, false)?;
+                }
             }
 
             if matches!(conflict_action, ConflictAction::None) && returning_cols.is_empty() {
