@@ -1962,6 +1962,7 @@ dependencies = [
  "hex",
  "hmac",
  "io-uring",
+ "itoa",
  "libc",
  "lz4_flex",
  "memchr",

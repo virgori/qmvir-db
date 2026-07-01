@@ -38,6 +38,7 @@ parking_lot = "0.12"
 num_cpus = "1.16"
 bytes = "1.5"
 memchr = "2.7"
+itoa = "1.0"
 
 # SIMD & Performance
 wide = "0.7"

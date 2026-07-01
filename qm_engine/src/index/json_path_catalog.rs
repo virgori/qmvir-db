@@ -50,7 +50,7 @@ impl ManagedJsonPathIndex {
         }
         let mut postings = self.postings.write();
         let rows = postings.entry(value.to_string()).or_default();
-        if !rows.contains(&row_id) {
+        if rows.last().copied() != Some(row_id) {
             rows.push(row_id);
         }
     }

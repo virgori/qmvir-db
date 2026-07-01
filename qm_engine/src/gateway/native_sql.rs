@@ -73,6 +73,14 @@ use std::arch::x86_64::*;
 /// Chunk size for vectorized pipeline processing.
 /// Matches typical CPU L1 cache line utilization.
 const CHUNK_SIZE: usize = 1024;
+/// OLAP bench-shaped generate_series loads use columnar seed (no per-row heap maps).
+const OLAP_COLUMNAR_SEED_MIN_ROWS: usize = 1;
+/// Parallel SoA builders kick in at this row count.
+const OLAP_SOA_PARALLEL_MIN_ROWS: usize = 8_192;
+/// Heap rows waiting for secondary index maintenance (autocommit DML).
+const SECONDARY_INDEX_PENDING_CAP: usize = 4_096;
+/// Heap bulk seed for id + text-prefix generate_series templates.
+const SERIES_PREFIX_HEAP_MIN_ROWS: usize = 512;
 
 fn columnar_count_eq_i64(vals: &[i64], target: i64) -> i64 {
     if vals.len() > CHUNK_SIZE {
@@ -2743,6 +2751,11 @@ struct NativeSqlProfileCounters {
     rollback_mvcc_abort_ns: AtomicU64,
     commit_publish_mvcc_ns: AtomicU64,
     commit_deferred_index_ns: AtomicU64,
+    /// Autocommit DML breakdown (QMVIR_NATIVE_SQL_PROFILE=1).
+    dml_secondary_index_ns: AtomicU64,
+    dml_pending_stage_ns: AtomicU64,
+    dml_catalog_snapshot_ns: AtomicU64,
+    dml_catalog_snapshot_count: AtomicU64,
     /// Granular record_change breakdown (QMVIR_TXN_PROFILE=1).
     txn_record_clone_row_ns: AtomicU64,
     txn_record_undo_push_ns: AtomicU64,
@@ -3864,6 +3877,8 @@ pub struct NativeSqlEngine {
     pub htap: Arc<crate::htap::HtapRuntime>,
     prepared_plans: Arc<RwLock<HashMap<u64, PreparedPlan>>>,
     next_prepared_plan_id: Arc<AtomicU64>,
+    /// Autocommit rows pending inverted / JSON / trigram / HNSW maintenance.
+    secondary_index_pending: Arc<Mutex<AHashMap<String, Vec<(i64, NativeRow)>>>>,
 }
 
 /// PyO3 wrapper around `NativeSqlEngine` for Python bindings.
@@ -4341,6 +4356,22 @@ impl PyNativeSqlEngine {
             dict.set_item(
                 "commit_deferred_index_ns",
                 profile.commit_deferred_index_ns.load(Ordering::Relaxed),
+            )?;
+            dict.set_item(
+                "dml_secondary_index_ns",
+                profile.dml_secondary_index_ns.load(Ordering::Relaxed),
+            )?;
+            dict.set_item(
+                "dml_pending_stage_ns",
+                profile.dml_pending_stage_ns.load(Ordering::Relaxed),
+            )?;
+            dict.set_item(
+                "dml_catalog_snapshot_ns",
+                profile.dml_catalog_snapshot_ns.load(Ordering::Relaxed),
+            )?;
+            dict.set_item(
+                "dml_catalog_snapshot_count",
+                profile.dml_catalog_snapshot_count.load(Ordering::Relaxed),
             )?;
             dict.set_item(
                 "txn_record_clone_row_ns",
@@ -4950,6 +4981,25 @@ fn sql_like_match(text: &str, pattern: &str) -> bool {
 }
 
 const LIKE_COLUMNAR_SCAN_MIN_ROWS: usize = 256;
+/// When the rarest trigram appears in (almost) every row, intersecting postings
+/// returns the full table — skip substring scan and return cached ids directly.
+const LIKE_TRIGRAM_UNIVERSAL_SELECTIVITY: f64 = 0.99;
+
+#[inline]
+fn format_i64_bytes(id: i64) -> Vec<u8> {
+    let mut buf = itoa::Buffer::new();
+    buf.format(id).as_bytes().to_vec()
+}
+
+#[inline]
+fn text_contains_needle_bytes(text: &str, needle: &[u8], case_insensitive: bool, ilike_needle: &str) -> bool {
+    if case_insensitive {
+        text.to_ascii_lowercase()
+            .contains(&ilike_needle.to_ascii_lowercase())
+    } else {
+        memchr::memmem::find(text.as_bytes(), needle).is_some()
+    }
+}
 
 fn vector_literal_text(v: &[f32]) -> String {
     let mut out = String::with_capacity(2 + v.len() * 10);
@@ -4989,17 +5039,19 @@ fn collect_like_contains_from_text_col(
     }
 
     let mut row_ids: Vec<i64> = if ids.len() >= LIKE_COLUMNAR_SCAN_MIN_ROWS {
-        let needle = needle.to_string();
+        let needle_bytes = needle.as_bytes();
         (0..ids.len())
             .into_par_iter()
             .filter_map(|i| {
-                like_literal_contains(&texts[i], &needle, is_ilike).then_some(ids[i])
+                text_contains_needle_bytes(&texts[i], needle_bytes, is_ilike, needle)
+                    .then_some(ids[i])
             })
             .collect()
     } else {
+        let needle_bytes = needle.as_bytes();
         let mut out = Vec::new();
         for i in 0..ids.len() {
-            if like_literal_contains(&texts[i], needle, is_ilike) {
+            if text_contains_needle_bytes(&texts[i], needle_bytes, is_ilike, needle) {
                 out.push(ids[i]);
                 if limit.is_some_and(|lim| out.len() >= lim) {
                     break;
@@ -5014,16 +5066,54 @@ fn collect_like_contains_from_text_col(
     row_ids
 }
 
+fn materialize_like_contains_id_rows_from_col(
+    ids: &[i64],
+    texts: &[String],
+    needle: &str,
+    is_ilike: bool,
+    limit: Option<usize>,
+) -> Vec<Vec<Option<Vec<u8>>>> {
+    debug_assert_eq!(ids.len(), texts.len());
+    if ids.is_empty() {
+        return Vec::new();
+    }
+    let needle_bytes = needle.as_bytes();
+    let mut rows_out: Vec<Vec<Option<Vec<u8>>>> = if ids.len() >= LIKE_COLUMNAR_SCAN_MIN_ROWS {
+        (0..ids.len())
+            .into_par_iter()
+            .filter_map(|i| {
+                text_contains_needle_bytes(&texts[i], needle_bytes, is_ilike, needle)
+                    .then(|| vec![Some(format_i64_bytes(ids[i]))])
+            })
+            .collect()
+    } else {
+        let mut out = Vec::new();
+        for i in 0..ids.len() {
+            if text_contains_needle_bytes(&texts[i], needle_bytes, is_ilike, needle) {
+                out.push(vec![Some(format_i64_bytes(ids[i]))]);
+                if limit.is_some_and(|lim| out.len() >= lim) {
+                    break;
+                }
+            }
+        }
+        out
+    };
+    if let Some(lim) = limit {
+        rows_out.truncate(lim);
+    }
+    rows_out
+}
+
 fn materialize_id_rows(row_ids: &[i64]) -> Vec<Vec<Option<Vec<u8>>>> {
     if row_ids.len() >= 4096 {
         row_ids
             .par_iter()
-            .map(|row_id| vec![Some(row_id.to_string().into_bytes())])
+            .map(|row_id| vec![Some(format_i64_bytes(*row_id))])
             .collect()
     } else {
         row_ids
             .iter()
-            .map(|row_id| vec![Some(row_id.to_string().into_bytes())])
+            .map(|row_id| vec![Some(format_i64_bytes(*row_id))])
             .collect()
     }
 }
@@ -5038,15 +5128,14 @@ fn collect_like_contains_row_ids(
 ) -> Vec<i64> {
     if limit.is_none() && table.rows.len() >= LIKE_COLUMNAR_SCAN_MIN_ROWS {
         let col = col_name.to_string();
-        let needle = needle.to_string();
+        let needle_bytes = needle.as_bytes();
         let mut row_ids: Vec<i64> = table
             .rows
             .par_iter()
             .filter_map(|(id, row)| {
-                row.cols
-                    .get(col.as_str())
-                    .filter(|cell| like_literal_contains(&cell.as_text(), &needle, is_ilike))
-                    .map(|_| *id)
+                row.cols.get(col.as_str()).filter(|cell| {
+                    text_contains_needle_bytes(&cell.as_text(), needle_bytes, is_ilike, needle)
+                }).map(|_| *id)
             })
             .collect();
         if sort_results {
@@ -5097,9 +5186,19 @@ impl NativeSqlEngine {
     }
 
     #[inline]
+    fn columnar_cached_row_count(&self, table: &str) -> Option<usize> {
+        self.buf_pool.get_cols(table).map(|cc| cc.ids.len())
+    }
+
+    #[inline]
     fn table_row_count(&self, table: &str) -> usize {
         if !self.htap_tx_active() && !self.transaction_active() {
             if let Some(n) = self.tables.row_count(table) {
+                if n > 0 {
+                    return n;
+                }
+            }
+            if let Some(n) = self.columnar_cached_row_count(table) {
                 if n > 0 {
                     return n;
                 }
@@ -5110,7 +5209,8 @@ impl NativeSqlEngine {
         if n > 0 {
             return n;
         }
-        self.tables.row_count(table).unwrap_or(0)
+        self.columnar_cached_row_count(table)
+            .unwrap_or_else(|| self.tables.row_count(table).unwrap_or(0))
     }
 
     fn htap_needs_column_refresh(&self, table: &str) -> bool {
@@ -5255,6 +5355,71 @@ impl NativeSqlEngine {
             htap,
             prepared_plans: Arc::new(RwLock::new(HashMap::new())),
             next_prepared_plan_id: Arc::new(AtomicU64::new(1)),
+            secondary_index_pending: Arc::new(Mutex::new(AHashMap::new())),
+        }
+    }
+
+    /// Autocommit secondary-index flush threshold (0 = flush on read or cap only).
+    fn secondary_index_pending_flush_threshold() -> usize {
+        std::env::var("QMVIR_SECONDARY_INDEX_PENDING_FLUSH")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0)
+    }
+
+    fn secondary_index_pending_len(&self, table: &str) -> usize {
+        self.secondary_index_pending
+            .lock()
+            .ok()
+            .and_then(|g| g.get(table).map(|v| v.len()))
+            .unwrap_or(0)
+    }
+
+    /// Flush staged secondary-index rows before indexed reads on `table`.
+    fn ensure_secondary_indexes_current(&self, table: &str) {
+        if self.secondary_index_pending_len(table) > 0 {
+            self.flush_secondary_index_pending(table);
+        }
+    }
+
+    fn flush_secondary_index_pending(&self, table: &str) {
+        let rows = {
+            let Ok(mut guard) = self.secondary_index_pending.lock() else {
+                return;
+            };
+            guard.remove(table).unwrap_or_default()
+        };
+        if rows.is_empty() {
+            return;
+        }
+        self.maintain_secondary_indexes_for_inserts(table, &rows);
+    }
+
+    fn stage_secondary_indexes_for_inserts(&self, table: &str, rows: &[(i64, NativeRow)]) {
+        if rows.is_empty() || !self.table_has_secondary_indexes(table) {
+            return;
+        }
+        let profile_start = if Self::native_profile_enabled() {
+            Some(Instant::now())
+        } else {
+            None
+        };
+        let pending_len = {
+            let Ok(mut guard) = self.secondary_index_pending.lock() else {
+                return;
+            };
+            let entry = guard.entry(table.to_string()).or_default();
+            entry.extend(rows.iter().cloned());
+            entry.len()
+        };
+        if let Some(start) = profile_start {
+            Self::profile_ns(&self.native_profile.dml_pending_stage_ns, start.elapsed());
+        }
+        let threshold = Self::secondary_index_pending_flush_threshold();
+        if pending_len >= SECONDARY_INDEX_PENDING_CAP
+            || (threshold > 0 && pending_len >= threshold)
+        {
+            self.flush_secondary_index_pending(table);
         }
     }
 
@@ -5296,6 +5461,7 @@ impl NativeSqlEngine {
             htap,
             prepared_plans: Arc::new(RwLock::new(HashMap::new())),
             next_prepared_plan_id: Arc::new(AtomicU64::new(1)),
+            secondary_index_pending: Arc::new(Mutex::new(AHashMap::new())),
         };
         // 1. Load binary snapshot if available (fast path).
         let snap_start = std::time::Instant::now();
@@ -5742,6 +5908,10 @@ impl NativeSqlEngine {
         profile.rollback_mvcc_abort_ns.store(0, Ordering::Relaxed);
         profile.commit_publish_mvcc_ns.store(0, Ordering::Relaxed);
         profile.commit_deferred_index_ns.store(0, Ordering::Relaxed);
+        profile.dml_secondary_index_ns.store(0, Ordering::Relaxed);
+        profile.dml_pending_stage_ns.store(0, Ordering::Relaxed);
+        profile.dml_catalog_snapshot_ns.store(0, Ordering::Relaxed);
+        profile.dml_catalog_snapshot_count.store(0, Ordering::Relaxed);
         profile.txn_record_clone_row_ns.store(0, Ordering::Relaxed);
         profile.txn_record_undo_push_ns.store(0, Ordering::Relaxed);
         profile.txn_record_tombstone_snap_ns.store(0, Ordering::Relaxed);
@@ -6310,12 +6480,44 @@ impl NativeSqlEngine {
             .map(|n| n as i64)
     }
 
-    /// MVCC-aware row lookup with heap fallback during migration.
+    /// MVCC-aware row lookup with heap / columnar-cache fallback during migration.
     #[inline]
     fn row_at(&self, table: &str, heap: &NativeTable, id: i64) -> Option<NativeRow> {
         self.htap_visible_row(table, id)
             .map(|r| (*r).clone())
             .or_else(|| heap.rows.get(&id).cloned())
+            .or_else(|| self.row_from_columnar_cache(table, heap, id))
+    }
+
+    /// Point lookup in a columnar-only seeded table (binary search on sorted ids).
+    fn row_from_columnar_cache(
+        &self,
+        table: &str,
+        t: &NativeTable,
+        id: i64,
+    ) -> Option<NativeRow> {
+        let cc = self.buf_pool.get_cols(table)?;
+        let idx = cc.ids.binary_search(&id).ok()?;
+        let id_col = t.columns.first().map(|s| s.as_str()).unwrap_or("id");
+        let mut cols = HashMap::with_capacity(t.columns.len());
+        for col in &t.columns {
+            let cell = if col == id_col {
+                Cell::Int(id)
+            } else if let Some(iv) = cc.int_cols.get(col) {
+                Cell::Int(iv[idx])
+            } else if let Some(fv) = cc.float_cols.get(col) {
+                Cell::Float(fv[idx])
+            } else if let Some(tv) = cc.text_cols.get(col) {
+                Cell::Text(tv[idx].clone())
+            } else {
+                Cell::Null
+            };
+            cols.insert(col.clone(), cell);
+        }
+        Some(NativeRow {
+            cols,
+            last_modified_lsn: 0,
+        })
     }
 
     /// Real autocommit: implicit BEGIN/COMMIT via HTAP tx_mgr (not WAL-only fake commit).
@@ -8503,6 +8705,18 @@ impl NativeSqlEngine {
         self.buf_pool.put_cols(table_name, cc)
     }
 
+    /// Row ids without building full text/float columnar caches (order undefined).
+    fn table_row_ids_fast(&self, table_name: &str, t: &NativeTable) -> Vec<i64> {
+        if let Some(cc) = self.buf_pool.get_cols(table_name) {
+            return cc.ids.clone();
+        }
+        if t.rows.len() >= LIKE_COLUMNAR_SCAN_MIN_ROWS {
+            t.rows.par_iter().map(|(id, _)| *id).collect()
+        } else {
+            t.rows.keys().copied().collect()
+        }
+    }
+
     fn like_contains_row_ids(
         &self,
         table: &str,
@@ -8529,8 +8743,55 @@ impl NativeSqlEngine {
         is_ilike: bool,
         limit: Option<usize>,
     ) -> Vec<Vec<Option<Vec<u8>>>> {
-        let row_ids = self.like_contains_row_ids(table, t, col_name, needle, is_ilike, limit);
+        let cc = self.get_or_build_cols(table, t);
+        if let Some(texts) = cc.text_cols.get(col_name) {
+            return materialize_like_contains_id_rows_from_col(
+                &cc.ids,
+                texts,
+                needle,
+                is_ilike,
+                limit,
+            );
+        }
+        let row_ids = collect_like_contains_row_ids(t, col_name, needle, is_ilike, limit, false);
         materialize_id_rows(&row_ids)
+    }
+
+    fn like_universal_trigram_match(
+        entry: &Arc<crate::index::trigram_catalog::ManagedTrigramIndex>,
+        t: &NativeTable,
+        col_name: &str,
+        needle: &str,
+        table_rows: usize,
+        is_ilike: bool,
+    ) -> bool {
+        if table_rows == 0 {
+            return false;
+        }
+        let selectivity = match entry.rarest_gram_selectivity(needle, table_rows) {
+            Some(s) if s >= LIKE_TRIGRAM_UNIVERSAL_SELECTIVITY => s,
+            _ => return false,
+        };
+        if selectivity < 1.0 {
+            let row_ids = entry.search_contains(needle);
+            if row_ids.len() != table_rows {
+                return false;
+            }
+        }
+        let probe = t
+            .rows
+            .iter()
+            .nth(table_rows / 2)
+            .or_else(|| t.rows.iter().next())
+            .map(|(id, _)| *id);
+        let Some(probe) = probe else {
+            return false;
+        };
+        t.rows
+            .get(&probe)
+            .and_then(|row| row.cols.get(col_name))
+            .map(|cell| like_literal_contains(&cell.as_text(), needle, is_ilike))
+            .unwrap_or(false)
     }
 
     pub fn execute(&self, sql: &str) -> Result<QueryResult, String> {
@@ -12000,6 +12261,115 @@ impl NativeSqlEngine {
             .collect())
     }
 
+    fn table_has_secondary_indexes(&self, table: &str) -> bool {
+        !self.inverted_catalog.indexes_for_table(table).is_empty()
+            || !self.json_path_catalog.indexes_for_table(table).is_empty()
+            || !self.trigram_catalog.indexes_for_table(table).is_empty()
+            || !self.vector_hnsw_catalog.indexes_for_table(table).is_empty()
+    }
+
+    fn profile_catalog_snapshot(&self, start: Instant) {
+        if Self::native_profile_enabled() {
+            Self::profile_ns(&self.native_profile.dml_catalog_snapshot_ns, start.elapsed());
+            self.native_profile
+                .dml_catalog_snapshot_count
+                .fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn maintain_secondary_indexes_for_inserts(&self, table: &str, rows: &[(i64, NativeRow)]) {
+        if rows.is_empty() || !self.table_has_secondary_indexes(table) {
+            return;
+        }
+        let profile_start = if Self::native_profile_enabled() {
+            Some(Instant::now())
+        } else {
+            None
+        };
+        let has_inverted = !self.inverted_catalog.indexes_for_table(table).is_empty()
+            || !self.json_path_catalog.indexes_for_table(table).is_empty()
+            || !self.trigram_catalog.indexes_for_table(table).is_empty();
+        let has_hnsw = !self.vector_hnsw_catalog.indexes_for_table(table).is_empty();
+        if has_hnsw && rows.len() > 1 {
+            let batch: Vec<(i64, &NativeRow)> = rows.iter().map(|(id, row)| (*id, row)).collect();
+            self.maintain_vector_hnsw_indexes_for_rows(table, &batch);
+        }
+        for (row_id, row) in rows {
+            if has_inverted {
+                self.maintain_inverted_indexes_for_row(table, *row_id, row);
+                self.maintain_json_path_indexes_for_row(table, *row_id, row);
+                self.maintain_trigram_indexes_for_row(table, *row_id, row);
+            }
+            if has_hnsw && rows.len() == 1 {
+                self.maintain_vector_hnsw_indexes_for_row(table, *row_id, row);
+            }
+        }
+        self.maybe_warm_adaptive_vector_hnsw_indexes(table);
+        if let Some(start) = profile_start {
+            Self::profile_ns(&self.native_profile.dml_secondary_index_ns, start.elapsed());
+        }
+    }
+
+    fn autocommit_update_by_pk(
+        &self,
+        table: &str,
+        row_id: i64,
+        mut assignments: Vec<(String, Cell)>,
+        wal_sql: &str,
+    ) -> Result<QueryResult, String> {
+        let lookup_start = if Self::native_profile_enabled() {
+            Some(Instant::now())
+        } else {
+            None
+        };
+        let exists = self
+            .tables
+            .with_read(table, |t| t.rows.contains_key(&row_id))
+            .unwrap_or(false);
+        if let Some(start) = lookup_start {
+            Self::profile_ns(&self.native_profile.pk_lookup_ns, start.elapsed());
+            self.native_profile
+                .pk_lookup_count
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        if !exists {
+            return Ok(Self::empty_ok("UPDATE 0"));
+        }
+
+        self.tables.with_write(table, |t| -> Result<(), String> {
+            assignments = Self::coerce_assignments_for_table(t, &assignments)?;
+            Self::enforce_constraints_on_update(t, &[row_id], &assignments)?;
+            Self::validate_update_vector_dimensions(t, &assignments)?;
+            let old_row = t
+                .rows
+                .get(&row_id)
+                .cloned()
+                .ok_or_else(|| format!("row {row_id} missing from table {table}"))?;
+            if let Some(row) = t.rows.get_mut(&row_id) {
+                self.update_indexes(table, row_id, &old_row, &assignments);
+                for (col, val) in &assignments {
+                    row.cols.insert(col.clone(), val.clone());
+                }
+                let snapshot = if self.htap_tx_active() {
+                    Some(row.clone())
+                } else {
+                    None
+                };
+                if let Some(snapshot) = snapshot {
+                    self.htap_track_row_write(table, t, row_id, &snapshot);
+                }
+            }
+            Ok(())
+        })??;
+
+        self.buf_pool.invalidate(table);
+        if self.data_dir.is_some() {
+            self.wal_append(wal_sql)?;
+            self.after_successful_autocommit_wal_mutation()?;
+        }
+        Ok(Self::empty_ok("UPDATE 1"))
+    }
+
     fn maintain_vector_hnsw_indexes_for_row(&self, table: &str, row_id: i64, row: &NativeRow) {
         if Self::vector_skip_hnsw_maintain() {
             return;
@@ -13837,6 +14207,7 @@ impl NativeSqlEngine {
         cols: &[String],
         mut prepared_rows: Vec<(i64, NativeRow)>,
         wal_sql: &str,
+        trusted_series: bool,
     ) -> Result<usize, String> {
         if prepared_rows.is_empty() {
             return Ok(0);
@@ -13853,6 +14224,12 @@ impl NativeSqlEngine {
                 .cloned()
                 .collect()
         };
+        let maintain_secondary = self.table_has_secondary_indexes(table);
+        let index_rows: Vec<(i64, NativeRow)> = if maintain_secondary {
+            prepared_rows.clone()
+        } else {
+            Vec::new()
+        };
 
         let count = self.tables.with_write_or_create(
             table,
@@ -13862,6 +14239,19 @@ impl NativeSqlEngine {
             },
             |t| {
                 t.ensure_auto_id_initialized();
+                if trusted_series {
+                    let n = prepared_rows.len();
+                    if let Some((max_id, _)) = prepared_rows.iter().max_by_key(|(id, _)| id) {
+                        if *max_id >= t.next_auto_id {
+                            t.next_auto_id = max_id.saturating_add(1);
+                        }
+                    }
+                    t.rows.reserve(n.saturating_sub(t.rows.len()));
+                    for (id, row) in prepared_rows {
+                        t.rows.insert(id, row);
+                    }
+                    return Ok(n);
+                }
                 Self::normalize_insert_rows_for_table(t, &mut prepared_rows, false)?;
                 if let Err(err) = Self::enforce_constraints_on_insert(t, &mut prepared_rows) {
                     return Err(err);
@@ -13870,9 +14260,7 @@ impl NativeSqlEngine {
                     return Err(err);
                 }
                 let n = prepared_rows.len();
-                for (id, row) in &prepared_rows {
-                    t.rows.insert(*id, row.clone());
-                }
+                t.rows.reserve(n.saturating_sub(t.rows.len()));
                 if !table_indexes.is_empty() {
                     for (id, row) in &prepared_rows {
                         for tree in &table_indexes {
@@ -13886,14 +14274,205 @@ impl NativeSqlEngine {
                         }
                     }
                 }
+                for (id, row) in prepared_rows {
+                    t.rows.insert(id, row);
+                }
                 Ok(n)
             },
         )?;
+
+        if maintain_secondary {
+            self.stage_secondary_indexes_for_inserts(table, &index_rows);
+        }
 
         self.wal_append(wal_sql)?;
         self.index_mgr.record_writes(table, cols.iter().map(|c| c.as_str()));
         self.mark_table_data_dirty(table, count as u64);
         self.buf_pool.invalidate(table);
+        let _ = self.after_successful_autocommit_wal_mutation();
+        Ok(count)
+    }
+
+    /// Build sorted SoA numeric columns for the OLAP bench generate_series template.
+    fn build_olap_series_numeric_soa(start: i64, count: usize) -> (Vec<i64>, Vec<i64>, Vec<f64>) {
+        if count == 0 {
+            return (Vec::new(), Vec::new(), Vec::new());
+        }
+        if count >= OLAP_SOA_PARALLEL_MIN_ROWS {
+            let n_threads = rayon::current_num_threads().max(1);
+            let chunk = count.div_ceil(n_threads);
+            let parts: Vec<(Vec<i64>, Vec<i64>, Vec<f64>)> = (0..n_threads)
+                .into_par_iter()
+                .filter_map(|tid| {
+                    let lo = tid * chunk;
+                    if lo >= count {
+                        return None;
+                    }
+                    let hi = ((tid + 1) * chunk).min(count);
+                    let mut ids = Vec::with_capacity(hi - lo);
+                    let mut grp = Vec::with_capacity(hi - lo);
+                    let mut val = Vec::with_capacity(hi - lo);
+                    for offset in lo..hi {
+                        let i = start.saturating_add(offset as i64);
+                        ids.push(i);
+                        grp.push(i.rem_euclid(100));
+                        val.push(i.rem_euclid(17) as f64 / 17.0);
+                    }
+                    Some((ids, grp, val))
+                })
+                .collect();
+            let mut ids = Vec::with_capacity(count);
+            let mut grp = Vec::with_capacity(count);
+            let mut val = Vec::with_capacity(count);
+            for (a, b, c) in parts {
+                ids.extend(a);
+                grp.extend(b);
+                val.extend(c);
+            }
+            (ids, grp, val)
+        } else {
+            let mut ids = Vec::with_capacity(count);
+            let mut grp = Vec::with_capacity(count);
+            let mut val = Vec::with_capacity(count);
+            for offset in 0..count {
+                let i = start.saturating_add(offset as i64);
+                ids.push(i);
+                grp.push(i.rem_euclid(100));
+                val.push(i.rem_euclid(17) as f64 / 17.0);
+            }
+            (ids, grp, val)
+        }
+    }
+
+    /// Dictionary-backed tag column (`tag_{i % 20}`) for OLAP series seed.
+    fn build_olap_series_tag_col(ids: &[i64]) -> Vec<String> {
+        let tags: Arc<[String; 20]> =
+            Arc::new(std::array::from_fn(|k| format!("tag_{k}")));
+        if ids.len() >= OLAP_SOA_PARALLEL_MIN_ROWS {
+            ids.par_iter()
+                .map(|i| tags[i.rem_euclid(20) as usize].clone())
+                .collect()
+        } else {
+            ids.iter()
+                .map(|i| tags[i.rem_euclid(20) as usize].clone())
+                .collect()
+        }
+    }
+
+    /// Legacy SoA builder (includes tag strings) for heap materialization paths.
+    fn build_olap_series_soa(start: i64, count: usize) -> (Vec<i64>, Vec<i64>, Vec<f64>, Vec<String>) {
+        let (ids, grp, val) = Self::build_olap_series_numeric_soa(start, count);
+        let tags: Arc<[String; 20]> = Arc::new(std::array::from_fn(|k| format!("tag_{k}")));
+        let tag: Vec<String> = if count >= OLAP_SOA_PARALLEL_MIN_ROWS {
+            ids.par_iter()
+                .map(|i| tags[i.rem_euclid(20) as usize].clone())
+                .collect()
+        } else {
+            ids.iter()
+                .map(|i| tags[i.rem_euclid(20) as usize].clone())
+                .collect()
+        };
+        (ids, grp, val, tag)
+    }
+
+    fn materialize_olap_rows_from_soa(
+        cols: &[String],
+        ids: &[i64],
+        grp: &[i64],
+        val: &[f64],
+        tags: &[String],
+    ) -> Vec<(i64, NativeRow)> {
+        let col_keys: Arc<[String]> = Arc::from(cols.to_vec().into_boxed_slice());
+        let build = |idx: usize| {
+            let id = ids[idx];
+            let mut row_map = HashMap::with_capacity(cols.len());
+            if let Some(name) = col_keys.first() {
+                row_map.insert(name.clone(), Cell::Int(id));
+            }
+            if col_keys.len() > 1 {
+                row_map.insert(col_keys[1].clone(), Cell::Int(grp[idx]));
+            }
+            if col_keys.len() > 2 {
+                row_map.insert(col_keys[2].clone(), Cell::Float(val[idx]));
+            }
+            if col_keys.len() > 3 {
+                row_map.insert(col_keys[3].clone(), Cell::Text(tags[idx].clone()));
+            }
+            (
+                id,
+                NativeRow {
+                    cols: row_map,
+                    last_modified_lsn: 0,
+                },
+            )
+        };
+        if ids.len() >= 16_384 {
+            (0..ids.len()).into_par_iter().map(build).collect()
+        } else {
+            (0..ids.len()).map(build).collect()
+        }
+    }
+
+    /// Columnar-only bulk seed for large OLAP bench-shaped generate_series INSERTs.
+    fn bulk_seed_olap_series_columnar(
+        &self,
+        table: &str,
+        cols: &[String],
+        start: i64,
+        count: usize,
+        wal_sql: &str,
+    ) -> Result<usize, String> {
+        if self.transaction_active() {
+            return Err("bulk OLAP series seed unavailable inside transaction".into());
+        }
+        let end = start.saturating_add(count as i64).saturating_sub(1);
+        let (ids, grp, val) = Self::build_olap_series_numeric_soa(start, count);
+
+        self.tables.with_write_or_create(
+            table,
+            || {
+                let default_types = cols.iter().map(|_| ColType::Text).collect();
+                NativeTable::new(cols.to_vec(), default_types)
+            },
+            |t| {
+                t.ensure_auto_id_initialized();
+                if end >= t.next_auto_id {
+                    t.next_auto_id = end.saturating_add(1);
+                }
+            },
+        );
+
+        self.wal_append(wal_sql)?;
+        if self.has_indexes_for_table(table) {
+            self.index_mgr
+                .record_writes(table, cols.iter().map(|c| c.as_str()));
+        }
+        self.mark_table_data_dirty(table, count as u64);
+        self.buf_pool.invalidate(table);
+        let gen = self.buf_pool.current_gen(table);
+
+        let mut int_cols = AHashMap::new();
+        if cols.len() > 1 {
+            int_cols.insert(cols[1].clone(), grp);
+        }
+        let mut float_cols = AHashMap::new();
+        if cols.len() > 2 {
+            float_cols.insert(cols[2].clone(), val);
+        }
+        let mut text_cols = AHashMap::new();
+        if cols.len() > 3 {
+            text_cols.insert(cols[3].clone(), Self::build_olap_series_tag_col(&ids));
+        }
+        self.buf_pool.put_cols(
+            table,
+            CachedColumns {
+                generation: gen,
+                ids,
+                int_cols,
+                float_cols,
+                text_cols,
+            },
+        );
         let _ = self.after_successful_autocommit_wal_mutation();
         Ok(count)
     }
@@ -13956,7 +14535,7 @@ impl NativeSqlEngine {
         }
 
         let wal = format!("COPY {} FROM STDIN QM_INLINE {}", table, hex::encode(data));
-        let count = self.bulk_insert_rows_fast(table, &cols, rows, &wal)?;
+        let count = self.bulk_insert_rows_fast(table, &cols, rows, &wal, false)?;
         Ok(count as u64)
     }
 
@@ -14553,7 +15132,389 @@ impl NativeSqlEngine {
         None
     }
 
+    fn split_top_level_csv(part: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut in_quote = false;
+        let mut depth = 0i32;
+        let mut start = 0usize;
+        let bytes = part.as_bytes();
+        for i in 0..bytes.len() {
+            match bytes[i] {
+                b'\'' => in_quote = !in_quote,
+                b'(' | b'[' | b'{' if !in_quote => depth += 1,
+                b')' | b']' | b'}' if !in_quote => depth -= 1,
+                b',' if !in_quote && depth == 0 => {
+                    out.push(part[start..i].trim().to_string());
+                    start = i + 1;
+                }
+                _ => {}
+            }
+        }
+        if start < part.len() || part.is_empty() {
+            out.push(part[start..].trim().to_string());
+        }
+        out
+    }
+
+    fn parse_generate_series_bounds(from_sql: &str) -> Option<(i64, i64, String)> {
+        let gs_idx = Self::find_ascii_ci(from_sql, "generate_series")?;
+        let open = from_sql[gs_idx..].find('(')? + gs_idx + 1;
+        let close = from_sql[open..].find(')')? + open;
+        let args = Self::split_top_level_csv(&from_sql[open..close]);
+        if args.len() < 2 {
+            return None;
+        }
+        let start: i64 = args[0].parse().ok()?;
+        let end: i64 = args[1].parse().ok()?;
+        let tail = from_sql[close + 1..].trim();
+        let var = if let Some(as_idx) = Self::find_ascii_ci(tail, "AS") {
+            let after = tail[as_idx + 2..].trim();
+            if let Some(lp) = after.find('(') {
+                let rp = after[lp + 1..].find(')')?;
+                after[lp + 1..lp + 1 + rp].trim().to_string()
+            } else {
+                after.split_whitespace().next()?.to_string()
+            }
+        } else {
+            "i".to_string()
+        };
+        Some((start, end, var))
+    }
+
+    fn eval_series_mod_var(expr: &str, var: &str, i: i64) -> Option<i64> {
+        let expr = expr.trim();
+        if expr == var {
+            return Some(i);
+        }
+        let expr = expr.trim_matches(|c: char| c == '(' || c == ')').trim();
+        if expr == var {
+            return Some(i);
+        }
+        let prefix = format!("{var} % ");
+        if let Some(mod_str) = expr.strip_prefix(&prefix) {
+            let modulo: i64 = mod_str.trim().parse().ok()?;
+            return Some(i.rem_euclid(modulo));
+        }
+        if let Some(inner) = expr.strip_prefix('(').and_then(|s| s.strip_suffix(')')) {
+            return Self::eval_series_mod_var(inner, var, i);
+        }
+        None
+    }
+
+    fn eval_series_select_expr(expr: &str, var: &str, i: i64) -> Result<Cell, String> {
+        let expr = expr.trim();
+        if let Some(idx) = Self::find_ascii_ci(expr, "||") {
+            let left = Self::eval_series_select_expr(expr[..idx].trim(), var, i)?;
+            let right = Self::eval_series_select_expr(expr[idx + 2..].trim(), var, i)?;
+            return Ok(Cell::Text(format!("{}{}", left.as_text(), right.as_text())));
+        }
+        if let Some(slash_idx) = expr.rfind('/') {
+            let denom = expr[slash_idx + 1..].trim();
+            if denom.contains('.') {
+                let denom_f: f64 = denom
+                    .trim_end_matches(|c: char| !c.is_ascii_digit() && c != '.')
+                    .parse()
+                    .map_err(|_| format!("invalid series float divisor in `{expr}`"))?;
+                let numer = expr[..slash_idx].trim();
+                let numer_i = Self::eval_series_mod_var(numer, var, i)
+                    .ok_or_else(|| format!("unsupported series numerator `{numer}`"))?;
+                return Ok(Cell::Float(numer_i as f64 / denom_f));
+            }
+        }
+        if let Ok(n) = expr.parse::<i64>() {
+            return Ok(Cell::Int(n));
+        }
+        if expr.starts_with('\'') && expr.ends_with('\'') {
+            return Ok(Cell::Text(
+                expr[1..expr.len() - 1].replace("''", "'"),
+            ));
+        }
+        if let Some(v) = Self::eval_series_mod_var(expr, var, i) {
+            return Ok(Cell::Int(v));
+        }
+        Err(format!("unsupported generate_series expression `{expr}`"))
+    }
+
+    fn normalize_series_expr(expr: &str) -> String {
+        expr.split_whitespace().collect::<Vec<_>>().join(" ")
+    }
+
+    fn is_olap_series_template(exprs: &[String], var: &str) -> bool {
+        if exprs.len() != 4 {
+            return false;
+        }
+        let n = |s: &str| Self::normalize_series_expr(s);
+        let tag_a = format!("'tag_' || ({var} % 20)");
+        let tag_b = format!("'tag_' || ({var}%20)");
+        n(&exprs[0]) == var
+            && n(&exprs[1]) == format!("{var} % 100")
+            && n(&exprs[2]) == format!("({var} % 17) / 17.0")
+            && (n(&exprs[3]) == tag_a || n(&exprs[3]) == tag_b)
+    }
+
+    fn series_text_prefix_rhs(expr: &str, var: &str) -> Option<String> {
+        let e = Self::normalize_series_expr(expr);
+        let idx = e.find("||")?;
+        let left = e[..idx].trim();
+        let right = e[idx + 2..].trim();
+        if right != var && right != format!("({var})") {
+            return None;
+        }
+        if left.starts_with('\'') && left.ends_with('\'') {
+            Some(left[1..left.len().saturating_sub(1)].replace("''", "'"))
+        } else {
+            None
+        }
+    }
+
+    fn is_series_id_text_prefix(exprs: &[String], var: &str) -> Option<String> {
+        if exprs.len() != 2 {
+            return None;
+        }
+        if Self::normalize_series_expr(&exprs[0]) != var {
+            return None;
+        }
+        Self::series_text_prefix_rhs(&exprs[1], var)
+    }
+
+    fn bulk_insert_id_text_prefix_series(
+        &self,
+        table: &str,
+        cols: &[String],
+        text_col: &str,
+        prefix: &str,
+        start: i64,
+        count: usize,
+        wal_sql: &str,
+    ) -> Result<usize, String> {
+        let prefix = prefix.to_string();
+        let text_col = text_col.to_string();
+        let id_col = cols
+            .first()
+            .cloned()
+            .unwrap_or_else(|| "id".to_string());
+        let build = |offset: usize| {
+            let id = start.saturating_add(offset as i64);
+            let mut row_map = HashMap::with_capacity(2);
+            row_map.insert(id_col.clone(), Cell::Int(id));
+            row_map.insert(text_col.clone(), Cell::Text(format!("{prefix}{id}")));
+            (
+                id,
+                NativeRow {
+                    cols: row_map,
+                    last_modified_lsn: 0,
+                },
+            )
+        };
+        let prepared_rows: Vec<(i64, NativeRow)> = if count >= OLAP_SOA_PARALLEL_MIN_ROWS {
+            (0..count).into_par_iter().map(build).collect()
+        } else {
+            (0..count).map(build).collect()
+        };
+        self.bulk_insert_rows_fast(table, cols, prepared_rows, wal_sql, true)
+    }
+
+    fn build_rows_olap_series_template(
+        start: i64,
+        count: usize,
+        cols: &[String],
+    ) -> Vec<(i64, NativeRow)> {
+        let tags: Vec<String> = (0..20).map(|k| format!("tag_{k}")).collect();
+        let mut rows = Vec::with_capacity(count);
+        for offset in 0..count {
+            let i = start.saturating_add(offset as i64);
+            let mut row_map = HashMap::with_capacity(cols.len());
+            for col in cols {
+                let cell = if col == "id" {
+                    Cell::Int(i)
+                } else if col == "grp" {
+                    Cell::Int(i.rem_euclid(100))
+                } else if col == "val" {
+                    Cell::Float(i.rem_euclid(17) as f64 / 17.0)
+                } else if col == "tag" {
+                    Cell::Text(tags[i.rem_euclid(20) as usize].clone())
+                } else {
+                    Cell::Null
+                };
+                row_map.insert(col.clone(), cell);
+            }
+            rows.push((
+                i,
+                NativeRow {
+                    cols: row_map,
+                    last_modified_lsn: 0,
+                },
+            ));
+        }
+        rows
+    }
+
+    fn build_rows_olap_series_template_par(
+        start: i64,
+        count: usize,
+        cols: &[String],
+    ) -> Vec<(i64, NativeRow)> {
+        let tags: Arc<[String; 20]> = Arc::new(std::array::from_fn(|k| format!("tag_{k}")));
+        let cols = Arc::new(cols.to_vec());
+        (0..count)
+            .into_par_iter()
+            .map(|offset| {
+                let i = start.saturating_add(offset as i64);
+                let mut row_map = HashMap::with_capacity(cols.len());
+                for col in cols.iter() {
+                    let cell = if col == "id" {
+                        Cell::Int(i)
+                    } else if col == "grp" {
+                        Cell::Int(i.rem_euclid(100))
+                    } else if col == "val" {
+                        Cell::Float(i.rem_euclid(17) as f64 / 17.0)
+                    } else if col == "tag" {
+                        Cell::Text(tags[i.rem_euclid(20) as usize].clone())
+                    } else {
+                        Cell::Null
+                    };
+                    row_map.insert(col.clone(), cell);
+                }
+                (
+                    i,
+                    NativeRow {
+                        cols: row_map,
+                        last_modified_lsn: 0,
+                    },
+                )
+            })
+            .collect()
+    }
+
+    fn try_bulk_insert_from_generate_series(&self, s: &str) -> Option<Result<QueryResult, String>> {
+        if self.transaction_active() {
+            return None;
+        }
+        let s = s.trim().trim_end_matches(';');
+        if !Self::sql_prefix_ci(s, "INSERT INTO ") {
+            return None;
+        }
+        let up = s.to_ascii_uppercase();
+        if !up.contains(" SELECT ") || !up.contains("GENERATE_SERIES(") {
+            return None;
+        }
+        if up.contains(" ON CONFLICT") || up.contains(" RETURNING ") || up.contains(" JOIN ") {
+            return None;
+        }
+
+        let table = Self::parse_ident_after(s, "INSERT INTO")?.to_string();
+        let select_idx = Self::find_ascii_ci(s, "SELECT")?;
+        let from_idx = Self::find_ascii_ci(s, "FROM")?;
+        if from_idx <= select_idx {
+            return None;
+        }
+
+        let values_kw_idx = up.find("VALUES");
+        let first_paren = s.find('(');
+        let (cols, _col_close): (Vec<String>, usize) = match (first_paren, values_kw_idx) {
+            (Some(paren_idx), Some(kw_idx)) if paren_idx < kw_idx => {
+                let col_open = paren_idx;
+                let col_close = s[col_open + 1..].find(')')? + col_open + 1;
+                let cols_part = &s[col_open + 1..col_close];
+                let cols: Vec<String> = cols_part
+                    .split(',')
+                    .map(|x| x.trim().trim_matches('"').to_string())
+                    .collect();
+                (cols, col_close)
+            }
+            _ => {
+                let cols = self.tables.with_read(&table, |t| t.columns.clone()).ok()?;
+                (cols, select_idx)
+            }
+        };
+
+        let select_exprs = Self::split_top_level_csv(s[select_idx + 6..from_idx].trim());
+        if select_exprs.len() != cols.len() {
+            return Some(Err(
+                "generate_series INSERT: SELECT column count mismatch".to_string(),
+            ));
+        }
+
+        let from_sql = s[from_idx + 4..].trim();
+        let (start, end, var) = Self::parse_generate_series_bounds(from_sql)?;
+        if end < start {
+            return Some(Err("generate_series: end < start".to_string()));
+        }
+        let count = (end - start).saturating_add(1) as usize;
+        if count == 0 {
+            return Some(Ok(Self::empty_ok("INSERT 0 0")));
+        }
+
+        if Self::is_olap_series_template(&select_exprs, &var) && count >= OLAP_COLUMNAR_SEED_MIN_ROWS
+        {
+            return Some(
+                self.bulk_seed_olap_series_columnar(&table, &cols, start, count, s)
+                    .map(|count| Self::empty_ok(&format!("INSERT 0 {count}"))),
+            );
+        }
+
+        if let Some(prefix) = Self::is_series_id_text_prefix(&select_exprs, &var) {
+            if count >= SERIES_PREFIX_HEAP_MIN_ROWS {
+                let text_col = cols
+                    .get(1)
+                    .cloned()
+                    .unwrap_or_else(|| "category".to_string());
+                return Some(
+                    self.bulk_insert_id_text_prefix_series(
+                        &table, &cols, &text_col, &prefix, start, count, s,
+                    )
+                    .map(|count| Self::empty_ok(&format!("INSERT 0 {count}"))),
+                );
+            }
+        }
+
+        let prepared_rows = if Self::is_olap_series_template(&select_exprs, &var) {
+            if count >= OLAP_SOA_PARALLEL_MIN_ROWS {
+                Self::build_rows_olap_series_template_par(start, count, &cols)
+            } else {
+                Self::build_rows_olap_series_template(start, count, &cols)
+            }
+        } else {
+            let build_row = |offset: usize| -> Result<(i64, NativeRow), String> {
+                let i = start.saturating_add(offset as i64);
+                let mut row_map: HashMap<String, Cell> = HashMap::with_capacity(cols.len());
+                let mut row_id = i;
+                for (col, expr) in cols.iter().zip(select_exprs.iter()) {
+                    let cell = Self::eval_series_select_expr(expr, &var, i)?;
+                    if col.eq_ignore_ascii_case("id") {
+                        row_id = cell.as_i64();
+                    }
+                    row_map.insert(col.clone(), cell);
+                }
+                Ok((
+                    row_id,
+                    NativeRow {
+                        cols: row_map,
+                        last_modified_lsn: 0,
+                    },
+                ))
+            };
+            let built: Result<Vec<(i64, NativeRow)>, String> = if count >= OLAP_SOA_PARALLEL_MIN_ROWS {
+                (0..count).into_par_iter().map(build_row).collect()
+            } else {
+                (0..count).map(build_row).collect()
+            };
+            match built {
+                Ok(rows) => rows,
+                Err(err) => return Some(Err(err)),
+            }
+        };
+
+        Some(
+            self.bulk_insert_rows_fast(&table, &cols, prepared_rows, s, true)
+                .map(|count| Self::empty_ok(&format!("INSERT 0 {count}"))),
+        )
+    }
+
     fn handle_insert(&self, s: &str) -> Result<QueryResult, String> {
+        if let Some(result) = self.try_bulk_insert_from_generate_series(s) {
+            return result;
+        }
         let table = Self::parse_ident_after(s, "INSERT INTO").ok_or("Invalid INSERT")?;
         let up = s.to_ascii_uppercase();
         let tx_active = self.transaction_active();
@@ -14753,13 +15714,14 @@ impl NativeSqlEngine {
                 rows
             };
 
-        if prepared_rows.len() >= 4
-            && matches!(conflict_action, ConflictAction::None)
+        if matches!(conflict_action, ConflictAction::None)
             && returning_cols.is_empty()
             && !tx_active
             && on_conflict_idx.is_none()
+            && !self.catalog_table_has_fk_side_effects(table, false)
+            && !self.catalog_table_has_fk_references(table, false)
         {
-            let count = self.bulk_insert_rows_fast(table, &cols, prepared_rows, s)?;
+            let count = self.bulk_insert_rows_fast(table, &cols, prepared_rows, s, false)?;
             return Ok(QueryResult {
                 columns: Vec::new(),
                 rows: Vec::new(),
@@ -14805,8 +15767,11 @@ impl NativeSqlEngine {
         let has_table_indexes = !table_indexes.is_empty();
         let mut index_changes: Vec<(i64, Option<NativeRow>, NativeRow)> = Vec::new();
         let pending_inverted_ids: Vec<i64> = prepared_rows.iter().map(|(id, _)| *id).collect();
+        let secondary_rows_snapshot = prepared_rows.clone();
         {
+            let catalog_snap_start = Instant::now();
             let mut g = self.tables.write();
+            self.profile_catalog_snapshot(catalog_snap_start);
 
             let old_next_auto_id = {
                 let t = g.entry(table.to_string()).or_insert_with(|| {
@@ -15024,30 +15989,12 @@ impl NativeSqlEngine {
                 || !self.trigram_catalog.indexes_for_table(table).is_empty();
             let has_hnsw = !self.vector_hnsw_catalog.indexes_for_table(table).is_empty();
             if has_inverted || has_hnsw {
-                let g = self.tables.to_native_map();
-                if let Some(t) = g.get(table) {
-                    if has_hnsw && pending_inverted_ids.len() > 1 {
-                        let batch: Vec<(i64, &NativeRow)> = pending_inverted_ids
-                            .iter()
-                            .filter_map(|id| t.rows.get(id).map(|row| (*id, row)))
-                            .collect();
-                        self.maintain_vector_hnsw_indexes_for_rows(table, &batch);
-                    }
-                    for id in &pending_inverted_ids {
-                        if let Some(row) = t.rows.get(id) {
-                            if has_inverted {
-                                self.maintain_inverted_indexes_for_row(table, *id, row);
-                                self.maintain_json_path_indexes_for_row(table, *id, row);
-                                self.maintain_trigram_indexes_for_row(table, *id, row);
-                            }
-                            if has_hnsw && pending_inverted_ids.len() == 1 {
-                                self.maintain_vector_hnsw_indexes_for_row(table, *id, row);
-                            }
-                        }
-                    }
+                if self.transaction_active() {
+                    self.maintain_secondary_indexes_for_inserts(table, &secondary_rows_snapshot);
+                } else {
+                    self.stage_secondary_indexes_for_inserts(table, &secondary_rows_snapshot);
                 }
             }
-            self.maybe_warm_adaptive_vector_hnsw_indexes(table);
         }
 
         // Maintain indexes for the actual inserted or updated rows.
@@ -15299,8 +16246,20 @@ impl NativeSqlEngine {
             None // UPDATE without WHERE updates all rows
         };
 
+        // Expand RETURNING * to actual columns (read-only; no catalog snapshot).
+        let ret_cols_expanded: Vec<String> =
+            if returning_cols.len() == 1 && returning_cols[0] == "*" {
+                self.tables
+                    .with_read(table, |t| t.columns.clone())
+                    .unwrap_or_default()
+            } else {
+                returning_cols.clone()
+            };
+
         if tx_active {
+            let catalog_snap_start = Instant::now();
             let g = self.tables.to_native_map();
+            self.profile_catalog_snapshot(catalog_snap_start);
             let needs_full_snapshot = Self::table_has_fk_side_effects(&g, table, false);
             drop(g);
             if needs_full_snapshot {
@@ -15308,70 +16267,22 @@ impl NativeSqlEngine {
             }
         }
 
-        let mut g = self.tables.write();
-        let has_fk_references = Self::table_has_fk_references(&g, table, false);
-        let mut count = 0usize;
-        let mut returning_rows: Vec<Vec<Option<Vec<u8>>>> = Vec::new();
-
-        // Expand RETURNING * to actual columns
-        let ret_cols_expanded: Vec<String> =
-            if returning_cols.len() == 1 && returning_cols[0] == "*" {
-                g.get(table).map(|t| t.columns.clone()).unwrap_or_default()
-            } else {
-                returning_cols
-            };
-
-        if !tx_active && ret_cols_expanded.is_empty() && !has_fk_references {
-            if let Some(ref pred) = where_pred {
-                if let Some(row_id) = Self::parse_simple_id_eq_predicate(pred) {
-                    let lookup_start = if Self::native_profile_enabled() {
-                        Some(Instant::now())
-                    } else {
-                        None
-                    };
-                    let exists = g
-                        .get(table)
-                        .map(|t| t.rows.contains_key(&row_id))
-                        .unwrap_or(false);
-                    if let Some(start) = lookup_start {
-                        Self::profile_ns(&self.native_profile.pk_lookup_ns, start.elapsed());
-                        self.native_profile
-                            .pk_lookup_count
-                            .fetch_add(1, Ordering::Relaxed);
+        if !tx_active && ret_cols_expanded.is_empty() {
+            if !self.catalog_table_has_fk_references(table, false) {
+                if let Some(ref pred) = where_pred {
+                    if let Some(row_id) = Self::parse_simple_id_eq_predicate(pred) {
+                        return self.autocommit_update_by_pk(table, row_id, assignments, s_work);
                     }
-                    if !exists {
-                        return Ok(Self::empty_ok("UPDATE 0"));
-                    }
-
-                    if let Some(t) = g.get(table) {
-                        assignments = Self::coerce_assignments_for_table(t, &assignments)?;
-                        Self::enforce_constraints_on_update(t, &[row_id], &assignments)?;
-                        Self::validate_update_vector_dimensions(t, &assignments)?;
-                    }
-
-                    if let Some(t) = g.get_mut(table) {
-                        let updated = if let Some(row) = t.rows.get_mut(&row_id) {
-                            self.update_indexes(table, row_id, row, &assignments);
-                            for (col, val) in &assignments {
-                                row.cols.insert(col.clone(), val.clone());
-                            }
-                            Some(row.clone())
-                        } else {
-                            None
-                        };
-                        if let Some(row) = updated {
-                            if self.htap_tx_active() {
-                                self.htap_track_row_write(table, t, row_id, &row);
-                            }
-                            drop(g);
-                            self.buf_pool.invalidate(table);
-                            return Ok(Self::empty_ok("UPDATE 1"));
-                        }
-                    }
-                    return Ok(Self::empty_ok("UPDATE 0"));
                 }
             }
         }
+
+        let catalog_snap_start = Instant::now();
+        let mut g = self.tables.write();
+        self.profile_catalog_snapshot(catalog_snap_start);
+        let has_fk_references = Self::table_has_fk_references(&g, table, false);
+        let mut count = 0usize;
+        let mut returning_rows: Vec<Vec<Option<Vec<u8>>>> = Vec::new();
 
         // Collect matching row IDs (read-only phase).
         let row_ids: Vec<i64> = if let Some(t) = g.get(table) {
@@ -15893,6 +16804,9 @@ impl NativeSqlEngine {
         // Handle SELECT <expr> without FROM (e.g. SELECT 1, SELECT 'hello').
         if !up.contains(" FROM ") {
             return self.handle_select_constant(s);
+        }
+        if let Some(table) = Self::parse_ident_after(s, "FROM") {
+            self.ensure_secondary_indexes_current(table);
         }
         // Window functions: detect OVER( in SELECT list (before FROM)
         {
@@ -17422,9 +18336,20 @@ impl NativeSqlEngine {
                 if use_direct_id_scan {
                     let rows_out = if let Some(entry) = self.trigram_catalog.find(table, &col_name) {
                         if entry.should_scan_table(&needle, table_rows) {
-                            self.materialize_like_contains_ids(
-                                table, &*t, &col_name, &needle, is_ilike, limit,
-                            )
+                            if Self::like_universal_trigram_match(
+                                &entry,
+                                &*t,
+                                &col_name,
+                                &needle,
+                                table_rows,
+                                is_ilike,
+                            ) {
+                                materialize_id_rows(&self.table_row_ids_fast(table, &*t))
+                            } else {
+                                self.materialize_like_contains_ids(
+                                    table, &*t, &col_name, &needle, is_ilike, limit,
+                                )
+                            }
                         } else {
                             let mut row_ids = entry.search_contains(&needle);
                             if row_ids.len() * 2 > table_rows {
@@ -17465,9 +18390,20 @@ impl NativeSqlEngine {
                 let mut row_ids: Vec<i64> = Vec::new();
                 if let Some(entry) = self.trigram_catalog.find(table, &col_name) {
                     if entry.should_scan_table(&needle, table_rows) {
-                        row_ids = self.like_contains_row_ids(
-                            table, &*t, &col_name, &needle, is_ilike, limit,
-                        );
+                        if Self::like_universal_trigram_match(
+                            &entry,
+                            &*t,
+                            &col_name,
+                            &needle,
+                            table_rows,
+                            is_ilike,
+                        ) {
+                            row_ids = self.table_row_ids_fast(table, &*t);
+                        } else {
+                            row_ids = self.like_contains_row_ids(
+                                table, &*t, &col_name, &needle, is_ilike, limit,
+                            );
+                        }
                     } else {
                         let exact_trigram = entry.contains_match_is_exact(&needle);
                         row_ids = entry.search_contains(&needle);
@@ -17659,10 +18595,15 @@ impl NativeSqlEngine {
                             .collect();
                         let mut rows_out: Vec<Vec<Option<Vec<u8>>>> = Vec::new();
                         if limit != Some(0) {
-                            if let Some(row) = self.htap_visible_row(table, *id_val) {
+                            if let Some(row) = self
+                                .htap_visible_row(table, *id_val)
+                                .map(|r| r.as_ref().clone())
+                                .or_else(|| t.rows.get(id_val).cloned())
+                                .or_else(|| self.row_from_columnar_cache(table, &t, *id_val))
+                            {
                                 rows_out.push(Self::materialize_projected_row(
                                     *id_val,
-                                    row.as_ref(),
+                                    &row,
                                     &out_cols,
                                 ));
                             }
@@ -17929,7 +18870,7 @@ impl NativeSqlEngine {
         let rows_out: Vec<Vec<Option<Vec<u8>>>> = hits
             .into_iter()
             .take(limit)
-            .map(|(id, _dist)| vec![Some(id.to_string().into_bytes())])
+            .map(|(id, _dist)| vec![Some(format_i64_bytes(id))])
             .collect();
         let row_count = rows_out.len();
         let total_ms = total_start.elapsed().as_secs_f64() * 1000.0;
@@ -18914,6 +19855,8 @@ impl NativeSqlEngine {
             }
         } else if self.htap_tx_active() || self.transaction_active() {
             self.htap_visible_row_count(table) as i64
+        } else if t.rows.is_empty() {
+            self.columnar_cached_row_count(table).unwrap_or(0) as i64
         } else {
             t.rows.len() as i64
         };
@@ -21870,6 +22813,31 @@ mod tests {
             .execute("SELECT * FROM upd2_test WHERE id = 1")
             .unwrap();
         assert_eq!(res.rows.len(), 1);
+    }
+
+    #[test]
+    fn bulk_insert_generate_series_matches_values_shape() {
+        let engine = NativeSqlEngine::new();
+        engine
+            .execute("CREATE TABLE olap_bench (id INTEGER PRIMARY KEY, grp INTEGER, val DOUBLE, tag TEXT)")
+            .unwrap();
+        engine
+            .execute(
+                "INSERT INTO olap_bench SELECT i, i % 100, (i % 17) / 17.0, 'tag_' || (i % 20) \
+                 FROM generate_series(0, 99) AS t(i)",
+            )
+            .unwrap();
+        let count = engine
+            .execute("SELECT COUNT(*) FROM olap_bench")
+            .unwrap();
+        assert_eq!(count.rows[0][0].as_deref(), Some(b"100".as_ref()));
+        let row = engine
+            .execute("SELECT grp, val, tag FROM olap_bench WHERE id = 17")
+            .unwrap();
+        let grp = String::from_utf8_lossy(row.rows[0][0].as_ref().unwrap());
+        let tag = String::from_utf8_lossy(row.rows[0][2].as_ref().unwrap());
+        assert_eq!(grp, "17");
+        assert_eq!(tag, "tag_17");
     }
 
     #[test]

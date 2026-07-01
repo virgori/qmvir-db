@@ -6,6 +6,7 @@
  */
 
 use super::hnsw::{DistanceMetric, HnswConfig, HnswIndex};
+use ahash::AHashMap;
 use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -27,7 +28,11 @@ pub struct VectorHnswIndexMeta {
 pub struct ManagedVectorHnswIndex {
     pub meta: VectorHnswIndexMeta,
     index: RwLock<HnswIndex>,
+    /// Vectors inserted since last graph flush; merged into search results.
+    pending: RwLock<AHashMap<u32, Vec<f32>>>,
 }
+
+const HNSW_PENDING_FLUSH_CAP: usize = 512;
 
 fn hnsw_config_for_metric(metric: DistanceMetric) -> HnswConfig {
     HnswConfig {
@@ -82,7 +87,93 @@ impl ManagedVectorHnswIndex {
                 dim,
             },
             index: RwLock::new(index),
+            pending: RwLock::new(AHashMap::new()),
         }
+    }
+
+    fn flush_pending_into_graph(&self) {
+        let batch: Vec<(u32, Vec<f32>)> = {
+            let mut pending = self.pending.write();
+            if pending.is_empty() {
+                return;
+            }
+            pending.drain().collect()
+        };
+        if batch.is_empty() {
+            return;
+        }
+        let mut index = self.index.write();
+        for (id, vec) in batch {
+            index.insert(id, vec);
+        }
+    }
+
+    fn stage_vector_internal(&self, external_id: u32, vector: Vec<f32>) {
+        let mut pending = self.pending.write();
+        pending.insert(external_id, vector);
+        if pending.len() >= HNSW_PENDING_FLUSH_CAP {
+            drop(pending);
+            self.flush_pending_into_graph();
+        }
+    }
+
+    fn merge_pending_search(
+        &self,
+        query: &[f32],
+        top_k: usize,
+        ef_search: usize,
+        mut results: Vec<(u32, f32)>,
+    ) -> Vec<(u32, f32)> {
+        let pending = self.pending.read();
+        if pending.is_empty() {
+            return results;
+        }
+        let metric = self.meta.key.metric;
+        for (&id, vec) in pending.iter() {
+            if vec.len() != query.len() {
+                continue;
+            }
+            let dist = match metric {
+                DistanceMetric::L2 => {
+                    let mut sum = 0.0f32;
+                    for (a, b) in query.iter().zip(vec.iter()) {
+                        let d = a - b;
+                        sum += d * d;
+                    }
+                    sum.sqrt()
+                }
+                DistanceMetric::Cosine => {
+                    let mut dot = 0.0f32;
+                    let mut na = 0.0f32;
+                    let mut nb = 0.0f32;
+                    for (a, b) in query.iter().zip(vec.iter()) {
+                        dot += a * b;
+                        na += a * a;
+                        nb += b * b;
+                    }
+                    let denom = (na * nb).sqrt();
+                    if denom > 0.0 {
+                        1.0 - (dot / denom)
+                    } else {
+                        1.0
+                    }
+                }
+                DistanceMetric::InnerProduct => {
+                    let mut dot = 0.0f32;
+                    for (a, b) in query.iter().zip(vec.iter()) {
+                        dot += a * b;
+                    }
+                    -dot
+                }
+            };
+            results.push((id, dist));
+        }
+        results.sort_by(|a, b| {
+            a.1.partial_cmp(&b.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        results.truncate(top_k);
+        results
     }
 
     pub fn replace_vector(&self, row_id: i64, vector: Vec<f32>) {
@@ -92,6 +183,10 @@ impl ManagedVectorHnswIndex {
         let Ok(external_id) = u32::try_from(row_id) else {
             return;
         };
+        {
+            let mut pending = self.pending.write();
+            pending.remove(&external_id);
+        }
         self.index.write().replace(external_id, vector);
     }
 
@@ -102,21 +197,29 @@ impl ManagedVectorHnswIndex {
         let Ok(external_id) = u32::try_from(row_id) else {
             return;
         };
-        self.index.write().insert(external_id, vector);
+        self.stage_vector_internal(external_id, vector);
     }
 
     pub fn index_vectors<I>(&self, rows: I)
     where
         I: IntoIterator<Item = (i64, Vec<f32>)>,
     {
+        let batch: Vec<(u32, Vec<f32>)> = rows
+            .into_iter()
+            .filter_map(|(row_id, vector)| {
+                if vector.len() != self.meta.dim {
+                    return None;
+                }
+                let external_id = u32::try_from(row_id).ok()?;
+                Some((external_id, vector))
+            })
+            .collect();
+        if batch.is_empty() {
+            return;
+        }
+        self.flush_pending_into_graph();
         let mut index = self.index.write();
-        for (row_id, vector) in rows {
-            if vector.len() != self.meta.dim {
-                continue;
-            }
-            let Ok(external_id) = u32::try_from(row_id) else {
-                continue;
-            };
+        for (external_id, vector) in batch {
             index.insert(external_id, vector);
         }
     }
@@ -125,6 +228,7 @@ impl ManagedVectorHnswIndex {
         let Ok(external_id) = u32::try_from(row_id) else {
             return;
         };
+        self.pending.write().remove(&external_id);
         self.index.write().remove(external_id);
     }
 
@@ -132,8 +236,7 @@ impl ManagedVectorHnswIndex {
         if query.len() != self.meta.dim || top_k == 0 {
             return Vec::new();
         }
-        let index = self.index.read();
-        let n = index.len();
+        let n = self.len();
         if n == 0 {
             return Vec::new();
         }
@@ -150,22 +253,30 @@ impl ManagedVectorHnswIndex {
         if query.len() != self.meta.dim || top_k == 0 {
             return Vec::new();
         }
-        let index = self.index.read();
-        if index.len() == 0 {
-            return Vec::new();
-        }
-        index
-            .search_with_ef(query, top_k, ef_search)
+        let graph_results = {
+            let index = self.index.read();
+            if index.len() == 0 {
+                Vec::new()
+            } else {
+                index
+                    .search_with_ef(query, top_k, ef_search)
+                    .into_iter()
+                    .map(|(id, dist)| (id, dist))
+                    .collect()
+            }
+        };
+        self.merge_pending_search(query, top_k, ef_search, graph_results)
             .into_iter()
             .map(|(id, dist)| (id as i64, dist))
             .collect()
     }
 
     pub fn len(&self) -> usize {
-        self.index.read().len()
+        self.index.read().len() + self.pending.read().len()
     }
 
     pub fn clear(&self) {
+        self.pending.write().clear();
         let dim = self.meta.dim;
         let metric = self.meta.key.metric;
         *self.index.write() = HnswIndex::new(dim, hnsw_config_for_metric(metric));
@@ -175,6 +286,7 @@ impl ManagedVectorHnswIndex {
         if vectors.is_empty() {
             return;
         }
+        self.pending.write().clear();
         if !vectors.is_sorted_by_key(|(external_id, _)| *external_id) {
             vectors.sort_by_key(|(external_id, _)| *external_id);
         }
