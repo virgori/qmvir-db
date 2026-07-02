@@ -4566,13 +4566,36 @@ impl PyNativeSqlEngine {
 #[cfg(feature = "python")]
 impl PyNativeSqlEngine {
     fn packed_ids_to_py_rows(py: Python<'_>, ids: &Arc<Vec<i64>>) -> PyResult<PyObject> {
+        use pyo3::ffi::{
+            PyList_New, PyList_SET_ITEM, PyLong_FromLongLong, PyTuple_New, PyTuple_SET_ITEM,
+        };
         use pyo3::types::PyList;
-        let outer = PyList::empty_bound(py);
-        for &id in ids.iter() {
-            let inner = PyList::new_bound(py, [id]);
-            outer.append(inner)?;
+        use pyo3::Bound;
+
+        let n = ids.len();
+        if n == 0 {
+            return Ok(PyList::empty_bound(py).into());
         }
-        Ok(outer.into())
+
+        unsafe {
+            let outer = PyList_New(n as isize);
+            if outer.is_null() {
+                return Err(PyErr::fetch(py));
+            }
+            for (i, &id) in ids.iter().enumerate() {
+                let inner = PyTuple_New(1);
+                if inner.is_null() {
+                    return Err(PyErr::fetch(py));
+                }
+                let cell = PyLong_FromLongLong(id);
+                if cell.is_null() {
+                    return Err(PyErr::fetch(py));
+                }
+                PyTuple_SET_ITEM(inner, 0, cell);
+                PyList_SET_ITEM(outer, i as isize, inner);
+            }
+            Ok(Bound::from_owned_ptr(py, outer).into_any().unbind())
+        }
     }
 
     fn compact_ranked_numeric_batch_to_py(
@@ -4808,7 +4831,38 @@ impl PyNativeSqlEngine {
         Ok(reduced)
     }
 
-    fn query_result_to_columnar_py(py: Python<'_>, result: QueryResult) -> PyResult<PyObject> {
+    fn query_result_to_columnar_py(py: Python<'_>, mut result: QueryResult) -> PyResult<PyObject> {
+        if result.columns.len() == 1
+            && result.columns[0].1 == oid::INT8
+            && result.packed_int64_col0.is_some()
+        {
+            let ids = result.packed_int64_col0.take().expect("checked above");
+            let (name, _, _) = &result.columns[0];
+            let row_count = ids.len();
+            let ids_vec = Arc::try_unwrap(ids).unwrap_or_else(|arc| (*arc).clone());
+            let values: Arc<[i64]> = ids_vec.into_boxed_slice().into();
+            let batch = NativeColumnarBatch {
+                columns: vec![NativeColumn {
+                    name: name.clone(),
+                    logical_type: "INTEGER".to_string(),
+                    physical_type: "int64_le".to_string(),
+                    len: row_count,
+                    null_count: 0,
+                    data: NativeColumnData::Int64 {
+                        values,
+                        validity: None,
+                    },
+                    zero_copy: true,
+                    copy_reason:
+                        "packed SELECT id exposes Arc<[i64]> as Python memoryview".to_string(),
+                }],
+                row_count,
+                classification: ColumnarClassification::ZeroCopyNumericOnly,
+                fallback_reason: None,
+            };
+            return Self::native_columnar_batch_to_py(py, batch);
+        }
+
         let row_count = result.row_count();
         let column_count = result.columns.len();
         let columns_meta = PyList::empty_bound(py);
@@ -18464,7 +18518,7 @@ impl NativeSqlEngine {
                 let use_direct_id_scan =
                     id_only && out_cols == vec!["id".to_string()] && limit.is_none();
                 if use_direct_id_scan {
-                    let rows_out = if let Some(entry) = self.trigram_catalog.find(table, &col_name) {
+                    let row_ids = if let Some(entry) = self.trigram_catalog.find(table, &col_name) {
                         if entry.should_scan_table(&needle, table_rows) {
                             if Self::like_universal_trigram_match(
                                 &entry,
@@ -18477,47 +18531,35 @@ impl NativeSqlEngine {
                                 return Ok(QueryResult::select_ids(
                                     self.table_row_ids_fast(table, &*t),
                                 ));
-                            } else {
-                                self.materialize_like_contains_ids(
-                                    table, &*t, &col_name, &needle, is_ilike, limit,
-                                )
                             }
+                            // Near-universal: columnar memmem scan beats intersecting
+                            // whole-table trigram postings (O(n) hash merges on ~100k ids).
+                            self.like_contains_row_ids(
+                                table, &*t, &col_name, &needle, is_ilike, limit,
+                            )
                         } else {
                             let mut row_ids = entry.search_contains(&needle);
-                            if row_ids.len() * 2 > table_rows {
-                                self.materialize_like_contains_ids(
-                                    table, &*t, &col_name, &needle, is_ilike, limit,
-                                )
-                            } else {
-                                if !entry.contains_match_is_exact(&needle) {
-                                    row_ids.retain(|row_id| {
-                                        t.rows.get(row_id).and_then(|row| {
-                                            row.cols.get(col_name.as_str()).map(|c| {
-                                                like_literal_contains(
-                                                    &c.as_text(),
-                                                    &needle,
-                                                    is_ilike,
-                                                )
-                                            })
+                            if !entry.contains_match_is_exact(&needle) {
+                                row_ids.retain(|row_id| {
+                                    t.rows.get(row_id).and_then(|row| {
+                                        row.cols.get(col_name.as_str()).map(|c| {
+                                            like_literal_contains(&c.as_text(), &needle, is_ilike)
                                         })
-                                        .unwrap_or(false)
-                                    });
-                                }
-                                materialize_id_rows(&row_ids)
+                                    })
+                                    .unwrap_or(false)
+                                });
                             }
+                            if let Some(lim) = limit {
+                                row_ids.truncate(lim);
+                            }
+                            row_ids
                         }
                     } else {
-                        self.materialize_like_contains_ids(
+                        self.like_contains_row_ids(
                             table, &*t, &col_name, &needle, is_ilike, limit,
                         )
                     };
-                    let row_count = rows_out.len();
-                    return Ok(QueryResult {
-                        columns,
-                        rows: rows_out,
-                        command_tag: format!("SELECT {}", row_count),
-                    ..Default::default()
-                    });
+                    return Ok(QueryResult::select_ids(Arc::new(row_ids)));
                 }
 
                 let mut row_ids: Vec<i64> = Vec::new();
@@ -18571,10 +18613,7 @@ impl NativeSqlEngine {
                 }
 
                 let rows_out = if id_only && out_cols == vec!["id".to_string()] {
-                    row_ids
-                        .iter()
-                        .map(|id| vec![Some(id.to_string().into_bytes())])
-                        .collect()
+                    return Ok(QueryResult::select_ids(Arc::new(row_ids)));
                 } else {
                     self.materialize_indexed_projection_rows_visible(table, &t, &row_ids, &out_cols)
                 };

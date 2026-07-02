@@ -606,6 +606,18 @@ pub fn format_i64_display(id: i64) -> String {
     format_i64_display_cow(id).into_owned()
 }
 
+/// Borrowed decimal text when `id` is in the static primary-key cache (0..2M).
+#[inline]
+pub fn small_int_display_str(id: i64) -> Option<&'static str> {
+    if id >= 0 {
+        let u = id as usize;
+        if u < SMALL_INT_STR_MAX {
+            return Some(&SMALL_INT_STR[u]);
+        }
+    }
+    None
+}
+
 /// Borrowed decimal text when `id` is in the static primary-key cache.
 #[inline]
 pub fn format_i64_display_cow(id: i64) -> std::borrow::Cow<'static, str> {
