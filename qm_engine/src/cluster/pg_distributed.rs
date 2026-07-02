@@ -159,6 +159,7 @@ fn stage_distributed_op(
         columns: vec![],
         rows: vec![],
         command_tag: "STAGED".into(),
+    ..Default::default()
     })
 }
 
@@ -175,6 +176,7 @@ fn commit_distributed(
             columns: vec![],
             rows: vec![],
             command_tag: "COMMIT".into(),
+        ..Default::default()
         });
     }
 
@@ -204,6 +206,7 @@ fn commit_distributed(
                 columns: vec![],
                 rows: vec![],
                 command_tag: "COMMIT".into(),
+            ..Default::default()
             })
         }
         Ok(false) => {

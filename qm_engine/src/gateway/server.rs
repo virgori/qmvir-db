@@ -458,6 +458,7 @@ pub fn dummy_query_handler() -> QueryHandler {
             columns: vec![],
             rows: vec![],
             command_tag: "SELECT 0".to_string(),
+        ..Default::default()
         })
     })
 }

@@ -13,6 +13,7 @@ use super::session_pool::global_session_pool;
 use ::rand::rngs::OsRng;
 use ::rand::RngCore;
 use bytes::{Buf, Bytes, BytesMut};
+use super::protocol::format_i64_display;
 use std::collections::HashMap;
 use std::io::{self, Cursor};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -41,11 +42,64 @@ pub enum ConnectionState {
 }
 
 /// Query result to send back
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct QueryResult {
     pub columns: Vec<(String, i32, i16)>, // name, type_oid, type_len
     pub rows: Vec<Vec<Option<Vec<u8>>>>,
     pub command_tag: String,
+    /// Column-0 int64 values without per-row cell materialization (SELECT id hot paths).
+    pub packed_int64_col0: Option<Arc<Vec<i64>>>,
+}
+
+impl QueryResult {
+    pub fn row_count(&self) -> usize {
+        self.packed_int64_col0
+            .as_ref()
+            .map(|ids| ids.len())
+            .unwrap_or(self.rows.len())
+    }
+
+    pub fn select_ids(row_ids: Arc<Vec<i64>>) -> Self {
+        let n = row_ids.len();
+        Self {
+            columns: vec![(
+                "id".to_string(),
+                super::protocol::oid::INT8,
+                8,
+            )],
+            rows: Vec::new(),
+            command_tag: format!("SELECT {}", n),
+            packed_int64_col0: Some(row_ids),
+        }
+    }
+}
+
+fn emit_query_result_rows(
+    buf: &mut BytesMut,
+    result: &QueryResult,
+    formats: &[i16],
+    row_limit: usize,
+) {
+    if let Some(ids) = &result.packed_int64_col0 {
+        let limit = if row_limit == 0 {
+            ids.len()
+        } else {
+            row_limit.min(ids.len())
+        };
+        for id in ids.iter().take(limit) {
+            let row = vec![Some(format_i64_display(*id).into_bytes())];
+            ProtocolCodec::encode_data_row_formatted(buf, &row, &result.columns, formats);
+        }
+        return;
+    }
+    let limit = if row_limit == 0 {
+        result.rows.len()
+    } else {
+        row_limit.min(result.rows.len())
+    };
+    for row in result.rows.iter().take(limit) {
+        ProtocolCodec::encode_data_row_formatted(buf, row, &result.columns, formats);
+    }
 }
 
 /// Prepared statement info
@@ -405,16 +459,14 @@ impl Connection {
                             let row_limit = if max_rows > 0 {
                                 max_rows as usize
                             } else {
-                                result.rows.len()
+                                result.row_count()
                             };
-                            for row in result.rows.iter().take(row_limit) {
-                                ProtocolCodec::encode_data_row_formatted(
-                                    &mut self.write_buf,
-                                    row,
-                                    &result.columns,
-                                    &result_formats,
-                                );
-                            }
+                            emit_query_result_rows(
+                                &mut self.write_buf,
+                                &result,
+                                &result_formats,
+                                row_limit,
+                            );
                             ProtocolCodec::encode_command_complete(
                                 &mut self.write_buf,
                                 &result.command_tag,
@@ -716,13 +768,13 @@ impl Connection {
                     ProtocolCodec::encode_row_description(&mut self.write_buf, &result.columns);
 
                     // Send data rows
-                    for row in &result.rows {
-                        let refs: Vec<Option<&[u8]>> = row
-                            .iter()
-                            .map(|v| v.as_ref().map(|b| b.as_slice()))
-                            .collect();
-                        ProtocolCodec::encode_data_row(&mut self.write_buf, &refs);
-                    }
+                    let text_formats = vec![0i16; result.columns.len()];
+                    emit_query_result_rows(
+                        &mut self.write_buf,
+                        &result,
+                        &text_formats,
+                        result.row_count(),
+                    );
                 }
 
                 // Send command complete

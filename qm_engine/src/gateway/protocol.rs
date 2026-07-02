@@ -509,7 +509,14 @@ impl ProtocolCodec {
             let oid = columns.get(i).map(|c| c.1).unwrap_or(oid::TEXT);
             scratch.push(match cell {
                 None => None,
-                Some(bytes) if fmt == 0 => Some(bytes.clone()),
+                Some(bytes) if fmt == 0 => {
+                    if oid == oid::INT8 && bytes.len() == 8 {
+                        let arr: [u8; 8] = bytes.as_slice().try_into().unwrap_or([0; 8]);
+                        Some(i64::from_le_bytes(arr).to_string().into_bytes())
+                    } else {
+                        Some(bytes.clone())
+                    }
+                }
                 Some(bytes) => Self::encode_cell_binary(oid, bytes).or_else(|| Some(bytes.clone())),
             });
         }
@@ -585,6 +592,32 @@ impl ProtocolCodec {
             buf.put_i32(*oid);
         }
     }
+}
+
+const SMALL_INT_STR_MAX: usize = 2_000_000;
+
+static SMALL_INT_STR: std::sync::LazyLock<Vec<String>> = std::sync::LazyLock::new(|| {
+    (0..SMALL_INT_STR_MAX).map(|i| i.to_string()).collect()
+});
+
+/// Decimal text for int64 — hot path for primary-key columns (0..2M cached).
+#[inline]
+pub fn format_i64_display(id: i64) -> String {
+    format_i64_display_cow(id).into_owned()
+}
+
+/// Borrowed decimal text when `id` is in the static primary-key cache.
+#[inline]
+pub fn format_i64_display_cow(id: i64) -> std::borrow::Cow<'static, str> {
+    use std::borrow::Cow;
+    if id >= 0 {
+        let u = id as usize;
+        if u < SMALL_INT_STR_MAX {
+            return Cow::Borrowed(&SMALL_INT_STR[u]);
+        }
+    }
+    let mut buf = itoa::Buffer::new();
+    Cow::Owned(buf.format(id).to_string())
 }
 
 // PostgreSQL OIDs for common types

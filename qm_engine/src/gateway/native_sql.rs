@@ -1,6 +1,7 @@
 use super::auth::{AuthManager, Privilege};
 use super::connection::QueryResult;
 use super::protocol::oid;
+use super::protocol::{format_i64_display, format_i64_display_cow};
 use super::table_store::{SharedTable, TableStore};
 use crate::executor::agg::{
     apply_having, AggFunction as ExecAggFunction, AggSpec, AggValue as ExecAggValue,
@@ -3640,6 +3641,8 @@ struct BufferPool {
     soa_cache: PLRwLock<HashMap<String, CachedSoA>>,
     /// Columnar analytics cache (table_name → CachedColumns).
     col_cache: PLRwLock<HashMap<String, Arc<CachedColumns>>>,
+    /// Sorted row-id lists (table_name → (generation, ids)).
+    id_cache: PLRwLock<HashMap<String, (u64, Arc<Vec<i64>>)>>,
     /// Parsed vector cache keyed by table + column.
     vector_cache: PLRwLock<HashMap<String, Arc<CachedVectorColumn>>>,
 }
@@ -3651,6 +3654,7 @@ impl BufferPool {
             dim_cache: PLRwLock::new(HashMap::new()),
             soa_cache: PLRwLock::new(HashMap::new()),
             col_cache: PLRwLock::new(HashMap::new()),
+            id_cache: PLRwLock::new(HashMap::new()),
             vector_cache: PLRwLock::new(HashMap::new()),
         }
     }
@@ -3666,6 +3670,7 @@ impl BufferPool {
         self.dim_cache.write().clear();
         self.soa_cache.write().clear();
         self.col_cache.write().clear();
+        self.id_cache.write().clear();
         self.vector_cache.write().clear();
     }
 
@@ -3780,6 +3785,27 @@ impl BufferPool {
                 }
             }
         }
+        arc
+    }
+
+    fn get_ids(&self, table: &str) -> Option<Arc<Vec<i64>>> {
+        let gen = self.current_gen(table);
+        let cache = self.id_cache.read();
+        cache.get(table).and_then(|(cached_gen, ids)| {
+            if *cached_gen == gen {
+                Some(Arc::clone(ids))
+            } else {
+                None
+            }
+        })
+    }
+
+    fn put_ids(&self, table: &str, ids: Vec<i64>) -> Arc<Vec<i64>> {
+        let gen = self.current_gen(table);
+        let arc = Arc::new(ids);
+        self.id_cache
+            .write()
+            .insert(table.to_string(), (gen, Arc::clone(&arc)));
         arc
     }
 
@@ -3906,24 +3932,37 @@ impl PyNativeSqlEngine {
         &self,
         py: Python<'_>,
         sql: &str,
-    ) -> PyResult<(Vec<String>, Vec<Vec<Option<String>>>, String)> {
+    ) -> PyResult<(Vec<String>, PyObject, String)> {
         let result = py
-            .allow_threads(|| self.inner.execute(sql))
+            .allow_threads(|| self.inner.execute_packed(sql))
             .map_err(pyo3::exceptions::PyRuntimeError::new_err)?;
         let columns = result
             .columns
             .into_iter()
             .map(|(name, _, _)| name)
             .collect();
-        let rows = result
-            .rows
-            .into_iter()
-            .map(|row| {
-                row.into_iter()
-                    .map(|cell| cell.map(|bytes| String::from_utf8_lossy(&bytes).into_owned()))
-                    .collect()
-            })
-            .collect();
+        let rows = if let Some(ids) = result.packed_int64_col0 {
+            Self::packed_ids_to_py_rows(py, &ids)?
+        } else {
+            use pyo3::types::{PyList, PyString};
+            let outer = PyList::empty_bound(py);
+            for row in result.rows {
+                let inner = PyList::empty_bound(py);
+                for cell in row {
+                    match cell {
+                        Some(bytes) => {
+                            inner.append(PyString::new_bound(
+                                py,
+                                std::str::from_utf8(&bytes).unwrap_or(""),
+                            ))?;
+                        }
+                        None => inner.append(py.None())?,
+                    }
+                }
+                outer.append(inner)?;
+            }
+            outer.into()
+        };
         Ok((columns, rows, result.command_tag))
     }
 
@@ -3951,7 +3990,7 @@ impl PyNativeSqlEngine {
     pub fn execute_columnar(&self, py: Python<'_>, sql: &str) -> PyResult<PyObject> {
         let result = self
             .inner
-            .execute(sql)
+            .execute_packed(sql)
             .map_err(pyo3::exceptions::PyRuntimeError::new_err)?;
         Self::query_result_to_columnar_py(py, result)
     }
@@ -3962,7 +4001,7 @@ impl PyNativeSqlEngine {
             Err(reason) => {
                 let result = self
                     .inner
-                    .execute(sql)
+                    .execute_packed(sql)
                     .map_err(pyo3::exceptions::PyRuntimeError::new_err)?;
                 Self::query_result_to_zero_copy_fallback_py(py, result, reason)
             }
@@ -4061,7 +4100,7 @@ impl PyNativeSqlEngine {
         py: Python<'_>,
         sql: &str,
         _timeout_ms: u64,
-    ) -> PyResult<(Vec<String>, Vec<Vec<Option<String>>>, String)> {
+    ) -> PyResult<(Vec<String>, PyObject, String)> {
         self.execute(py, sql)
     }
 
@@ -4526,6 +4565,16 @@ impl PyNativeSqlEngine {
 
 #[cfg(feature = "python")]
 impl PyNativeSqlEngine {
+    fn packed_ids_to_py_rows(py: Python<'_>, ids: &Arc<Vec<i64>>) -> PyResult<PyObject> {
+        use pyo3::types::PyList;
+        let outer = PyList::empty_bound(py);
+        for &id in ids.iter() {
+            let inner = PyList::new_bound(py, [id]);
+            outer.append(inner)?;
+        }
+        Ok(outer.into())
+    }
+
     fn compact_ranked_numeric_batch_to_py(
         py: Python<'_>,
         ids: Vec<i64>,
@@ -4760,7 +4809,7 @@ impl PyNativeSqlEngine {
     }
 
     fn query_result_to_columnar_py(py: Python<'_>, result: QueryResult) -> PyResult<PyObject> {
-        let row_count = result.rows.len();
+        let row_count = result.row_count();
         let column_count = result.columns.len();
         let columns_meta = PyList::empty_bound(py);
         let column_buffers = PyList::empty_bound(py);
@@ -4776,7 +4825,31 @@ impl PyNativeSqlEngine {
             columns_meta.append(meta)?;
             type_names.append(Self::columnar_type_name(*type_oid))?;
 
-            let encoded = Self::encode_column_buffer(py, &result.rows, col_idx, *type_oid)?;
+            let encoded = if col_idx == 0 {
+                if let Some(ref ids) = result.packed_int64_col0 {
+                    if *type_oid == oid::INT8 {
+                        let mut data = Vec::with_capacity(ids.len() * 8);
+                        for &id in ids.iter() {
+                            data.extend_from_slice(&id.to_le_bytes());
+                        }
+                        let validity = vec![0xFFu8; (ids.len() + 7) / 8];
+                        let d = PyDict::new_bound(py);
+                        d.set_item("encoding", "int64_le")?;
+                        d.set_item("element_width", 8)?;
+                        d.set_item("length", ids.len())?;
+                        d.set_item("null_count", 0)?;
+                        d.set_item("validity", PyBytes::new_bound(py, &validity))?;
+                        d.set_item("data", PyBytes::new_bound(py, &data))?;
+                        d.into()
+                    } else {
+                        Self::encode_column_buffer(py, &result.rows, col_idx, *type_oid)?
+                    }
+                } else {
+                    Self::encode_column_buffer(py, &result.rows, col_idx, *type_oid)?
+                }
+            } else {
+                Self::encode_column_buffer(py, &result.rows, col_idx, *type_oid)?
+            };
             let duplicate_count = result.columns.iter().filter(|(n, _, _)| n == name).count();
             let buffer_key = if duplicate_count == 1 {
                 name.clone()
@@ -4871,16 +4944,27 @@ impl PyNativeSqlEngine {
     }
 
     fn encode_int64_le(rows: &[Vec<Option<Vec<u8>>>], col_idx: usize) -> Option<Vec<u8>> {
-        let mut data = Vec::with_capacity(rows.len() * 8);
-        for row in rows {
-            match row.get(col_idx).and_then(|cell| cell.as_ref()) {
-                Some(bytes) => {
-                    let text = std::str::from_utf8(bytes).ok()?;
-                    let value = text.parse::<i64>().ok()?;
-                    data.extend_from_slice(&value.to_le_bytes());
-                }
-                None => data.extend_from_slice(&0i64.to_le_bytes()),
+        let row_count = rows.len();
+        if row_count == 0 {
+            return Some(Vec::new());
+        }
+        if row_count >= 4096 {
+            let values: Option<Vec<i64>> = rows
+                .par_iter()
+                .map(|row| decode_i64_cell(row.get(col_idx).and_then(|cell| cell.as_ref())?))
+                .collect();
+            let values = values?;
+            let mut data = Vec::with_capacity(values.len() * 8);
+            for value in values {
+                data.extend_from_slice(&value.to_le_bytes());
             }
+            return Some(data);
+        }
+        let mut data = Vec::with_capacity(row_count * 8);
+        for row in rows {
+            let bytes = row.get(col_idx).and_then(|cell| cell.as_ref())?;
+            let value = decode_i64_cell(bytes)?;
+            data.extend_from_slice(&value.to_le_bytes());
         }
         Some(data)
     }
@@ -4987,8 +5071,17 @@ const LIKE_TRIGRAM_UNIVERSAL_SELECTIVITY: f64 = 0.99;
 
 #[inline]
 fn format_i64_bytes(id: i64) -> Vec<u8> {
-    let mut buf = itoa::Buffer::new();
-    buf.format(id).as_bytes().to_vec()
+    format_i64_display(id).into_bytes()
+}
+
+#[inline]
+fn decode_i64_cell(bytes: &[u8]) -> Option<i64> {
+    if bytes.len() == 8 {
+        // Binary int64 cells (internal fast paths only).
+        let arr: [u8; 8] = bytes.try_into().ok()?;
+        return Some(i64::from_le_bytes(arr));
+    }
+    std::str::from_utf8(bytes).ok()?.parse().ok()
 }
 
 #[inline]
@@ -5116,6 +5209,15 @@ fn materialize_id_rows(row_ids: &[i64]) -> Vec<Vec<Option<Vec<u8>>>> {
             .map(|row_id| vec![Some(format_i64_bytes(*row_id))])
             .collect()
     }
+}
+
+fn expand_packed_query_result(mut result: QueryResult) -> QueryResult {
+    if result.rows.is_empty() {
+        if let Some(ids) = result.packed_int64_col0.take() {
+            result.rows = materialize_id_rows(&ids);
+        }
+    }
+    result
 }
 
 fn collect_like_contains_row_ids(
@@ -8706,15 +8808,19 @@ impl NativeSqlEngine {
     }
 
     /// Row ids without building full text/float columnar caches (order undefined).
-    fn table_row_ids_fast(&self, table_name: &str, t: &NativeTable) -> Vec<i64> {
-        if let Some(cc) = self.buf_pool.get_cols(table_name) {
-            return cc.ids.clone();
+    fn table_row_ids_fast(&self, table_name: &str, t: &NativeTable) -> Arc<Vec<i64>> {
+        if let Some(ids) = self.buf_pool.get_ids(table_name) {
+            return ids;
         }
-        if t.rows.len() >= LIKE_COLUMNAR_SCAN_MIN_ROWS {
+        if let Some(cc) = self.buf_pool.get_cols(table_name) {
+            return self.buf_pool.put_ids(table_name, cc.ids.clone());
+        }
+        let ids: Vec<i64> = if t.rows.len() >= LIKE_COLUMNAR_SCAN_MIN_ROWS {
             t.rows.par_iter().map(|(id, _)| *id).collect()
         } else {
             t.rows.keys().copied().collect()
-        }
+        };
+        self.buf_pool.put_ids(table_name, ids)
     }
 
     fn like_contains_row_ids(
@@ -8778,12 +8884,7 @@ impl NativeSqlEngine {
                 return false;
             }
         }
-        let probe = t
-            .rows
-            .iter()
-            .nth(table_rows / 2)
-            .or_else(|| t.rows.iter().next())
-            .map(|(id, _)| *id);
+        let probe = t.rows.keys().next().copied();
         let Some(probe) = probe else {
             return false;
         };
@@ -8795,6 +8896,19 @@ impl NativeSqlEngine {
     }
 
     pub fn execute(&self, sql: &str) -> Result<QueryResult, String> {
+        let result = if Self::native_profile_enabled() {
+            let start = Instant::now();
+            let result = self.execute_inner(sql, true);
+            Self::profile_ns(&self.native_profile.execute_ns, start.elapsed());
+            result
+        } else {
+            self.execute_inner(sql, true)
+        };
+        result.map(expand_packed_query_result)
+    }
+
+    /// Python / zero-copy callers: keep packed int64 columns without row materialization.
+    pub(crate) fn execute_packed(&self, sql: &str) -> Result<QueryResult, String> {
         if Self::native_profile_enabled() {
             let start = Instant::now();
             let result = self.execute_inner(sql, true);
@@ -9681,6 +9795,7 @@ impl NativeSqlEngine {
             command_tag: format!("SELECT {}", rows.len()),
             columns,
             rows,
+        ..Default::default()
         })
     }
 
@@ -9739,6 +9854,7 @@ impl NativeSqlEngine {
             command_tag: format!("SELECT {}", rows.len()),
             columns,
             rows,
+        ..Default::default()
         })
     }
 
@@ -9889,6 +10005,7 @@ impl NativeSqlEngine {
             columns: vec![("count".to_string(), oid::INT8, 8)],
             rows: vec![vec![Some(count.to_string().into_bytes())]],
             command_tag: "SELECT 1".to_string(),
+        ..Default::default()
         })
     }
 
@@ -9945,6 +10062,7 @@ impl NativeSqlEngine {
             columns: vec![("count".to_string(), oid::INT8, 8)],
             rows: vec![vec![Some(count.to_string().into_bytes())]],
             command_tag: "SELECT 1".to_string(),
+        ..Default::default()
         })
     }
 
@@ -10434,6 +10552,7 @@ impl NativeSqlEngine {
             columns: vec![("QUERY PLAN".to_string(), oid::TEXT, -1)],
             rows: vec![vec![Some(plan.into_bytes())]],
             command_tag: "EXPLAIN".to_string(),
+        ..Default::default()
         })
     }
 
@@ -10608,6 +10727,7 @@ impl NativeSqlEngine {
             columns: vec![],
             rows: vec![],
             command_tag: tag.to_string(),
+        ..Default::default()
         }
     }
 
@@ -12154,33 +12274,25 @@ impl NativeSqlEngine {
         table: &str,
     ) -> Result<(), String> {
         let col = entry.meta.key.column.clone();
-        let row_ids: Vec<i64> = {
-            let g = self.tables.to_native_map();
-            let Some(t) = g.get(table) else {
-                return Ok(());
-            };
-            self.get_or_build_cols(table, t).ids.clone()
-        };
-        let mut vectors = Vec::with_capacity(row_ids.len());
-        {
-            let mut g = self.tables.write();
-            let Some(t) = g.get_mut(table) else {
-                return Ok(());
-            };
-            for row_id in row_ids {
-                let Some(row) = t.rows.get_mut(&row_id) else {
-                    continue;
-                };
+        let dim = entry.meta.dim;
+        let vectors = self.tables.with_write(table, |t| {
+            let mut out = Vec::with_capacity(t.rows.len());
+            for (&row_id, row) in t.rows.iter_mut() {
                 let Some(cell) = row.cols.get_mut(col.as_str()) else {
                     continue;
                 };
-                if let Some(vec) = Self::take_vector_cell(cell) {
-                    if let Ok(external_id) = u32::try_from(row_id) {
-                        vectors.push((external_id, vec));
-                    }
+                let Some(vec) = Self::take_vector_cell(cell) else {
+                    continue;
+                };
+                if vec.len() != dim {
+                    continue;
+                }
+                if let Ok(external_id) = u32::try_from(row_id) {
+                    out.push((external_id, vec));
                 }
             }
-        }
+            out
+        })?;
         entry.batch_build(vectors);
         Ok(())
     }
@@ -12589,20 +12701,16 @@ impl NativeSqlEngine {
                 self.backfill_trigram_index(&entry, &table)?;
             }
             CreateIndexKind::Hnsw(metric) => {
-                let dim = {
-                    let g = self.tables.to_native_map();
-                    g.get(&table)
-                        .and_then(|t| {
-                            Self::declared_vector_dim(t, &col)
-                                .or_else(|| Self::existing_vector_dim(t, &col))
-                        })
-                        .ok_or_else(|| {
-                            format!(
-                                "CREATE INDEX USING hnsw requires VECTOR column \"{}\" with at least one row",
-                                col
-                            )
-                        })?
-                };
+                let dim = self.tables.with_read(&table, |t| {
+                    Self::declared_vector_dim(t, &col)
+                        .or_else(|| Self::existing_vector_dim(t, &col))
+                })?
+                .ok_or_else(|| {
+                    format!(
+                        "CREATE INDEX USING hnsw requires VECTOR column \"{}\" with at least one row",
+                        col
+                    )
+                })?;
                 let entry = self.vector_hnsw_catalog.create_index(
                     name,
                     table.clone(),
@@ -12711,6 +12819,7 @@ impl NativeSqlEngine {
             columns: vec![("analyze".to_string(), oid::TEXT, -1)],
             rows: vec![vec![Some(msg.as_bytes().to_vec())]],
             command_tag: format!("ANALYZE {}", total_analyzed),
+        ..Default::default()
         })
     }
 
@@ -12730,6 +12839,7 @@ impl NativeSqlEngine {
             columns,
             rows,
             command_tag: format!("SELECT {}", n),
+        ..Default::default()
         })
     }
 
@@ -12787,6 +12897,7 @@ impl NativeSqlEngine {
                 columns,
                 rows,
                 command_tag: format!("SELECT {}", n),
+            ..Default::default()
             });
         }
 
@@ -12819,6 +12930,7 @@ impl NativeSqlEngine {
             columns,
             rows,
             command_tag: format!("SELECT {}", n),
+        ..Default::default()
         })
     }
 
@@ -12913,6 +13025,7 @@ impl NativeSqlEngine {
             columns,
             rows: rows_out,
             command_tag: format!("SELECT {}", n),
+        ..Default::default()
         })
     }
 
@@ -13127,6 +13240,7 @@ impl NativeSqlEngine {
             columns: vec![("copy".to_string(), oid::TEXT, -1)],
             rows: vec![vec![Some(msg.as_bytes().to_vec())]],
             command_tag: msg,
+        ..Default::default()
         })
     }
 
@@ -14195,6 +14309,7 @@ impl NativeSqlEngine {
                 columns,
                 rows: returning_rows,
                 command_tag: format!("DELETE {deleted}"),
+            ..Default::default()
             });
         }
         Ok(Self::empty_ok(&format!("DELETE {deleted}")))
@@ -14486,6 +14601,7 @@ impl NativeSqlEngine {
             columns: Vec::new(),
             rows: Vec::new(),
             command_tag: format!("COPY {}", count),
+        ..Default::default()
         })
     }
 
@@ -15726,6 +15842,7 @@ impl NativeSqlEngine {
                 columns: Vec::new(),
                 rows: Vec::new(),
                 command_tag: format!("INSERT 0 {}", count),
+            ..Default::default()
             });
         }
 
@@ -16034,6 +16151,7 @@ impl NativeSqlEngine {
                 columns,
                 rows: returning_rows,
                 command_tag: format!("INSERT 0 {}", inserted_count),
+            ..Default::default()
             });
         }
 
@@ -16416,6 +16534,7 @@ impl NativeSqlEngine {
                 columns,
                 rows: returning_rows,
                 command_tag: format!("UPDATE {count}"),
+            ..Default::default()
             });
         }
         Ok(Self::empty_ok(&format!("UPDATE {count}")))
@@ -17352,6 +17471,7 @@ impl NativeSqlEngine {
             columns: merged_columns.unwrap_or_default(),
             rows: all_rows,
             command_tag: format!("SELECT {}", row_count),
+        ..Default::default()
         })
     }
 
@@ -17409,6 +17529,7 @@ impl NativeSqlEngine {
             columns,
             rows: current_rows,
             command_tag: format!("SELECT {}", n),
+        ..Default::default()
         })
     }
 
@@ -17464,6 +17585,7 @@ impl NativeSqlEngine {
             columns,
             rows,
             command_tag: format!("SELECT {}", n),
+        ..Default::default()
         })
     }
 
@@ -17753,6 +17875,7 @@ impl NativeSqlEngine {
             columns,
             rows: rows_out,
             command_tag: format!("SELECT {}", n),
+        ..Default::default()
         })
     }
 
@@ -17827,6 +17950,7 @@ impl NativeSqlEngine {
                 columns,
                 rows: rows_out,
                 command_tag: format!("SELECT {}", row_count),
+            ..Default::default()
             });
         }
 
@@ -17914,6 +18038,7 @@ impl NativeSqlEngine {
             columns,
             rows: rows_out,
             command_tag: format!("SELECT {}", row_count),
+        ..Default::default()
         })
     }
 
@@ -18087,6 +18212,7 @@ impl NativeSqlEngine {
                     columns,
                     rows: rows_out,
                     command_tag: format!("SELECT {}", row_count),
+                ..Default::default()
                 });
             }
         }
@@ -18185,6 +18311,7 @@ impl NativeSqlEngine {
             columns,
             rows: rows_out,
             command_tag: format!("SELECT {}", row_count),
+        ..Default::default()
         })
     }
 
@@ -18197,6 +18324,7 @@ impl NativeSqlEngine {
             columns: vec![("?column?".to_string(), oid::TEXT, -1)],
             rows: vec![vec![Some(val.as_bytes().to_vec())]],
             command_tag: "SELECT 1".to_string(),
+        ..Default::default()
         })
     }
 
@@ -18257,6 +18385,7 @@ impl NativeSqlEngine {
                 columns,
                 rows: rows_out,
                 command_tag: format!("SELECT {}", row_count),
+            ..Default::default()
             });
         }
 
@@ -18298,6 +18427,7 @@ impl NativeSqlEngine {
                 columns,
                 rows: rows_out,
                 command_tag: format!("SELECT {}", row_count),
+            ..Default::default()
             });
         }
 
@@ -18344,7 +18474,9 @@ impl NativeSqlEngine {
                                 table_rows,
                                 is_ilike,
                             ) {
-                                materialize_id_rows(&self.table_row_ids_fast(table, &*t))
+                                return Ok(QueryResult::select_ids(
+                                    self.table_row_ids_fast(table, &*t),
+                                ));
                             } else {
                                 self.materialize_like_contains_ids(
                                     table, &*t, &col_name, &needle, is_ilike, limit,
@@ -18384,6 +18516,7 @@ impl NativeSqlEngine {
                         columns,
                         rows: rows_out,
                         command_tag: format!("SELECT {}", row_count),
+                    ..Default::default()
                     });
                 }
 
@@ -18398,7 +18531,11 @@ impl NativeSqlEngine {
                             table_rows,
                             is_ilike,
                         ) {
-                            row_ids = self.table_row_ids_fast(table, &*t);
+                            let cached_ids = self.table_row_ids_fast(table, &*t);
+                            if id_only && out_cols == vec!["id".to_string()] {
+                                return Ok(QueryResult::select_ids(cached_ids));
+                            }
+                            row_ids = (*cached_ids).clone();
                         } else {
                             row_ids = self.like_contains_row_ids(
                                 table, &*t, &col_name, &needle, is_ilike, limit,
@@ -18446,6 +18583,7 @@ impl NativeSqlEngine {
                     columns,
                     rows: rows_out,
                     command_tag: format!("SELECT {}", row_count),
+                ..Default::default()
                 });
             }
             let is_ilike = pred_up.contains(" ILIKE ");
@@ -18521,6 +18659,7 @@ impl NativeSqlEngine {
                 columns,
                 rows: rows_out,
                 command_tag: format!("SELECT {}", row_count),
+            ..Default::default()
             });
         }
 
@@ -18560,6 +18699,7 @@ impl NativeSqlEngine {
                 columns,
                 rows: rows_out,
                 command_tag: format!("SELECT {}", row_count),
+            ..Default::default()
             });
         }
 
@@ -18613,6 +18753,7 @@ impl NativeSqlEngine {
                             columns,
                             rows: rows_out,
                             command_tag: format!("SELECT {}", row_count),
+                        ..Default::default()
                         });
                     }
                 }
@@ -18668,6 +18809,7 @@ impl NativeSqlEngine {
                         columns,
                         rows: rows_out,
                         command_tag: format!("SELECT {}", row_count),
+                    ..Default::default()
                     });
                 }
             }
@@ -18724,6 +18866,7 @@ impl NativeSqlEngine {
             columns,
             rows: rows_out,
             command_tag: format!("SELECT {}", row_count),
+        ..Default::default()
         })
     }
 
@@ -18867,12 +19010,7 @@ impl NativeSqlEngine {
             return Ok(None);
         };
 
-        let rows_out: Vec<Vec<Option<Vec<u8>>>> = hits
-            .into_iter()
-            .take(limit)
-            .map(|(id, _dist)| vec![Some(format_i64_bytes(id))])
-            .collect();
-        let row_count = rows_out.len();
+        let ids: Vec<i64> = hits.into_iter().take(limit).map(|(id, _)| id).collect();
         let total_ms = total_start.elapsed().as_secs_f64() * 1000.0;
         let timing = if include_timing {
             serde_json::json!({
@@ -18893,14 +19031,7 @@ impl NativeSqlEngine {
         } else {
             serde_json::Value::Null
         };
-        Ok(Some((
-            QueryResult {
-                columns: vec![("id".to_string(), oid::INT8, 8)],
-                rows: rows_out,
-                command_tag: format!("SELECT {}", row_count),
-            },
-            timing,
-        )))
+        Ok(Some((QueryResult::select_ids(Arc::new(ids)), timing)))
     }
 
     fn handle_select_vector_knn_profiled(
@@ -19066,6 +19197,7 @@ impl NativeSqlEngine {
                     columns,
                     rows: Vec::new(),
                     command_tag: "SELECT 0".to_string(),
+                ..Default::default()
                 };
                 let total_ms = total_start.elapsed().as_secs_f64() * 1000.0;
                 let timing = if include_timing {
@@ -19170,6 +19302,7 @@ impl NativeSqlEngine {
                     columns,
                     rows: rows_out,
                     command_tag: format!("SELECT {}", row_count),
+                ..Default::default()
                 };
                 let total_ms = total_start.elapsed().as_secs_f64() * 1000.0;
                 let timing = if include_timing {
@@ -19204,6 +19337,7 @@ impl NativeSqlEngine {
                 columns,
                 rows: Vec::new(),
                 command_tag: "SELECT 0".to_string(),
+            ..Default::default()
             };
             let total_ms = total_start.elapsed().as_secs_f64() * 1000.0;
             let timing = if include_timing {
@@ -19351,6 +19485,7 @@ impl NativeSqlEngine {
             columns,
             rows: rows_out,
             command_tag: format!("SELECT {}", row_count),
+        ..Default::default()
         };
         let total_ms = total_start.elapsed().as_secs_f64() * 1000.0;
         let timing = if include_timing {
@@ -19605,6 +19740,7 @@ impl NativeSqlEngine {
                         .collect(),
                     rows: vec![],
                     command_tag: "SELECT 0".to_string(),
+                ..Default::default()
                 });
             }
         };
@@ -19725,6 +19861,7 @@ impl NativeSqlEngine {
                 columns,
                 rows: rows_out,
                 command_tag: format!("SELECT {}", limited_count),
+            ..Default::default()
             });
         }
 
@@ -19784,6 +19921,7 @@ impl NativeSqlEngine {
             columns,
             rows: rows_out,
             command_tag: format!("SELECT {}", row_count),
+        ..Default::default()
         })
     }
 
@@ -19800,6 +19938,7 @@ impl NativeSqlEngine {
                 columns: vec![("count".to_string(), oid::INT8, 8)],
                 rows: Vec::new(),
                 command_tag: "SELECT 0".to_string(),
+            ..Default::default()
             });
         }
         let cnt: i64 = if let Some(wi) = up.find(" WHERE ") {
@@ -19865,6 +20004,7 @@ impl NativeSqlEngine {
             columns: vec![("count".to_string(), oid::INT8, 8)],
             rows: vec![vec![Some(cnt.to_string().into_bytes())]],
             command_tag: "SELECT 1".to_string(),
+        ..Default::default()
         })
     }
 
@@ -19961,6 +20101,7 @@ impl NativeSqlEngine {
                         columns,
                         rows,
                         command_tag: "SELECT 1".to_string(),
+                    ..Default::default()
                     });
                 }
             }
@@ -19989,6 +20130,7 @@ impl NativeSqlEngine {
                     columns,
                     rows,
                     command_tag: "SELECT 1".to_string(),
+                ..Default::default()
                 });
             }
         }
@@ -20143,12 +20285,14 @@ impl NativeSqlEngine {
                 columns,
                 rows,
                 command_tag: "SELECT 1".to_string(),
+            ..Default::default()
             })
         } else {
             Ok(QueryResult {
                 columns: vec![("sum".to_string(), oid::FLOAT8, 8)],
                 rows: vec![vec![Some("0".to_string().into_bytes())]],
                 command_tag: "SELECT 1".to_string(),
+            ..Default::default()
             })
         }
     }
@@ -20178,6 +20322,7 @@ impl NativeSqlEngine {
                     columns: vec![("avg".to_string(), oid::FLOAT8, 8)],
                     rows: vec![vec![Some(avg.to_string().into_bytes())]],
                     command_tag: "SELECT 1".to_string(),
+                ..Default::default()
                 });
             }
         }
@@ -20216,6 +20361,7 @@ impl NativeSqlEngine {
                             columns: vec![("avg".to_string(), oid::FLOAT8, 8)],
                             rows: vec![vec![Some(avg.to_string().into_bytes())]],
                             command_tag: "SELECT 1".to_string(),
+                        ..Default::default()
                         });
                     }
                 }
@@ -20243,12 +20389,14 @@ impl NativeSqlEngine {
                 columns: vec![("avg".to_string(), oid::FLOAT8, 8)],
                 rows: vec![vec![Some(avg.to_string().into_bytes())]],
                 command_tag: "SELECT 1".to_string(),
+            ..Default::default()
             })
         } else {
             Ok(QueryResult {
                 columns: vec![("avg".to_string(), oid::FLOAT8, 8)],
                 rows: vec![vec![Some("0".to_string().into_bytes())]],
                 command_tag: "SELECT 1".to_string(),
+            ..Default::default()
             })
         }
     }
@@ -20425,6 +20573,7 @@ impl NativeSqlEngine {
                         columns,
                         rows: rows_out,
                         command_tag: format!("SELECT {}", n),
+                    ..Default::default()
                     });
                 }
             } else if let Some(grp_vals) = cc.int_cols.get(gb_col.as_str()) {
@@ -20512,6 +20661,7 @@ impl NativeSqlEngine {
                         columns,
                         rows: rows_out,
                         command_tag: format!("SELECT {}", n),
+                    ..Default::default()
                     });
                 }
             }
@@ -20583,6 +20733,7 @@ impl NativeSqlEngine {
             columns,
             rows: rows_out,
             command_tag: format!("SELECT {}", n),
+        ..Default::default()
         })
     }
 
@@ -20714,6 +20865,7 @@ impl NativeSqlEngine {
                         ],
                         rows: out_rows,
                         command_tag: format!("SELECT {}", n),
+                    ..Default::default()
                     });
                 }
             }
@@ -20812,6 +20964,7 @@ impl NativeSqlEngine {
             ],
             rows: out_rows,
             command_tag: format!("SELECT {}", n),
+        ..Default::default()
         })
     }
 
@@ -21051,6 +21204,7 @@ impl NativeSqlEngine {
             columns,
             rows,
             command_tag: format!("SELECT {}", n),
+        ..Default::default()
         })
     }
 
@@ -21574,6 +21728,7 @@ impl NativeSqlEngine {
             columns,
             rows: rows_out,
             command_tag: format!("SELECT {}", n_rows),
+        ..Default::default()
         })
     }
 
@@ -21820,6 +21975,7 @@ impl NativeSqlEngine {
             columns,
             rows: rows_out,
             command_tag: format!("SELECT {}", n_rows),
+        ..Default::default()
         })
     }
 

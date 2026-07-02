@@ -208,6 +208,7 @@ impl PyPostgresGateway {
                     columns,
                     rows,
                     command_tag,
+                ..Default::default()
                 })
             })
         });

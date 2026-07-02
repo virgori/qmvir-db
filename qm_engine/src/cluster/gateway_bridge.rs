@@ -245,6 +245,7 @@ fn forward_result_to_query_result(
         columns: Vec::new(),
         rows,
         command_tag: msg.command_tag,
+    ..Default::default()
     })
 }
 
@@ -379,6 +380,7 @@ fn execute_ddl_fanout(
                         columns: Vec::new(),
                         rows: Vec::new(),
                         command_tag: "OK".into(),
+                    ..Default::default()
                     }));
                 } else {
                     return result;

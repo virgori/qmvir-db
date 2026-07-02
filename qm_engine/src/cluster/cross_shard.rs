@@ -126,6 +126,7 @@ pub fn execute_distributed_batch(
                     statements.len(),
                     txn_id
                 ),
+            ..Default::default()
             })
         }
         Ok(false) => {
