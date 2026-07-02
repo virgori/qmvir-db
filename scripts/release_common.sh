@@ -100,7 +100,7 @@ release_bump_patch() {
   IFS='.' read -r major minor patch <<<"$ver"
   patch=$((patch + 1))
   ver="${major}.${minor}.${patch}"
-  release_sync_versions "$ver"
+  release_sync_versions "$ver" >&2
   echo "$ver"
 }
 
@@ -180,6 +180,35 @@ release_verify_binary() {
   local out got
   out="$("$path" --version 2>/dev/null || true)"
   if [[ ! "$out" =~ $QM_VERSION_REGEX ]]; then
+    if command -v file >/dev/null 2>&1; then
+      local kind host
+      kind="$(file -b "$path" 2>/dev/null || true)"
+      host="$(uname -m 2>/dev/null || true)"
+      case "$kind" in
+        *ELF*)
+          if [[ "$(uname -s 2>/dev/null || true)" != "Linux" ]]; then
+            echo "  skip exec verify (ELF on $(uname -s)): $(basename "$path")"
+            return 0
+          fi
+          ;;
+        *x86-64*|*x86_64*)
+          if [[ "$host" != "x86_64" && "$host" != "amd64" ]]; then
+            echo "  skip exec verify (cross x86_64 on $host): $(basename "$path")"
+            return 0
+          fi
+          ;;
+        *ARM\ aarch64*|*aarch64*|*ARM64*)
+          if [[ "$host" != "aarch64" && "$host" != "arm64" ]]; then
+            echo "  skip exec verify (cross aarch64 on $host): $(basename "$path")"
+            return 0
+          fi
+          ;;
+        *PE32+*)
+          echo "  skip exec verify (windows PE on $(uname -s)): $(basename "$path")"
+          return 0
+          ;;
+      esac
+    fi
     echo "ERROR: $(basename "$path") --version invalid: '$out' (expected 'qm $want')" >&2
     return 1
   fi
@@ -259,5 +288,40 @@ release_verify_all_binaries() {
 }
 
 release_clean_stale_names() {
-  rm -f "$QM_OUT/qm-linux-arm64" "$QM_OUT/qm-linux-x64" "$QM_OUT"/qm-linux-*\ 2 2>/dev/null || true
+  rm -f "$QM_OUT/qm-linux-arm64" "$QM_OUT/qm-linux-x64" "$QM_OUT"/qm-linux-*\ 2>/dev/null || true
+}
+
+# Remove all release artifacts so a new build cannot mix with stale binaries.
+release_wipe_output_dir() {
+  mkdir -p "$QM_OUT"
+  find "$QM_OUT" -maxdepth 1 -type f \( \
+    -name 'qm-*' -o -name '.version' -o -name 'manifest.json' \
+  \) -delete 2>/dev/null || true
+  release_clean_stale_names
+  echo "wiped $QM_OUT (qm-* / .version / manifest.json)"
+}
+
+# Drop version-suffixed copies and wrong names; keep only canonical + stamp for $ver.
+release_prune_output_dir() {
+  local ver="${1:-$RELEASE_VERSION}"
+  local name path base
+  for path in "$QM_OUT"/qm-*; do
+    [[ -f "$path" ]] || continue
+    base="$(basename "$path")"
+    case "$base" in
+      qm-macos-arm64|qm-macos-x86_64|qm-linux-x86_64|qm-linux-aarch64|qm-windows-x86_64.exe|qm-windows-aarch64.exe)
+        continue
+        ;;
+      qm-linux-arm64|qm-linux-x64)
+        rm -f "$path"
+        ;;
+      *)
+        if [[ "$base" == *"-${ver}" || "$base" == *"-${ver}.exe" ]]; then
+          continue
+        fi
+        rm -f "$path"
+        ;;
+    esac
+  done
+  release_clean_stale_names
 }

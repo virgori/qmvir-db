@@ -50,22 +50,29 @@ echo "=== [3/4] release build on ${SSH_HOST} (linux + windows) ==="
 ssh -o BatchMode=yes "${SSH_HOST}" \
   "bash ${REMOTE_DIR}/qm_engine/scripts/build_release_quizzman.sh ${BUMP_ARGS[*]:-}"
 
-echo "=== [4/4] fetch binaries -> build/release/ ==="
+echo "=== [4/5] sync bumped manifests + binaries <- ${SSH_HOST} ==="
+mkdir -p "$ROOT/build/release"
+# Remote --bump updates manifests only on quizzman; pull them back before publish.
+rsync -avz \
+  "${SSH_HOST}:${REMOTE_DIR}/pyproject.toml" \
+  "${SSH_HOST}:${REMOTE_DIR}/qm_app.py" \
+  "$ROOT/"
+rsync -avz \
+  "${SSH_HOST}:${REMOTE_DIR}/npm/package.json" \
+  "$ROOT/npm/"
+rsync -avz \
+  "${SSH_HOST}:${REMOTE_DIR}/qm_engine/Cargo.toml" \
+  "$ROOT/qm_engine/"
+# Fresh artifact dir — never merge with stale local qm-* from an older release.
+rm -rf "$ROOT/build/release"
 mkdir -p "$ROOT/build/release"
 rsync -avz \
-  "${SSH_HOST}:${REMOTE_DIR}/build/release/qm-linux-*" \
-  "${SSH_HOST}:${REMOTE_DIR}/build/release/qm-windows-*" \
-  "${SSH_HOST}:${REMOTE_DIR}/build/release/.version" \
-  "${SSH_HOST}:${REMOTE_DIR}/build/release/manifest.json" \
-  "$ROOT/build/release/" 2>/dev/null || \
-rsync -avz \
-  "${SSH_HOST}:${REMOTE_DIR}/build/release/qm-linux-*" \
-  "${SSH_HOST}:${REMOTE_DIR}/build/release/.version" \
+  "${SSH_HOST}:${REMOTE_DIR}/build/release/" \
   "$ROOT/build/release/"
 
 if [[ "$BUILD_MAC" -eq 1 ]]; then
   echo ""
-  echo "=== macOS only (local; Linux/Windows already built on quizzman) ==="
+  echo "=== [5/5] macOS only (local; Linux/Windows already built on quizzman) ==="
   cd "$ROOT/qm_engine"
   bash scripts/build_release.sh --no-bump
 fi

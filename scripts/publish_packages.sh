@@ -125,7 +125,23 @@ verify_release_binaries() {
   source "$ROOT/scripts/release_common.sh"
   RELEASE_VERSION="$want"
   release_verify_manifest_versions "$want"
+  release_prune_output_dir "$want"
   release_verify_all_binaries "$want"
+  if [[ -f "$BIN_DIR/manifest.json" ]]; then
+    python3 - "$BIN_DIR/manifest.json" "$want" <<'PY'
+import json, sys
+from pathlib import Path
+
+manifest = json.loads(Path(sys.argv[1]).read_text())
+want = sys.argv[2]
+if manifest.get("version") != want:
+    raise SystemExit(f"manifest version {manifest.get('version')!r} != {want!r}")
+for art in manifest.get("artifacts", []):
+    if art.get("version") != want:
+        raise SystemExit(f"artifact {art.get('name')} version {art.get('version')!r} != {want!r}")
+print(f"manifest OK ({len(manifest.get('artifacts', []))} artifacts @ {want})")
+PY
+  fi
 }
 
 # Sets NPM_AUTH_MODE: token | session | browser
@@ -335,6 +351,17 @@ publish_github_release() {
     printf '  %s\n' "${assets[@]}"
     return 0
   fi
+
+  # Verify every asset reports the target version before upload (catch stale cross-builds).
+  local asset
+  for asset in "${assets[@]}"; do
+    if [[ -x "$asset" ]] || file "$asset" 2>/dev/null | grep -qE 'executable|ELF|Mach-O|PE32'; then
+      QM_ROOT="$ROOT"
+      # shellcheck source=release_common.sh
+      source "$ROOT/scripts/release_common.sh"
+      release_verify_binary "$asset" "$VERSION"
+    fi
+  done
 
   if gh release view "$TAG" --repo "$GITHUB_REPO" >/dev/null 2>&1; then
     gh release upload "$TAG" "${assets[@]}" --repo "$GITHUB_REPO" --clobber

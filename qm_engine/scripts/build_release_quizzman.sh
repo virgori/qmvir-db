@@ -10,7 +10,7 @@ fi
 # shellcheck source=../../scripts/release_common.sh
 source "$(dirname "$0")/../../scripts/release_common.sh"
 
-release_clean_stale_names
+release_wipe_output_dir
 release_prepare_version
 mkdir -p "$QM_OUT"
 

@@ -3,13 +3,16 @@
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-use tokio::net::{TcpStream, UnixStream};
+use tokio::net::TcpStream;
+#[cfg(unix)]
+use tokio::net::UnixStream;
 use tokio_rustls::server::TlsStream;
 use tokio_rustls::TlsAcceptor;
 
 pub enum ServerIo {
     Empty,
     Tcp(TcpStream),
+    #[cfg(unix)]
     Unix(UnixStream),
     Tls(TlsStream<TcpStream>),
 }
@@ -23,6 +26,7 @@ impl AsyncRead for ServerIo {
         match &mut *self {
             ServerIo::Empty => Poll::Pending,
             ServerIo::Tcp(s) => Pin::new(s).poll_read(cx, buf),
+            #[cfg(unix)]
             ServerIo::Unix(s) => Pin::new(s).poll_read(cx, buf),
             ServerIo::Tls(s) => Pin::new(s).poll_read(cx, buf),
         }
@@ -38,6 +42,7 @@ impl AsyncWrite for ServerIo {
         match &mut *self {
             ServerIo::Empty => Poll::Pending,
             ServerIo::Tcp(s) => Pin::new(s).poll_write(cx, buf),
+            #[cfg(unix)]
             ServerIo::Unix(s) => Pin::new(s).poll_write(cx, buf),
             ServerIo::Tls(s) => Pin::new(s).poll_write(cx, buf),
         }
@@ -47,6 +52,7 @@ impl AsyncWrite for ServerIo {
         match &mut *self {
             ServerIo::Empty => Poll::Ready(Ok(())),
             ServerIo::Tcp(s) => Pin::new(s).poll_flush(cx),
+            #[cfg(unix)]
             ServerIo::Unix(s) => Pin::new(s).poll_flush(cx),
             ServerIo::Tls(s) => Pin::new(s).poll_flush(cx),
         }
@@ -56,6 +62,7 @@ impl AsyncWrite for ServerIo {
         match &mut *self {
             ServerIo::Empty => Poll::Ready(Ok(())),
             ServerIo::Tcp(s) => Pin::new(s).poll_shutdown(cx),
+            #[cfg(unix)]
             ServerIo::Unix(s) => Pin::new(s).poll_shutdown(cx),
             ServerIo::Tls(s) => Pin::new(s).poll_shutdown(cx),
         }
@@ -67,6 +74,7 @@ impl ServerIo {
         ServerIo::Tcp(stream)
     }
 
+    #[cfg(unix)]
     pub fn from_unix(stream: UnixStream) -> Self {
         ServerIo::Unix(stream)
     }
