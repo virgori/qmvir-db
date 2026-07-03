@@ -1,17 +1,24 @@
 # qmvir
 
-**QMvir v6.2.0** — Hybrid AI-native database: OLTP + OLAP + full-text search + vector search in one Rust engine. PostgreSQL wire protocol. **Production Multi-DC Enterprise Certified** (optional HA cluster).
+**QMvir v6.2.1** — Hybrid AI-native database: OLTP + OLAP + full-text search + vector search in one Rust engine. PostgreSQL wire protocol. **Production Multi-DC Enterprise Certified** (optional HA cluster).
+
+## What's new in 6.2.1
+
+- Faster `LIKE '%…%'` id-only scans (packed int64 + columnar bridge)
+- Release pipeline fix: npm `postinstall` downloads GitHub binaries matching `package.json` version (no stale 6.2.0 bins)
 
 ## Install
 
 ```bash
-npm install qmvir@6.2.0
+npm install qmvir@6.2.1
 # or global CLI
 npm install -g qmvir
-qm --version   # qm 6.2.0
+qm --version   # qm 6.2.1
 ```
 
-Postinstall downloads the native binary (~8–13 MB) for your platform from [GitHub releases](https://github.com/virgori/qmvir-releases/releases/tag/v6.2.0).
+Postinstall downloads the native binary (~8–13 MB) for your platform from [GitHub releases](https://github.com/virgori/qmvir-releases/releases/tag/v6.2.1).
+
+If a cached binary reports a different version, postinstall re-downloads automatically.
 
 ## Quick start
 

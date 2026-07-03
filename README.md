@@ -19,7 +19,9 @@
 
 QMvir is a **hybrid database engine** (Rust) combining transactional SQL, analytics-style execution, full-text search, and vector similarity in one process. It exposes a **PostgreSQL wire-protocol** gateway for standard clients.
 
-**v6.2.0** adds optional **Production Multi-DC Enterprise HA**: sync WAL replication, automatic failover, meta Raft, 2PC, STONITH, witness, and `qm cluster certify` certification tiers.
+**v6.2.1** improves search hot paths (packed `SELECT id` for `LIKE`, columnar int64 bridge) and hardens the npm/GitHub release pipeline so postinstall downloads binaries that match the package version.
+
+**v6.2.0** added optional **Production Multi-DC Enterprise HA**: sync WAL replication, automatic failover, meta Raft, 2PC, STONITH, witness, and `qm cluster certify` certification tiers.
 
 ### 🌟 What Makes QMvir Special?
 
@@ -39,7 +41,7 @@ QMvir is a **hybrid database engine** (Rust) combining transactional SQL, analyt
 
 #### Option 1: NPM (Recommended)
 ```bash
-npm install -g qmvir@6.2.0
+npm install -g qmvir@6.2.1
 qm --version
 ```
 
@@ -169,8 +171,8 @@ Historical reports and old audits: [docs/_archive/legacy/](docs/_archive/legacy/
 ### Links
 
 - **GitHub:** [virgori/qmvir-db](https://github.com/virgori/qmvir-db)
-- **Releases:** [virgori/qmvir-releases v6.2.0](https://github.com/virgori/qmvir-releases/releases/tag/v6.2.0)
-- **npm:** [qmvir@6.2.0](https://www.npmjs.com/package/qmvir/v/6.2.0)
+- **Releases:** [virgori/qmvir-releases v6.2.1](https://github.com/virgori/qmvir-releases/releases/tag/v6.2.1)
+- **npm:** [qmvir@6.2.1](https://www.npmjs.com/package/qmvir/v/6.2.1)
 
 ---
 
@@ -238,96 +240,3 @@ QMvir is distributed under the proprietary license in [LICENSE](LICENSE). See th
 Made with ❤️ by the QMvir Team
 
 </div>
-
-## Documentation
-
-See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for full architecture details.
-=======
-# QMvir / QM Engine: Hybrid Rust Database Core
-
-**QMvir** is a high-performance database engine built in Rust, blending transactional power (OLTP) with analytical scale (OLAP). It features a PostgreSQL-compatible wire protocol and a modular architecture designed for the modern data stack.
-
----
-
-## ⚡ Key Capabilities
-
-* **Hybrid Engine:** Seamlessly handles row-based operations, complex aggregations, and massive scans.
-* **Multi-Modal Search:** Built-in Full-text search (FTS) and Vector search (HNSW) for AI-ready applications.
-* **Postgres Compatible:** Connect instantly using `psql` or any standard PG driver.
-* **Advanced Storage:** Features binary WAL, MVCC building blocks, snapshots, and `io_uring` optimization (Linux). NativeSqlEngine currently uses a separate SQL WAL/checkpoint path.
-* **V4.8+ Engine Pools:** Dedicated worker pools for Analytics, Vector search, and Compaction to prevent resource contention.
-
----
-
-## 🏗️ Architecture at a Glance
-
-| Layer | Responsibility |
-| --- | --- |
-| **Gateway** | PG v3 protocol, SCRAM authentication, CDC hooks. |
-| **NativeSqlEngine** | The primary SQL execution hot path. |
-| **Executor** | SIMD vectorized kernels, JIT compilation, and hybrid search logic. |
-| **Storage** | WAL, MVCC building blocks, and snapshot management; NativeSqlEngine transaction isolation is documented separately. |
-| **Engines** | Specialized pools (Rayon) for compute-heavy analytics and vector tasks. |
-
----
-
-## 🚀 Quick Start
-
-### 1. Build the CLI (Standalone)
-
-```bash
-cargo build --manifest-path qm_engine/Cargo.toml --release --no-default-features --bin qm
-
-```
-
-### 2. Start the Server
-
-```bash
-./qm_engine/target/release/qm --data-dir ./data start --foreground --admin-password your-password
-
-```
-
-*QMvir listens on port `55433` by default. Connect via: `psql -p 55433`.*
-
-### 3. Launch HTTP Dashboard (Optional)
-
-```bash
-cargo build --manifest-path qm_engine/Cargo.toml --release --no-default-features --bin qm_web
-./qm_engine/target/release/qm_web --port 8080
-
-```
-
----
-
-## 📦 Ecosystem Support
-
-* **Rust:** Available as the `qm_engine` crate.
-* **Node.js/NPM:**
-```bash
-npm install -g qmvir
-qmvir --version
-
-```
-
-
-* **Python:** Seamless integration via PyO3 (build with default features).
-
----
-
-## 📊 Benchmarks & Documentation
-
-* **Performance:** Compare against PostgreSQL and DuckDB:
-
-```bash
-    bash benchmarks/run_benchmark_suite.sh
-    ```
-*   **Technical Docs:** 
-    *   `docs/QMVIR_ARCHITECTURE.md`: Deep dive into gateway and engine pools.
-    *   `docs/QMVIR_ALGORITHMS.md`: Detailed inventory of implemented data structures.
-    *   `docs/README.md`: Central documentation index.
-
----
-> **Note:** As of v4.8+, QMvir has migrated its primary SQL and wire logic to the Rust core. Legacy Python modules are archived in `docs/reference/`.
-
-```
->>>>>>> ee323ec991015f1993ec3cde81738d42f3749524
