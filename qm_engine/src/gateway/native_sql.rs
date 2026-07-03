@@ -6079,7 +6079,8 @@ impl NativeSqlEngine {
 
     pub fn new_session(&self) -> Self {
         let mut session = self.clone();
-        session.session_id = self.mvcc_tx_mgr.register_session();
+        // Per-connection PG sessions must register in htap.tx_mgr (writes use begin_transaction).
+        session.session_id = self.htap.register_session();
         session.transaction = Arc::new(PLRwLock::new(None));
         session
     }
@@ -26395,6 +26396,26 @@ mod tests {
         assert_eq!(manager.transaction_state(tx2), Some(MvccTxState::Aborted));
         assert_eq!(manager.active_count(), 0);
         assert_eq!(manager.oldest_active_snapshot(), 1);
+    }
+
+    #[test]
+    fn pg_wire_new_sessions_support_persistent_autocommit_writes() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let engine = NativeSqlEngine::with_data_dir(dir.path().to_path_buf());
+        engine
+            .execute("CREATE TABLE pg_sess (id INTEGER PRIMARY KEY)")
+            .unwrap();
+        let s1 = engine.new_session();
+        let s2 = engine.new_session();
+        assert_ne!(s1.session_id(), s2.session_id());
+        s1.execute("INSERT INTO pg_sess (id) VALUES (1)")
+            .expect("session 1 insert");
+        s2.execute("INSERT INTO pg_sess (id) VALUES (2)")
+            .expect("session 2 insert");
+        assert_eq!(
+            ids_from_sql(&engine, "SELECT id FROM pg_sess ORDER BY id"),
+            vec![1, 2]
+        );
     }
 
     #[test]

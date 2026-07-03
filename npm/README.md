@@ -1,6 +1,10 @@
 # qmvir
 
-**QMvir v6.2.2** — Hybrid AI-native database: OLTP + OLAP + full-text search + vector search in one Rust engine. PostgreSQL wire protocol. **Production Multi-DC Enterprise Certified** (optional HA cluster).
+**QMvir v6.2.3** — Hybrid AI-native database: OLTP + OLAP + full-text search + vector search in one Rust engine. PostgreSQL wire protocol. **Production Multi-DC Enterprise Certified** (optional HA cluster).
+
+## What's new in 6.2.3
+
+- Fix PG wire `new_session()` registration so `node-pg` connection pools can INSERT/UPDATE/DELETE (was `Session not registered` on connection 2+)
 
 ## What's new in 6.2.2
 
@@ -14,13 +18,13 @@
 ## Install
 
 ```bash
-npm install qmvir@6.2.2
+npm install qmvir@6.2.3
 # or global CLI
 npm install -g qmvir
-qm --version   # qm 6.2.2
+qm --version   # qm 6.2.3
 ```
 
-Postinstall downloads the native binary (~8–13 MB) for **your** platform from [GitHub releases](https://github.com/virgori/qmvir-releases/releases/tag/v6.2.2).
+Postinstall downloads the native binary (~8–13 MB) for **your** platform from [GitHub releases](https://github.com/virgori/qmvir-releases/releases/tag/v6.2.3).
 
 Linux and Windows binaries are **not** bundled in the npm package (that would ship ~70 MB for all platforms). After `npm install`, `scripts/postinstall.js` fetches exactly one binary:
 
