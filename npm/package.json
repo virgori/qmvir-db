@@ -43,7 +43,7 @@
     "node": ">=16"
   },
   "files": [
-    "bin/",
+    "bin/qmvir.js",
     "scripts/",
     "sdk/client.js",
     "sdk/client.d.ts",

@@ -20,7 +20,18 @@ npm install -g qmvir
 qm --version   # qm 6.2.2
 ```
 
-Postinstall downloads the native binary (~8–13 MB) for your platform from [GitHub releases](https://github.com/virgori/qmvir-releases/releases/tag/v6.2.2).
+Postinstall downloads the native binary (~8–13 MB) for **your** platform from [GitHub releases](https://github.com/virgori/qmvir-releases/releases/tag/v6.2.2).
+
+Linux and Windows binaries are **not** bundled in the npm package (that would ship ~70 MB for all platforms). After `npm install`, `scripts/postinstall.js` fetches exactly one binary:
+
+| Platform | Downloaded asset |
+|----------|------------------|
+| macOS Apple Silicon | `qm-macos-arm64` |
+| macOS Intel | `qm-macos-x86_64` |
+| Linux x86_64 | `qm-linux-x86_64` |
+| Linux ARM64 | `qm-linux-aarch64` |
+| Windows x86_64 | `qm-windows-x86_64.exe` |
+| Windows ARM64 | `qm-windows-aarch64.exe` |
 
 If a cached binary reports a different version, postinstall re-downloads automatically.
 

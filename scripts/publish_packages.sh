@@ -249,6 +249,26 @@ _npm_cleanup_publish_npmrc() {
 
 publish_npm() {
   setup_npm_auth
+  # Never ship platform binaries in the npm tarball — postinstall fetches from GitHub.
+  rm -rf "$ROOT/npm/bin/native/"*
+  mkdir -p "$ROOT/npm/bin/native"
+  echo "npm: cleared bin/native (binaries download via postinstall from GitHub releases)"
+
+  _npm_verify_pack_list() {
+    (
+      cd "$ROOT/npm"
+      local tarball
+      tarball="$(npm pack --dry-run 2>&1)"
+      if echo "$tarball" | grep -q 'bin/native/qm-'; then
+        echo "ERROR: npm pack would include bin/native/qm-* platform binaries" >&2
+        echo "$tarball" | grep 'bin/native' >&2 || true
+        return 1
+      fi
+      echo "npm pack OK (no platform binaries in tarball):"
+      echo "$tarball" | grep -E 'npm notice.*(bin/|scripts/)' || true
+    )
+  }
+
   _npm_publish_once() {
     (
       cd "$ROOT/npm"
@@ -261,6 +281,7 @@ publish_npm() {
         npx -p typescript tsc --declaration --module nodenext --target es2020 \
           --moduleResolution nodenext --esModuleInterop --outDir sdk sdk/client.ts 2>/dev/null || true
       fi
+      _npm_verify_pack_list
       npm publish --access public ${NPM_OTP:+--otp="$NPM_OTP"}
     )
   }
