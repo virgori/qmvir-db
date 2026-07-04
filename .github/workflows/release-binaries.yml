@@ -113,7 +113,7 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           repository: virgori/qmvir-releases
-          token: ${{ secrets.RELEASE_REPO_TOKEN }}
+          token: ${{ secrets.RELEASE_REPO_TOKEN || secrets.SOURCE_REPO_TOKEN }}
           tag_name: ${{ steps.ver.outputs.tag }}
           name: QMvir ${{ steps.ver.outputs.tag }}
           draft: false

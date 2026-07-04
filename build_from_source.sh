@@ -5,7 +5,7 @@
 set -e
 
 VERSION="${1:-main}"
-REPO_URL="https://github.com/virgori/qmvir"
+REPO_URL="https://github.com/virgori/qmvir-db"
 BUILD_DIR=$(mktemp -d)
 
 echo "Building QMvir from source..."
@@ -25,7 +25,7 @@ git clone --depth 1 --branch "$VERSION" "$REPO_URL" source 2>/dev/null || {
     echo "  1. SSH key configured, OR"
     echo "  2. Personal Access Token with repo access"
     echo ""
-    echo "Try: git clone https://<TOKEN>@github.com/virgori/qmvir"
+    echo "Try: git clone https://<TOKEN>@github.com/virgori/qmvir-db"
     exit 1
 }
 
