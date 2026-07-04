@@ -86,15 +86,9 @@ qm guide quickstart
 
 ## Documentation
 
-Full docs in the source repository:
+Public install and release docs: [virgori/qmvir-releases](https://github.com/virgori/qmvir-releases).
 
-| Topic | Link |
-|-------|------|
-| Architecture | [docs/QMVIR_ARCHITECTURE.md](https://github.com/virgori/qmvir-db/blob/main/docs/QMVIR_ARCHITECTURE.md) |
-| Algorithms | [docs/QMVIR_ALGORITHMS.md](https://github.com/virgori/qmvir-db/blob/main/docs/QMVIR_ALGORITHMS.md) |
-| Basic usage | [docs/BASIC_USAGE.md](https://github.com/virgori/qmvir-db/blob/main/docs/BASIC_USAGE.md) |
-| Enterprise HA | [docs/ENTERPRISE_HA_GUIDE.md](https://github.com/virgori/qmvir-db/blob/main/docs/ENTERPRISE_HA_GUIDE.md) |
-| Doc index | [docs/README.md](https://github.com/virgori/qmvir-db/blob/main/docs/README.md) |
+Full architecture docs ship with the private source repository for collaborators.
 
 ## License
 

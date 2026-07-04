@@ -170,7 +170,7 @@ Historical reports and old audits: [docs/_archive/legacy/](docs/_archive/legacy/
 
 ### Links
 
-- **GitHub:** [virgori/qmvir-db](https://github.com/virgori/qmvir-db)
+- **Source:** private repo `virgori/qmvir-db` (collaborators only)
 - **Releases:** [virgori/qmvir-releases v6.2.3](https://github.com/virgori/qmvir-releases/releases/tag/v6.2.3)
 - **npm:** [qmvir@6.2.3](https://www.npmjs.com/package/qmvir/v/6.2.3)
 
@@ -221,8 +221,7 @@ QM/
 
 ## 🤝 Community & Support
 
-- **GitHub Issues**: [Bug reports and feature requests](https://github.com/virgori/qmvir-db/issues)
-- **Discussions**: [Community discussions and Q&A](https://github.com/virgori/qmvir-db/discussions)
+- **Issues / discussions:** contact maintainers (source repo is private)
 - **Documentation**: [Full documentation site](https://qmvir.readthedocs.io/)
 
 ---
@@ -235,7 +234,7 @@ QMvir is distributed under the proprietary license in [LICENSE](LICENSE). See th
 
 <div align="center">
 
-**[⭐ Star us on GitHub](https://github.com/virgori/qmvir-db) • [📖 Read the docs](https://qmvir.readthedocs.io/) • [🚀 Get started now](#-quick-start)**
+**[⭐ Star releases](https://github.com/virgori/qmvir-releases) • [📖 Read the docs](https://qmvir.readthedocs.io/) • [🚀 Get started now](#-quick-start)**
 
 Made with ❤️ by the QMvir Team
 
