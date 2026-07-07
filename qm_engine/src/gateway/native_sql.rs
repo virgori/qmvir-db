@@ -3866,6 +3866,8 @@ pub struct NativeSqlEngine {
     wal_open_datasync: Arc<AtomicBool>,
     /// Mutations since last checkpoint (for auto-checkpoint).
     wal_mutations: Arc<AtomicU64>,
+    /// True while a background checkpoint thread is running.
+    checkpoint_in_flight: Arc<AtomicBool>,
     /// Tracked WAL file size (avoids fs::metadata on commit hot path).
     wal_file_bytes: Arc<AtomicU64>,
     /// Optional engine-native WAL sync policy. Default preserves the legacy
@@ -5492,6 +5494,7 @@ impl NativeSqlEngine {
             wal_writer: Arc::new(RwLock::new(None)),
             wal_open_datasync: Arc::new(AtomicBool::new(false)),
             wal_mutations: Arc::new(AtomicU64::new(0)),
+            checkpoint_in_flight: Arc::new(AtomicBool::new(false)),
             wal_file_bytes: Arc::new(AtomicU64::new(0)),
             wal_sync_policy: Arc::new(AtomicU64::new(WalSyncPolicy::AppendOnlyProfile as u64)),
             wal_sync_count: Arc::new(AtomicU64::new(0)),
@@ -5598,6 +5601,7 @@ impl NativeSqlEngine {
             wal_writer: Arc::new(RwLock::new(None)),
             wal_open_datasync: Arc::new(AtomicBool::new(false)),
             wal_mutations: Arc::new(AtomicU64::new(0)),
+            checkpoint_in_flight: Arc::new(AtomicBool::new(false)),
             wal_file_bytes: Arc::new(AtomicU64::new(0)),
             wal_sync_policy: Arc::new(AtomicU64::new(WalSyncPolicy::AppendOnlyProfile as u64)),
             wal_sync_count: Arc::new(AtomicU64::new(0)),
@@ -6160,10 +6164,42 @@ impl NativeSqlEngine {
             WalSyncPolicy::RelaxedOsBuffered => self.wal_flush_only()?,
             WalSyncPolicy::AppendOnlyProfile => {}
         }
-        if self.wal_mutations.fetch_add(1, Ordering::Relaxed) + 1 >= CHECKPOINT_INTERVAL {
-            self.checkpoint();
+        let count = self.wal_mutations.fetch_add(1, Ordering::Relaxed) + 1;
+        if count >= CHECKPOINT_INTERVAL {
+            self.schedule_background_checkpoint();
         }
         Ok(())
+    }
+
+    /// Avoid blocking OLTP on full-catalog snapshot + fsync; run checkpoint off-thread.
+    fn schedule_background_checkpoint(&self) {
+        if self
+            .checkpoint_in_flight
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            return;
+        }
+        let pending = self.wal_mutations.swap(0, Ordering::Relaxed);
+        if pending < CHECKPOINT_INTERVAL {
+            self.checkpoint_in_flight.store(false, Ordering::Release);
+            return;
+        }
+        let engine_bg = self.clone();
+        if std::thread::Builder::new()
+            .name("qm-checkpoint".into())
+            .spawn(move || {
+                engine_bg.checkpoint();
+                engine_bg
+                    .checkpoint_in_flight
+                    .store(false, Ordering::Release);
+            })
+            .is_err()
+        {
+            self.checkpoint();
+            self.checkpoint_in_flight
+                .store(false, Ordering::Release);
+        }
     }
 
     fn cell_query_bytes(cell: &Cell) -> Option<Vec<u8>> {
@@ -7411,7 +7447,7 @@ impl NativeSqlEngine {
                 }
                 if previous + wal_statement_count >= CHECKPOINT_INTERVAL {
                     let ck_start = profile.then(Instant::now);
-                    self.checkpoint();
+                    self.schedule_background_checkpoint();
                     if let Some(start) = ck_start {
                         Self::profile_ns(&self.native_profile.commit_checkpoint_ns, start.elapsed());
                     }
@@ -12477,6 +12513,45 @@ impl NativeSqlEngine {
         }
     }
 
+    fn autocommit_delete_by_pk(
+        &self,
+        table: &str,
+        row_id: i64,
+    ) -> Result<QueryResult, String> {
+        let lookup_start = if Self::native_profile_enabled() {
+            Some(Instant::now())
+        } else {
+            None
+        };
+        let exists = self
+            .tables
+            .with_read(table, |t| t.rows.contains_key(&row_id))
+            .unwrap_or(false);
+        if let Some(start) = lookup_start {
+            Self::profile_ns(&self.native_profile.pk_lookup_ns, start.elapsed());
+            self.native_profile
+                .pk_lookup_count
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        if !exists {
+            return Ok(Self::empty_ok("DELETE 0"));
+        }
+
+        self.tables.with_write(table, |t| -> Result<(), String> {
+            if let Some(row) = t.rows.get(&row_id) {
+                self.remove_from_indexes(table, row_id, row);
+            }
+            if self.htap_tx_active() {
+                self.htap_track_row_delete(table, t, row_id);
+            }
+            t.rows.remove(&row_id);
+            Ok(())
+        })??;
+
+        self.buf_pool.invalidate(table);
+        Ok(Self::empty_ok("DELETE 1"))
+    }
+
     fn autocommit_update_by_pk(
         &self,
         table: &str,
@@ -14094,32 +14169,25 @@ impl NativeSqlEngine {
         let up_work = s_work.to_ascii_uppercase();
 
         if tx_active {
-            let g = self.tables.to_native_map();
-            let needs_full_snapshot = Self::table_has_fk_side_effects(&g, table, true);
-            drop(g);
-            if needs_full_snapshot {
+            if self.catalog_table_has_fk_side_effects(table, true) {
                 self.ensure_full_transaction_snapshot()?;
             }
         }
 
         // Determine which rows to delete.
         let has_where = up_work.contains("WHERE");
+        let has_fk_references = self.catalog_table_has_fk_references(table, true);
 
-        let mut g = self.tables.write();
-        let has_fk_references = Self::table_has_fk_references(&g, table, true);
-        let mut deleted = 0usize;
-        let mut returning_rows: Vec<Vec<Option<Vec<u8>>>> = Vec::new();
-
-        // Expand RETURNING * to actual columns
         let ret_cols_expanded: Vec<String> =
             if returning_cols.len() == 1 && returning_cols[0] == "*" {
-                g.get(table).map(|t| t.columns.clone()).unwrap_or_default()
+                self.tables
+                    .with_read(table, |t| t.columns.clone())
+                    .unwrap_or_default()
             } else {
-                returning_cols
+                returning_cols.clone()
             };
 
         if has_where {
-            // Parse WHERE predicate for targeted delete.
             let where_idx = up_work.find("WHERE").unwrap();
             let pred_part = s_work[where_idx + 5..].trim().trim_end_matches(';');
             if pred_part.is_empty() {
@@ -14127,38 +14195,19 @@ impl NativeSqlEngine {
             }
             if !tx_active && ret_cols_expanded.is_empty() && !has_fk_references {
                 if let Some(row_id) = Self::parse_simple_id_eq_predicate(pred_part) {
-                    let lookup_start = if Self::native_profile_enabled() {
-                        Some(Instant::now())
-                    } else {
-                        None
-                    };
-                    let exists = g
-                        .get(table)
-                        .map(|t| t.rows.contains_key(&row_id))
-                        .unwrap_or(false);
-                    if let Some(start) = lookup_start {
-                        Self::profile_ns(&self.native_profile.pk_lookup_ns, start.elapsed());
-                        self.native_profile
-                            .pk_lookup_count
-                            .fetch_add(1, Ordering::Relaxed);
-                    }
-                    if exists {
-                        if let Some(row) = g.get(table).and_then(|t| t.rows.get(&row_id)) {
-                            self.remove_from_indexes(table, row_id, row);
-                        }
-                        if let Some(t) = g.get_mut(table) {
-                            if self.htap_tx_active() {
-                                self.htap_track_row_delete(table, t, row_id);
-                            }
-                            t.rows.remove(&row_id);
-                        }
-                        drop(g);
-                        self.buf_pool.invalidate(table);
-                        return Ok(Self::empty_ok("DELETE 1"));
-                    }
-                    return Ok(Self::empty_ok("DELETE 0"));
+                    return self.autocommit_delete_by_pk(table, row_id);
                 }
             }
+        }
+
+        let mut g = self.tables.write();
+        let mut deleted = 0usize;
+        let mut returning_rows: Vec<Vec<Option<Vec<u8>>>> = Vec::new();
+
+        if has_where {
+            // Parse WHERE predicate for targeted delete.
+            let where_idx = up_work.find("WHERE").unwrap();
+            let pred_part = s_work[where_idx + 5..].trim().trim_end_matches(';');
             let mut to_delete: Vec<i64> = Vec::new();
             if let Some(t) = g.get(table) {
                 if let Some(row_id) = Self::parse_simple_id_eq_predicate(pred_part) {
@@ -26396,6 +26445,35 @@ mod tests {
         assert_eq!(manager.transaction_state(tx2), Some(MvccTxState::Aborted));
         assert_eq!(manager.active_count(), 0);
         assert_eq!(manager.oldest_active_snapshot(), 1);
+    }
+
+    #[test]
+    fn autocommit_delete_by_pk_after_bulk_insert_does_not_clone_catalog() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let engine = NativeSqlEngine::with_data_dir(dir.path().to_path_buf());
+        engine
+            .execute("CREATE TABLE bulk_del (id INTEGER PRIMARY KEY, body TEXT)")
+            .unwrap();
+        for i in 0..2_000 {
+            engine
+                .execute(&format!(
+                    "INSERT INTO bulk_del (id, body) VALUES ({i}, 'payload-{i}')"
+                ))
+                .unwrap();
+        }
+        let deleted = engine
+            .execute("DELETE FROM bulk_del WHERE id = 42")
+            .expect("delete by pk");
+        assert_eq!(deleted.command_tag, "DELETE 1");
+        assert_eq!(
+            engine
+                .execute("SELECT COUNT(*) FROM bulk_del")
+                .unwrap()
+                .rows[0][0]
+                .as_ref()
+                .map(|b| String::from_utf8_lossy(b).to_string()),
+            Some("1999".to_string())
+        );
     }
 
     #[test]

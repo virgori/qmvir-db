@@ -362,7 +362,13 @@ impl PyPostgresGateway {
         }
 
         let native = Arc::new(match data_dir {
-            Some(ref d) => NativeSqlEngine::with_data_dir(std::path::PathBuf::from(d)),
+            Some(ref d) => {
+                let engine = NativeSqlEngine::with_data_dir(std::path::PathBuf::from(d));
+                if std::env::var("QMVIR_WAL_SYNC_POLICY").is_err() {
+                    let _ = engine.set_wal_sync_policy("group_commit_sync");
+                }
+                engine
+            }
             None => NativeSqlEngine::new(),
         });
         let auth_mgr = native.auth.clone();

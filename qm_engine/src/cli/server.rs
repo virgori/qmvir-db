@@ -246,6 +246,10 @@ pub fn run_start(
         } else {
             eprintln!("[WAL] sync policy: {}", policy);
         }
+    } else if let Err(err) = engine.set_wal_sync_policy("group_commit_sync") {
+        eprintln!("warning: failed to set default group_commit_sync ({err})");
+    } else {
+        eprintln!("[WAL] sync policy: group_commit_sync (gateway default)");
     }
 
     // SEC-02: Override default admin password.

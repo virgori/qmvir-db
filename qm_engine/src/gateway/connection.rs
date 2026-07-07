@@ -24,6 +24,14 @@ use tokio_rustls::TlsAcceptor;
 
 static CONNECTION_COUNTER: AtomicU64 = AtomicU64::new(1);
 
+fn sql_is_read_only_query(sql: &str) -> bool {
+    let up = sql.trim_start().to_ascii_uppercase();
+    up.starts_with("SELECT")
+        || up.starts_with("WITH")
+        || up.starts_with("SHOW")
+        || up.starts_with("EXPLAIN")
+}
+
 #[derive(Debug)]
 struct CopyInState {
     table: String,
@@ -441,6 +449,7 @@ impl Connection {
                     )
                 });
                 if let Some((cached, query, result_formats)) = cached_and_query {
+                    let txn_sql = query.clone();
                     let result = if let Some(c) = cached {
                         Ok(c)
                     } else {
@@ -456,6 +465,7 @@ impl Connection {
                     };
                     match result {
                         Ok(result) => {
+                            self.update_txn_status(&txn_sql, false);
                             let row_limit = if max_rows > 0 {
                                 max_rows as usize
                             } else {
@@ -473,6 +483,7 @@ impl Connection {
                             );
                         }
                         Err(e) => {
+                            self.update_txn_status(&txn_sql, true);
                             self.send_error("ERROR", "42000", &e).await?;
                         }
                     }
@@ -488,31 +499,29 @@ impl Connection {
                     b'S' => {
                         // Describe prepared statement
                         if let Some(stmt) = self.prepared_statements.get(&name) {
-                            // Execute query to get column info (dry run)
-                            let test_query = Self::substitute_params_with_defaults(
-                                &stmt.query,
-                                stmt.param_types.len(),
+                            // Parameter description only for mutations; read queries may dry-run.
+                            ProtocolCodec::encode_parameter_description(
+                                &mut self.write_buf,
+                                &stmt.param_types,
                             );
-                            if let Ok(result) = (self.query_handler)(test_query) {
-                                // Parameter description
-                                ProtocolCodec::encode_parameter_description(
-                                    &mut self.write_buf,
-                                    &stmt.param_types,
+                            if sql_is_read_only_query(&stmt.query) {
+                                let test_query = Self::substitute_params_with_defaults(
+                                    &stmt.query,
+                                    stmt.param_types.len(),
                                 );
-                                // Row description
-                                if !result.columns.is_empty() {
-                                    ProtocolCodec::encode_row_description(
-                                        &mut self.write_buf,
-                                        &result.columns,
-                                    );
+                                if let Ok(result) = (self.query_handler)(test_query) {
+                                    if !result.columns.is_empty() {
+                                        ProtocolCodec::encode_row_description(
+                                            &mut self.write_buf,
+                                            &result.columns,
+                                        );
+                                    } else {
+                                        ProtocolCodec::encode_no_data(&mut self.write_buf);
+                                    }
                                 } else {
                                     ProtocolCodec::encode_no_data(&mut self.write_buf);
                                 }
                             } else {
-                                ProtocolCodec::encode_parameter_description(
-                                    &mut self.write_buf,
-                                    &stmt.param_types,
-                                );
                                 ProtocolCodec::encode_no_data(&mut self.write_buf);
                             }
                         } else {
@@ -523,17 +532,21 @@ impl Connection {
                         // Describe portal - row description; cache result to avoid re-execution in Execute.
                         let query = self.portals.get(&name).map(|p| p.query.clone());
                         if let Some(query) = query {
-                            if let Ok(result) = self.dispatch_query(&query) {
-                                if !result.columns.is_empty() {
-                                    ProtocolCodec::encode_row_description(
-                                        &mut self.write_buf,
-                                        &result.columns,
-                                    );
+                            if sql_is_read_only_query(&query) {
+                                if let Ok(result) = self.dispatch_query(&query) {
+                                    if !result.columns.is_empty() {
+                                        ProtocolCodec::encode_row_description(
+                                            &mut self.write_buf,
+                                            &result.columns,
+                                        );
+                                    } else {
+                                        ProtocolCodec::encode_no_data(&mut self.write_buf);
+                                    }
+                                    if let Some(p) = self.portals.get_mut(&name) {
+                                        p.cached_result = Some(result);
+                                    }
                                 } else {
                                     ProtocolCodec::encode_no_data(&mut self.write_buf);
-                                }
-                                if let Some(p) = self.portals.get_mut(&name) {
-                                    p.cached_result = Some(result);
                                 }
                             } else {
                                 ProtocolCodec::encode_no_data(&mut self.write_buf);

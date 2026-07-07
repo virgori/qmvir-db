@@ -1,6 +1,12 @@
 # qmvir
 
-**QMvir v6.2.3** — Hybrid AI-native database: OLTP + OLAP + full-text search + vector search in one Rust engine. PostgreSQL wire protocol. **Production Multi-DC Enterprise Certified** (optional HA cluster).
+**QMvir v6.2.4** — Hybrid AI-native database: OLTP + OLAP + full-text search + vector search in one Rust engine. PostgreSQL wire protocol. **Production Multi-DC Enterprise Certified** (optional HA cluster).
+
+## What's new in 6.2.4
+
+- Fix DELETE/UPDATE hang after bulk insert (no full-catalog clone on `WHERE id = ?` autocommit path)
+- Defer checkpoint off the WAL hot path; gateway default `group_commit_sync` for durable pgwire
+- PG extended protocol: safe Describe (no mutation side effects on prepare); txn status on Execute
 
 ## What's new in 6.2.3
 
@@ -18,13 +24,13 @@
 ## Install
 
 ```bash
-npm install qmvir@6.2.3
+npm install qmvir@6.2.4
 # or global CLI
 npm install -g qmvir
-qm --version   # qm 6.2.3
+qm --version   # qm 6.2.4
 ```
 
-Postinstall downloads the native binary (~8–13 MB) for **your** platform from [GitHub releases](https://github.com/virgori/qmvir-releases/releases/tag/v6.2.3).
+Postinstall downloads the native binary (~8–13 MB) for **your** platform from [GitHub releases](https://github.com/virgori/qmvir-releases/releases/tag/v6.2.4).
 
 Linux and Windows binaries are **not** bundled in the npm package (that would ship ~70 MB for all platforms). After `npm install`, `scripts/postinstall.js` fetches exactly one binary:
 

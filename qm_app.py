@@ -92,7 +92,7 @@ except Exception:
 
 logger = logging.getLogger("qm.daemon")
 
-__version__ = "6.2.3"
+__version__ = "6.2.4"
 
 
 # ── i18n ────────────────────────────────────────────────────────────

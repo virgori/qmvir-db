@@ -19,7 +19,7 @@
 
 QMvir is a **hybrid database engine** (Rust) combining transactional SQL, analytics-style execution, full-text search, and vector similarity in one process. It exposes a **PostgreSQL wire-protocol** gateway for standard clients.
 
-**v6.2.3** fixes PostgreSQL wire session registration so multi-connection clients (`node-pg` pools) can write. **v6.2.2** improves search hot paths and hardens the npm/GitHub release pipeline.
+**v6.2.4** fixes PG wire DELETE/UPDATE hangs after bulk load, defers checkpoint off the hot path, and defaults gateway WAL to group commit for real `node-pg` benchmarks. **v6.2.3** fixes PostgreSQL wire session registration so multi-connection clients (`node-pg` pools) can write. **v6.2.2** improves search hot paths and hardens the npm/GitHub release pipeline.
 
 **v6.2.0** added optional **Production Multi-DC Enterprise HA**: sync WAL replication, automatic failover, meta Raft, 2PC, STONITH, witness, and `qm cluster certify` certification tiers.
 
@@ -41,7 +41,7 @@ QMvir is a **hybrid database engine** (Rust) combining transactional SQL, analyt
 
 #### Option 1: NPM (Recommended)
 ```bash
-npm install -g qmvir@6.2.3
+npm install -g qmvir@6.2.4
 qm --version
 ```
 
@@ -171,8 +171,8 @@ Historical reports and old audits: [docs/_archive/legacy/](docs/_archive/legacy/
 ### Links
 
 - **Source:** private repo `virgori/qmvir-db` (collaborators only)
-- **Releases:** [virgori/qmvir-releases v6.2.3](https://github.com/virgori/qmvir-releases/releases/tag/v6.2.3)
-- **npm:** [qmvir@6.2.3](https://www.npmjs.com/package/qmvir/v/6.2.3)
+- **Releases:** [virgori/qmvir-releases v6.2.4](https://github.com/virgori/qmvir-releases/releases/tag/v6.2.4)
+- **npm:** [qmvir@6.2.4](https://www.npmjs.com/package/qmvir/v/6.2.4)
 
 ---
 
