@@ -6577,7 +6577,8 @@ impl NativeSqlEngine {
             return;
         }
         if let Some(tx_id) = self.htap.tx_mgr.active_tx_for_session(self.session_id) {
-            self.htap.bootstrap_table_engine(&self.tables, table);
+            // Use `t` directly — do not bootstrap via TableStore (would deadlock under
+            // with_write / holding the per-table write lock).
             let _ = self
                 .htap
                 .mvcc
@@ -6591,7 +6592,7 @@ impl NativeSqlEngine {
             return;
         }
         if let Some(tx_id) = self.htap.tx_mgr.active_tx_for_session(self.session_id) {
-            self.htap.bootstrap_table_engine(&self.tables, table);
+            // Same as write: `ensure_table` in delete_row uses `t`, no TableStore re-lock.
             let _ = self.htap.mvcc.delete_row(tx_id, table, t, row_id);
             self.htap.mark_column_dirty(table);
         }
@@ -26445,6 +26446,31 @@ mod tests {
         assert_eq!(manager.transaction_state(tx2), Some(MvccTxState::Aborted));
         assert_eq!(manager.active_count(), 0);
         assert_eq!(manager.oldest_active_snapshot(), 1);
+    }
+
+    #[test]
+    fn autocommit_update_delete_after_htap_inserts_no_deadlock() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let engine = NativeSqlEngine::with_data_dir(dir.path().to_path_buf());
+        let _ = engine.set_wal_sync_policy("group_commit_sync");
+        engine
+            .execute("CREATE TABLE ddl_probe (id INTEGER PRIMARY KEY, body TEXT)")
+            .unwrap();
+        for i in 0..200 {
+            engine
+                .execute(&format!(
+                    "INSERT INTO ddl_probe (id, body) VALUES ({i}, 'row-{i}')"
+                ))
+                .unwrap();
+        }
+        let upd = engine
+            .execute("UPDATE ddl_probe SET body = 'x' WHERE id = 7")
+            .expect("update must not deadlock");
+        assert_eq!(upd.command_tag, "UPDATE 1");
+        let del = engine
+            .execute("DELETE FROM ddl_probe WHERE id = 8")
+            .expect("delete must not deadlock");
+        assert_eq!(del.command_tag, "DELETE 1");
     }
 
     #[test]
