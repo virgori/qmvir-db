@@ -1,6 +1,6 @@
 [package]
 name = "qm_engine"
-version = "6.2.5"
+version = "6.2.6"
 edition = "2021"
 description = "QMvir High-Performance Database Engine - Rust Core"
 autobins = false

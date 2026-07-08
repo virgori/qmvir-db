@@ -106,6 +106,33 @@ impl TableStore {
         out
     }
 
+    /// Clone only named tables (one lock at a time) — preferred for checkpoint.
+    pub fn clone_named(&self, names: &[String]) -> HashMap<String, NativeTable> {
+        let mut out = HashMap::with_capacity(names.len());
+        for name in names {
+            if let Some(shared) = self.get_shared(name) {
+                out.insert(name.clone(), shared.read().clone());
+            }
+        }
+        out
+    }
+
+    /// Best-effort clone that never blocks DML — returns None if any table is
+    /// write-locked or too large to clone under a shared lock (would stall writers).
+    pub fn try_clone_named(&self, names: &[String]) -> Option<HashMap<String, NativeTable>> {
+        const MAX_ROWS_UNDER_SHARED_LOCK: usize = 2_000;
+        let mut out = HashMap::with_capacity(names.len());
+        for name in names {
+            let shared = self.get_shared(name)?;
+            let guard = shared.try_read()?;
+            if guard.rows.len() > MAX_ROWS_UNDER_SHARED_LOCK {
+                return None;
+            }
+            out.insert(name.clone(), guard.clone());
+        }
+        Some(out)
+    }
+
     pub fn row_count(&self, table: &str) -> Option<usize> {
         self.get_shared(table)
             .map(|shared| shared.read().rows.len())

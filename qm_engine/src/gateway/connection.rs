@@ -952,12 +952,13 @@ impl Connection {
         param_formats: &[i16],
         params: &[Option<Bytes>],
     ) -> String {
+        // Replace highest $N first so $1 does not corrupt $10/$11.
         let mut result = query.to_string();
-        for (i, param) in params.iter().enumerate() {
+        for i in (0..params.len()).rev() {
             let placeholder = format!("${}", i + 1);
             let oid = param_types.get(i).copied().unwrap_or(0);
             let format = Self::param_format_code(param_formats, i);
-            let value = match param {
+            let value = match &params[i] {
                 Some(bytes) => Self::format_param_sql(oid, format, bytes),
                 None => "NULL".to_string(),
             };

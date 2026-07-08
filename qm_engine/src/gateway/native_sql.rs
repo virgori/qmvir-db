@@ -1641,25 +1641,38 @@ fn eval_case_when(expr: &str, row: &NativeRow) -> Cell {
     Cell::Null
 }
 
-/// Find a keyword at the top level (not inside parentheses) in an uppercase string.
+/// Find a keyword at the top level (not inside parentheses or string literals).
 fn find_keyword_top_level(s: &str, keyword: &str) -> Option<usize> {
     let kw_len = keyword.len();
     if s.len() < kw_len {
         return None;
     }
     let mut depth = 0i32;
+    let mut in_quote = false;
     let bytes = s.as_bytes();
-    for i in 0..=(s.len() - kw_len) {
-        match bytes[i] {
+    let mut i = 0usize;
+    while i + kw_len <= s.len() {
+        let b = bytes[i];
+        if b == b'\'' {
+            // SQL '' escape inside literals
+            if in_quote && i + 1 < s.len() && bytes[i + 1] == b'\'' {
+                i += 2;
+                continue;
+            }
+            in_quote = !in_quote;
+            i += 1;
+            continue;
+        }
+        if in_quote {
+            i += 1;
+            continue;
+        }
+        match b {
             b'(' => depth += 1,
             b')' => depth -= 1,
-            b'\'' => {
-                // Skip string literal — but we're in uppercase, so just track quotes roughly
-            }
             _ => {}
         }
         if depth == 0 && &s[i..i + kw_len] == keyword {
-            // Check word boundary
             let kw_bytes = keyword.as_bytes();
             let before_ok = i == 0
                 || !kw_bytes[0].is_ascii_alphanumeric()
@@ -1671,6 +1684,7 @@ fn find_keyword_top_level(s: &str, keyword: &str) -> Option<usize> {
                 return Some(i);
             }
         }
+        i += 1;
     }
     None
 }
@@ -3386,7 +3400,9 @@ unsafe fn simd_eq_indices_i32_neon(values: &[i32], target: i32) -> Vec<usize> {
 }
 
 /// Auto-checkpoint after this many WAL mutations.
-const CHECKPOINT_INTERVAL: u64 = 10_000;
+/// Kept high enough that pgwire OLTP benches (10k inserts) are not interrupted
+/// by a synchronous snapshot of large text/vector tables.
+const CHECKPOINT_INTERVAL: u64 = 50_000;
 
 // ---------------------------------------------------------------------------
 //  Buffer Pool — caches hot data structures to avoid per-query rebuild.
@@ -6180,7 +6196,9 @@ impl NativeSqlEngine {
         {
             return;
         }
-        let pending = self.wal_mutations.swap(0, Ordering::Relaxed);
+        // Do not zero the counter here — checkpoint() / skip path owns that.
+        // Otherwise a skipped large-table snapshot loses the checkpoint forever.
+        let pending = self.wal_mutations.load(Ordering::Relaxed);
         if pending < CHECKPOINT_INTERVAL {
             self.checkpoint_in_flight.store(false, Ordering::Release);
             return;
@@ -6190,6 +6208,14 @@ impl NativeSqlEngine {
             .name("qm-checkpoint".into())
             .spawn(move || {
                 engine_bg.checkpoint();
+                // Reset only after a completed (or intentionally skipped) attempt.
+                // Successful checkpoints clear dirty state; skipped ones leave counter so
+                // the next interval can retry once table locks are free / size shrinks.
+                let _ = engine_bg
+                    .wal_mutations
+                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                        Some(v.saturating_sub(CHECKPOINT_INTERVAL))
+                    });
                 engine_bg
                     .checkpoint_in_flight
                     .store(false, Ordering::Release);
@@ -6197,6 +6223,11 @@ impl NativeSqlEngine {
             .is_err()
         {
             self.checkpoint();
+            let _ = self
+                .wal_mutations
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                    Some(v.saturating_sub(CHECKPOINT_INTERVAL))
+                });
             self.checkpoint_in_flight
                 .store(false, Ordering::Release);
         }
@@ -8502,10 +8533,6 @@ impl NativeSqlEngine {
         profile.dirty_table_count = dirty_names.len() as u64;
         profile.dirty_row_count = dirty_rows;
         profile.dirty_page_or_segment_count = dirty_names.len() as u64;
-        let lock_wait_start = Instant::now();
-        let tables = self.tables.to_native_map();
-        profile.lock_wait_ms = lock_wait_start.elapsed().as_secs_f64() * 1000.0;
-        let lock_held_start = Instant::now();
         let table_dir = Self::table_snapshot_dir(dir);
         if fs::create_dir_all(&table_dir).is_err() {
             profile.checkpoint_trigger_reason = "failed_table_snapshot_dir".to_string();
@@ -8516,7 +8543,7 @@ impl NativeSqlEngine {
             return;
         }
 
-        let mut current_tables: Vec<String> = tables.keys().cloned().collect();
+        let mut current_tables: Vec<String> = self.tables.table_names();
         current_tables.sort();
         let manifest_path = Self::table_snapshot_manifest_path(dir);
         let mut tables_to_write = if manifest_path.exists() {
@@ -8526,6 +8553,23 @@ impl NativeSqlEngine {
         };
         tables_to_write.sort();
         tables_to_write.dedup();
+
+        // Best-effort clone only tables we will write. Skip if any table is write-locked
+        // so checkpoint never blocks OLTP UPDATE/DELETE/INSERT.
+        let lock_wait_start = Instant::now();
+        let Some(tables) = self.tables.try_clone_named(&tables_to_write) else {
+            // Leave counter at 0 — retry after the next CHECKPOINT_INTERVAL mutations.
+            // Never block writers waiting on a large shared-lock clone.
+            profile.checkpoint_trigger_reason = "skipped_table_write_locked_or_large".to_string();
+            profile.lock_wait_ms = lock_wait_start.elapsed().as_secs_f64() * 1000.0;
+            profile.checkpoint_total_ms = checkpoint_start.elapsed().as_secs_f64() * 1000.0;
+            if let Ok(mut guard) = self.last_checkpoint_profile.write() {
+                *guard = profile;
+            }
+            return;
+        };
+        profile.lock_wait_ms = lock_wait_start.elapsed().as_secs_f64() * 1000.0;
+        let lock_held_start = Instant::now();
 
         let mut checkpoint_ok = true;
         let mut serialized_tables: Vec<(std::path::PathBuf, Vec<u8>)> =
@@ -10563,30 +10607,35 @@ impl NativeSqlEngine {
             // Also detect INTERSECT / EXCEPT as set operations.
             {
                 // Check for top-level set operations (not inside parentheses).
-                let mut depth = 0;
+                // Compare on bytes — never slice UTF-8 strings at non-char boundaries
+                // (CJK in LIKE patterns would panic on `&up[ii..ii+N]`).
+                let mut depth = 0i32;
                 let bts = up.as_bytes();
                 let mut has_union = false;
                 let mut has_intersect = false;
                 let mut has_except = false;
-                let mut ii = 0;
+                let mut ii = 0usize;
                 while ii < bts.len() {
                     match bts[ii] {
                         b'(' => depth += 1,
-                        b')' => depth -= 1,
-                        b'U' if depth == 0 && ii + 5 <= bts.len() && &up[ii..ii + 5] == "UNION" => {
+                        b')' => depth = depth.saturating_sub(1),
+                        b'U' if depth == 0
+                            && ii + 5 <= bts.len()
+                            && &bts[ii..ii + 5] == b"UNION" =>
+                        {
                             has_union = true;
                             break;
                         }
                         b'I' if depth == 0
                             && ii + 9 <= bts.len()
-                            && &up[ii..ii + 9] == "INTERSECT" =>
+                            && &bts[ii..ii + 9] == b"INTERSECT" =>
                         {
                             has_intersect = true;
                             break;
                         }
                         b'E' if depth == 0
                             && ii + 6 <= bts.len()
-                            && &up[ii..ii + 6] == "EXCEPT" =>
+                            && &bts[ii..ii + 6] == b"EXCEPT" =>
                         {
                             has_except = true;
                             break;
@@ -14468,6 +14517,9 @@ impl NativeSqlEngine {
                     }
                     t.rows.reserve(n.saturating_sub(t.rows.len()));
                     for (id, row) in prepared_rows {
+                        if self.htap_tx_active() {
+                            self.htap_track_row_write(table, t, id, &row);
+                        }
                         t.rows.insert(id, row);
                     }
                     return Ok(n);
@@ -14495,6 +14547,9 @@ impl NativeSqlEngine {
                     }
                 }
                 for (id, row) in prepared_rows {
+                    if self.htap_tx_active() {
+                        self.htap_track_row_write(table, t, id, &row);
+                    }
                     t.rows.insert(id, row);
                 }
                 Ok(n)
@@ -14505,11 +14560,20 @@ impl NativeSqlEngine {
             self.stage_secondary_indexes_for_inserts(table, &index_rows);
         }
 
-        self.wal_append(wal_sql)?;
-        self.index_mgr.record_writes(table, cols.iter().map(|c| c.as_str()));
-        self.mark_table_data_dirty(table, count as u64);
-        self.buf_pool.invalidate(table);
-        let _ = self.after_successful_autocommit_wal_mutation();
+        // When wrapped by htap_autocommit_mutation, parent already WAL-appends + syncs.
+        // Doing it here double-counts toward CHECKPOINT_INTERVAL and stalls OLTP.
+        let wal_owned_by_htap = self.htap_tx_active();
+        if !wal_owned_by_htap {
+            self.wal_append(wal_sql)?;
+            self.index_mgr.record_writes(table, cols.iter().map(|c| c.as_str()));
+            self.mark_table_data_dirty(table, count as u64);
+            self.buf_pool.invalidate(table);
+            let _ = self.after_successful_autocommit_wal_mutation();
+        } else {
+            self.index_mgr.record_writes(table, cols.iter().map(|c| c.as_str()));
+            self.mark_table_data_dirty(table, count as u64);
+            self.buf_pool.invalidate(table);
+        }
         Ok(count)
     }
 
@@ -16443,11 +16507,16 @@ impl NativeSqlEngine {
         };
 
         // Parse SET clause: everything between SET and WHERE (or end).
+        // WHERE must be found outside string literals — Chinese sense_text often
+        // contains the substring " where " and would otherwise trigger full-table UPDATE.
         let up_work = s_work.to_ascii_uppercase();
         let set_idx = up_work.find(" SET ").ok_or("Invalid UPDATE: missing SET")?;
         let after_set = &s_work[set_idx + 5..];
 
-        let where_idx_in_after = after_set.to_ascii_uppercase().find(" WHERE ");
+        let where_idx_in_after = {
+            let after_up = after_set.to_ascii_uppercase();
+            find_keyword_top_level(&after_up, " WHERE ")
+        };
         let set_part = if let Some(wi) = where_idx_in_after {
             &after_set[..wi]
         } else {
@@ -16658,7 +16727,7 @@ impl NativeSqlEngine {
                 b'\'' => in_quote = !in_quote,
                 b',' if !in_quote => {
                     let piece = set_part[start..i].trim();
-                    if let Some(eq_idx) = piece.find('=') {
+                    if let Some(eq_idx) = find_op_top_level(piece, "=") {
                         let col = piece[..eq_idx].trim().trim_matches('"').to_string();
                         let val = Self::parse_value(piece[eq_idx + 1..].trim());
                         assignments.push((col, val));
@@ -16670,7 +16739,7 @@ impl NativeSqlEngine {
         }
         // Last assignment.
         let piece = set_part[start..].trim();
-        if let Some(eq_idx) = piece.find('=') {
+        if let Some(eq_idx) = find_op_top_level(piece, "=") {
             let col = piece[..eq_idx].trim().trim_matches('"').to_string();
             let val = Self::parse_value(piece[eq_idx + 1..].trim());
             assignments.push((col, val));
@@ -26471,6 +26540,33 @@ mod tests {
             .execute("DELETE FROM ddl_probe WHERE id = 8")
             .expect("delete must not deadlock");
         assert_eq!(del.command_tag, "DELETE 1");
+    }
+
+    #[test]
+    fn update_where_ignores_where_inside_string_literal() {
+        let engine = NativeSqlEngine::new();
+        engine
+            .execute("CREATE TABLE upd_quote (id INTEGER PRIMARY KEY, text TEXT)")
+            .unwrap();
+        engine
+            .execute("INSERT INTO upd_quote (id, text) VALUES (1, 'hello'), (2, 'world')")
+            .unwrap();
+        // Chinese / English text may contain the word "where" — must not become a SET/WHERE split.
+        engine
+            .execute(
+                "UPDATE upd_quote SET text = 'go where you want [upd]' WHERE id = 1",
+            )
+            .expect("quoted WHERE must not confuse parser");
+        let r = engine.execute("SELECT text FROM upd_quote WHERE id = 1").unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(r.rows[0][0].as_ref().unwrap()),
+            "go where you want [upd]"
+        );
+        let r2 = engine.execute("SELECT text FROM upd_quote WHERE id = 2").unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(r2.rows[0][0].as_ref().unwrap()),
+            "world"
+        );
     }
 
     #[test]
