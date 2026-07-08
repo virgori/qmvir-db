@@ -19,7 +19,7 @@
 
 QMvir is a **hybrid database engine** (Rust) combining transactional SQL, analytics-style execution, full-text search, and vector similarity in one process. It exposes a **PostgreSQL wire-protocol** gateway for standard clients.
 
-**v6.2.6** fixes UPDATE hang when values contain `WHERE`, and makes checkpoint skip large-table clones so OLTP never stalls. **v6.2.5** fixed HTAP write-lock deadlock. **v6.2.4** deferred checkpoint / group-commit defaults. **v6.2.3** fixed `node-pg` pool session registration.
+**v6.2.7** fixes UTF-8 panic in UPDATE keyword scan (accents/CJK). **v6.2.6** fixed WHERE-in-literal hang and soft checkpoint. **v6.2.5** fixed HTAP write-lock deadlock. **v6.2.4** deferred checkpoint / group-commit defaults.
 
 **v6.2.0** added optional **Production Multi-DC Enterprise HA**: sync WAL replication, automatic failover, meta Raft, 2PC, STONITH, witness, and `qm cluster certify` certification tiers.
 
@@ -41,7 +41,7 @@ QMvir is a **hybrid database engine** (Rust) combining transactional SQL, analyt
 
 #### Option 1: NPM (Recommended)
 ```bash
-npm install -g qmvir@6.2.6
+npm install -g qmvir@6.2.7
 qm --version
 ```
 
@@ -171,8 +171,8 @@ Historical reports and old audits: [docs/_archive/legacy/](docs/_archive/legacy/
 ### Links
 
 - **Source:** private repo `virgori/qmvir-db` (collaborators only)
-- **Releases:** [virgori/qmvir-releases v6.2.6](https://github.com/virgori/qmvir-releases/releases/tag/v6.2.6)
-- **npm:** [qmvir@6.2.6](https://www.npmjs.com/package/qmvir/v/6.2.6)
+- **Releases:** [virgori/qmvir-releases v6.2.7](https://github.com/virgori/qmvir-releases/releases/tag/v6.2.7)
+- **npm:** [qmvir@6.2.7](https://www.npmjs.com/package/qmvir/v/6.2.7)
 
 ---
 

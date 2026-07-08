@@ -1642,20 +1642,21 @@ fn eval_case_when(expr: &str, row: &NativeRow) -> Cell {
 }
 
 /// Find a keyword at the top level (not inside parentheses or string literals).
+/// Byte-safe: never slices a UTF-8 string mid-character (sense_text may be CJK/Latin-1).
 fn find_keyword_top_level(s: &str, keyword: &str) -> Option<usize> {
-    let kw_len = keyword.len();
-    if s.len() < kw_len {
+    let kw_bytes = keyword.as_bytes();
+    let kw_len = kw_bytes.len();
+    let bytes = s.as_bytes();
+    if bytes.len() < kw_len {
         return None;
     }
     let mut depth = 0i32;
     let mut in_quote = false;
-    let bytes = s.as_bytes();
     let mut i = 0usize;
-    while i + kw_len <= s.len() {
+    while i + kw_len <= bytes.len() {
         let b = bytes[i];
         if b == b'\'' {
-            // SQL '' escape inside literals
-            if in_quote && i + 1 < s.len() && bytes[i + 1] == b'\'' {
+            if in_quote && i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
                 i += 2;
                 continue;
             }
@@ -1672,12 +1673,12 @@ fn find_keyword_top_level(s: &str, keyword: &str) -> Option<usize> {
             b')' => depth -= 1,
             _ => {}
         }
-        if depth == 0 && &s[i..i + kw_len] == keyword {
-            let kw_bytes = keyword.as_bytes();
+        // Keywords are ASCII; skip non-ASCII lead bytes without slicing &str.
+        if depth == 0 && b.is_ascii() && &bytes[i..i + kw_len] == kw_bytes {
             let before_ok = i == 0
                 || !kw_bytes[0].is_ascii_alphanumeric()
                 || !bytes[i - 1].is_ascii_alphanumeric();
-            let after_ok = i + kw_len >= s.len()
+            let after_ok = i + kw_len >= bytes.len()
                 || !kw_bytes[kw_len - 1].is_ascii_alphanumeric()
                 || !bytes[i + kw_len].is_ascii_alphanumeric();
             if before_ok && after_ok {
@@ -26540,6 +26541,35 @@ mod tests {
             .execute("DELETE FROM ddl_probe WHERE id = 8")
             .expect("delete must not deadlock");
         assert_eq!(del.command_tag, "DELETE 1");
+    }
+
+    #[test]
+    fn update_where_ignores_where_inside_multibyte_string() {
+        let engine = NativeSqlEngine::new();
+        engine
+            .execute("CREATE TABLE upd_utf8 (id INTEGER PRIMARY KEY, text TEXT)")
+            .unwrap();
+        engine
+            .execute("INSERT INTO upd_utf8 (id, text) VALUES (1, 'x'), (2, 'y')")
+            .unwrap();
+        // Latin-1 / CJK bytes inside the literal must not panic or redefine WHERE.
+        engine
+            .execute("UPDATE upd_utf8 SET text = 'café where 你好 [upd]' WHERE id = 1")
+            .expect("multibyte SET value must not panic keyword scan");
+        let r = engine
+            .execute("SELECT text FROM upd_utf8 WHERE id = 1")
+            .unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(r.rows[0][0].as_ref().unwrap()),
+            "café where 你好 [upd]"
+        );
+        let r2 = engine
+            .execute("SELECT text FROM upd_utf8 WHERE id = 2")
+            .unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(r2.rows[0][0].as_ref().unwrap()),
+            "y"
+        );
     }
 
     #[test]

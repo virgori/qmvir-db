@@ -1,6 +1,10 @@
 # qmvir
 
-**QMvir v6.2.6** — Hybrid AI-native database: OLTP + OLAP + full-text search + vector search in one Rust engine. PostgreSQL wire protocol. **Production Multi-DC Enterprise Certified** (optional HA cluster).
+**QMvir v6.2.7** — Hybrid AI-native database: OLTP + OLAP + full-text search + vector search in one Rust engine. PostgreSQL wire protocol. **Production Multi-DC Enterprise Certified** (optional HA cluster).
+
+## What's new in 6.2.7
+
+- Fix UTF-8 panic in keyword scan on UPDATE values with accents/CJK (`café`, `你好`) during fair node-pg benches
 
 ## What's new in 6.2.6
 
@@ -34,13 +38,13 @@
 ## Install
 
 ```bash
-npm install qmvir@6.2.6
+npm install qmvir@6.2.7
 # or global CLI
 npm install -g qmvir
-qm --version   # qm 6.2.6
+qm --version   # qm 6.2.7
 ```
 
-Postinstall downloads the native binary (~8–13 MB) for **your** platform from [GitHub releases](https://github.com/virgori/qmvir-releases/releases/tag/v6.2.6).
+Postinstall downloads the native binary (~8–13 MB) for **your** platform from [GitHub releases](https://github.com/virgori/qmvir-releases/releases/tag/v6.2.7).
 
 Linux and Windows binaries are **not** bundled in the npm package (that would ship ~70 MB for all platforms). After `npm install`, `scripts/postinstall.js` fetches exactly one binary:
 
