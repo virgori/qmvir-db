@@ -377,13 +377,15 @@ impl PyPostgresGateway {
             native.clone(),
             self.inner.runtime.as_ref(),
         );
-        let (handler, authed_handler) =
+        let (handler, authed_handler, prepare_handler, prepared_exec_handler) =
             crate::cluster::routed_query_handlers(&attach, native.clone());
 
-        let server = Arc::new(Server::new_with_auth(
+        let server = Arc::new(Server::new_with_auth_prepared(
             self.inner.config.clone(),
             handler,
             authed_handler,
+            Some(prepare_handler),
+            Some(prepared_exec_handler),
             auth_mgr,
         ));
         self.launch_server(server, &mut runner_guard)

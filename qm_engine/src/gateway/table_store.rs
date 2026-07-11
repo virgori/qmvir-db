@@ -1,6 +1,6 @@
 //! Per-table concurrent storage — avoids global catalog lock on hot read paths.
 
-use super::native_sql::NativeTable;
+use super::native_sql::{FkAction, NativeTable};
 use dashmap::DashMap;
 use parking_lot::RwLock;
 use std::collections::HashMap;
@@ -160,6 +160,38 @@ impl TableStore {
 
     pub fn table_names(&self) -> Vec<String> {
         self.map.iter().map(|e| e.key().clone()).collect()
+    }
+
+    /// True if any table declares a foreign key referencing `ref_table`.
+    pub fn any_incoming_fk_reference(&self, ref_table: &str, on_delete: bool) -> bool {
+        for entry in self.map.iter() {
+            let child = entry.value().read();
+            if child.foreign_keys.iter().any(|fk| {
+                fk.ref_table == ref_table
+                    && if on_delete {
+                        matches!(
+                            fk.on_delete,
+                            FkAction::Cascade
+                                | FkAction::SetNull
+                                | FkAction::SetDefault
+                                | FkAction::Restrict
+                                | FkAction::NoAction
+                        )
+                    } else {
+                        matches!(
+                            fk.on_update,
+                            FkAction::Cascade
+                                | FkAction::SetNull
+                                | FkAction::SetDefault
+                                | FkAction::Restrict
+                                | FkAction::NoAction
+                        )
+                    }
+            }) {
+                return true;
+            }
+        }
+        false
     }
 
     pub fn with_read<R>(

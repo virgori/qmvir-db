@@ -5,7 +5,7 @@
  */
 
 use super::auth::AuthManager;
-use super::connection::{AuthQueryHandler, Connection, QueryHandler, QueryResult};
+use super::connection::{AuthQueryHandler, Connection, PrepareHandler, PreparedExecHandler, QueryHandler, QueryResult};
 use super::pg_tls::PgTlsConfig;
 use super::stream::ServerIo;
 use super::ConnectionConfig;
@@ -43,6 +43,8 @@ pub struct Server {
     config: ConnectionConfig,
     query_handler: QueryHandler,
     authed_handler: Option<AuthQueryHandler>,
+    prepare_handler: Option<PrepareHandler>,
+    prepared_exec_handler: Option<PreparedExecHandler>,
     auth: Option<AuthManager>,
     tls: PgTlsConfig,
     running: Arc<AtomicBool>,
@@ -56,6 +58,8 @@ impl Server {
             config,
             query_handler,
             authed_handler: None,
+            prepare_handler: None,
+            prepared_exec_handler: None,
             auth: None,
             tls: PgTlsConfig::from_env(),
             running: Arc::new(AtomicBool::new(false)),
@@ -71,10 +75,23 @@ impl Server {
         authed_handler: AuthQueryHandler,
         auth: AuthManager,
     ) -> Self {
+        Self::new_with_auth_prepared(config, query_handler, authed_handler, None, None, auth)
+    }
+
+    pub fn new_with_auth_prepared(
+        config: ConnectionConfig,
+        query_handler: QueryHandler,
+        authed_handler: AuthQueryHandler,
+        prepare_handler: Option<PrepareHandler>,
+        prepared_exec_handler: Option<PreparedExecHandler>,
+        auth: AuthManager,
+    ) -> Self {
         Self {
             config,
             query_handler,
             authed_handler: Some(authed_handler),
+            prepare_handler,
+            prepared_exec_handler,
             auth: Some(auth),
             tls: PgTlsConfig::from_env(),
             running: Arc::new(AtomicBool::new(false)),
@@ -95,6 +112,8 @@ impl Server {
             config,
             query_handler,
             authed_handler: Some(authed_handler),
+            prepare_handler: None,
+            prepared_exec_handler: None,
             auth: Some(auth),
             tls,
             running: Arc::new(AtomicBool::new(false)),
@@ -109,6 +128,8 @@ impl Server {
             config,
             query_handler,
             authed_handler: None,
+            prepare_handler: None,
+            prepared_exec_handler: None,
             auth: None,
             tls,
             running: Arc::new(AtomicBool::new(false)),
@@ -255,6 +276,8 @@ impl Server {
 
                         let handler = self.query_handler.clone();
                         let authed = self.authed_handler.clone();
+                        let prepare = self.prepare_handler.clone();
+                        let prepared_exec = self.prepared_exec_handler.clone();
                         let auth = self.auth.clone();
                         let tls = self.tls.clone();
                         let stats = self.stats.clone();
@@ -264,22 +287,15 @@ impl Server {
 
                         tokio::spawn(async move {
                             let tls_acceptor = tls.acceptor.clone();
-                            let mut conn = match (authed, auth) {
-                                (Some(ah), Some(am)) => Connection::new_with_auth(
-                                    stream,
-                                    handler,
-                                    ah,
-                                    am,
-                                    tls_acceptor,
-                                ),
-                                _ => Connection::new_io(
-                                    ServerIo::from_tcp(stream),
-                                    handler,
-                                    None,
-                                    None,
-                                    tls_acceptor,
-                                ),
-                            };
+                            let mut conn = Connection::new_io_with_prepare(
+                                ServerIo::from_tcp(stream),
+                                handler,
+                                prepare,
+                                prepared_exec,
+                                authed,
+                                auth,
+                                tls_acceptor,
+                            );
 
                             if let Err(e) = conn.run().await {
                                 if e.kind() != std::io::ErrorKind::ConnectionReset {
@@ -302,6 +318,8 @@ impl Server {
 
                         let handler = self.query_handler.clone();
                         let authed = self.authed_handler.clone();
+                        let prepare = self.prepare_handler.clone();
+                        let prepared_exec = self.prepared_exec_handler.clone();
                         let auth = self.auth.clone();
                         let tls = self.tls.clone();
                         let stats = self.stats.clone();
@@ -310,22 +328,15 @@ impl Server {
                         stats.active_connections.fetch_add(1, Ordering::Relaxed);
 
                         tokio::spawn(async move {
-                            let mut conn = match (authed, auth) {
-                                (Some(ah), Some(am)) => Connection::new_io(
-                                    ServerIo::from_unix(stream),
-                                    handler,
-                                    Some(ah),
-                                    Some(am),
-                                    None,
-                                ),
-                                _ => Connection::new_io(
-                                    ServerIo::from_unix(stream),
-                                    handler,
-                                    None,
-                                    None,
-                                    None,
-                                ),
-                            };
+                            let mut conn = Connection::new_io_with_prepare(
+                                ServerIo::from_unix(stream),
+                                handler,
+                                prepare,
+                                prepared_exec,
+                                authed,
+                                auth,
+                                None,
+                            );
 
                             if let Err(e) = conn.run().await {
                                 if e.kind() != std::io::ErrorKind::ConnectionReset {
@@ -367,6 +378,8 @@ impl Server {
 
                         let handler = self.query_handler.clone();
                         let authed = self.authed_handler.clone();
+                        let prepare = self.prepare_handler.clone();
+                        let prepared_exec = self.prepared_exec_handler.clone();
                         let auth = self.auth.clone();
                         let tls = self.tls.clone();
                         let stats = self.stats.clone();
@@ -376,22 +389,15 @@ impl Server {
 
                         tokio::spawn(async move {
                             let tls_acceptor = tls.acceptor.clone();
-                            let mut conn = match (authed, auth) {
-                                (Some(ah), Some(am)) => Connection::new_with_auth(
-                                    stream,
-                                    handler,
-                                    ah,
-                                    am,
-                                    tls_acceptor,
-                                ),
-                                _ => Connection::new_io(
-                                    ServerIo::from_tcp(stream),
-                                    handler,
-                                    None,
-                                    None,
-                                    tls_acceptor,
-                                ),
-                            };
+                            let mut conn = Connection::new_io_with_prepare(
+                                ServerIo::from_tcp(stream),
+                                handler,
+                                prepare,
+                                prepared_exec,
+                                authed,
+                                auth,
+                                tls_acceptor,
+                            );
 
                             if let Err(e) = conn.run().await {
                                 if e.kind() != std::io::ErrorKind::ConnectionReset {

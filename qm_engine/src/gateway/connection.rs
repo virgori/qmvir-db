@@ -115,12 +115,15 @@ fn emit_query_result_rows(
 struct PreparedStatement {
     query: String,
     param_types: Vec<i32>,
+    plan_id: Option<u64>,
 }
 
 /// Bound portal info
 #[derive(Debug, Clone)]
 struct Portal {
     query: String,
+    param_strings: Vec<String>,
+    plan_id: Option<u64>,
     result_formats: Vec<i16>,
     cached_result: Option<QueryResult>,
 }
@@ -131,6 +134,12 @@ pub type QueryHandler = Arc<dyn Fn(String) -> Result<QueryResult, String> + Send
 /// Query handler with user context (for authorization).
 pub type AuthQueryHandler =
     Arc<dyn Fn(String, String) -> Result<QueryResult, String> + Send + Sync>;
+
+/// Compile a prepared plan at Parse time (returns opaque plan id).
+pub type PrepareHandler = Arc<dyn Fn(String) -> Result<u64, String> + Send + Sync>;
+
+/// Execute a prepared plan with bound parameter strings.
+pub type PreparedExecHandler = Arc<dyn Fn(u64, Vec<String>) -> Result<QueryResult, String> + Send + Sync>;
 
 /// Single client connection
 pub struct Connection {
@@ -145,6 +154,8 @@ pub struct Connection {
     secret_key: i32,
     transaction_status: TransactionStatus,
     query_handler: QueryHandler,
+    prepare_handler: Option<PrepareHandler>,
+    prepared_exec_handler: Option<PreparedExecHandler>,
     prepared_statements: HashMap<String, PreparedStatement>,
     portals: HashMap<String, Portal>,
     authed_handler: Option<AuthQueryHandler>,
@@ -187,6 +198,26 @@ impl Connection {
         auth: Option<AuthManager>,
         tls_acceptor: Option<TlsAcceptor>,
     ) -> Self {
+        Self::new_io_with_prepare(
+            stream,
+            query_handler,
+            None,
+            None,
+            authed_handler,
+            auth,
+            tls_acceptor,
+        )
+    }
+
+    pub fn new_io_with_prepare(
+        stream: ServerIo,
+        query_handler: QueryHandler,
+        prepare_handler: Option<PrepareHandler>,
+        prepared_exec_handler: Option<PreparedExecHandler>,
+        authed_handler: Option<AuthQueryHandler>,
+        auth: Option<AuthManager>,
+        tls_acceptor: Option<TlsAcceptor>,
+    ) -> Self {
         let id = CONNECTION_COUNTER.fetch_add(1, Ordering::Relaxed);
         let process_id = (id & 0x7FFFFFFF) as i32;
         let secret_key = OsRng.next_u32() as i32;
@@ -204,6 +235,8 @@ impl Connection {
             secret_key,
             transaction_status: TransactionStatus::Idle,
             query_handler,
+            prepare_handler,
+            prepared_exec_handler,
             prepared_statements: HashMap::new(),
             portals: HashMap::new(),
             authed_handler,
@@ -224,6 +257,26 @@ impl Connection {
         tls_acceptor: Option<TlsAcceptor>,
     ) -> Self {
         Self::new_with_auth_tcp(stream, query_handler, authed_handler, auth, tls_acceptor)
+    }
+
+    fn resolve_prepared_statement(&self, statement: &str) -> Option<PreparedStatement> {
+        if let Some(stmt) = self.prepared_statements.get(statement) {
+            return Some(stmt.clone());
+        }
+        if !statement.is_empty() {
+            return self.prepared_statements.get("").cloned();
+        }
+        None
+    }
+
+    fn resolve_portal_key(&self, portal: &str) -> Option<String> {
+        if self.portals.contains_key(portal) {
+            return Some(portal.to_string());
+        }
+        if !portal.is_empty() && self.portals.contains_key("") {
+            return Some(String::new());
+        }
+        None
     }
 
     /// Main connection loop
@@ -405,10 +458,29 @@ impl Connection {
                 query,
                 param_types,
             } => {
-                // Extended query protocol - Parse
-                // Store prepared statement for later binding
-                self.prepared_statements
-                    .insert(name, PreparedStatement { query, param_types });
+                let plan_id = self
+                    .prepared_statements
+                    .values()
+                    .find_map(|stmt| {
+                        if stmt.query == query {
+                            stmt.plan_id
+                        } else {
+                            None
+                        }
+                    })
+                    .or_else(|| {
+                        self.prepare_handler
+                            .as_ref()
+                            .and_then(|h| h(query.clone()).ok())
+                    });
+                self.prepared_statements.insert(
+                    name,
+                    PreparedStatement {
+                        query,
+                        param_types,
+                        plan_id,
+                    },
+                );
                 ProtocolCodec::encode_parse_complete(&mut self.write_buf);
                 Ok(true)
             }
@@ -420,17 +492,33 @@ impl Connection {
                 params,
                 result_formats,
             } => {
-                if let Some(stmt) = self.prepared_statements.get(&statement) {
-                    let bound_query = Self::substitute_params_typed(
-                        &stmt.query,
-                        &stmt.param_types,
-                        &param_formats,
-                        &params,
-                    );
+                if let Some(stmt) = self.resolve_prepared_statement(&statement) {
+                    let param_strings: Vec<String> = (0..params.len())
+                        .map(|i| {
+                            let oid = stmt.param_types.get(i).copied().unwrap_or(0);
+                            let format = Self::param_format_code(&param_formats, i);
+                            match &params[i] {
+                                Some(bytes) => Self::format_param_sql(oid, format, bytes),
+                                None => "NULL".to_string(),
+                            }
+                        })
+                        .collect();
+                    let bound_query = if params.is_empty() {
+                        stmt.query.clone()
+                    } else {
+                        Self::substitute_params_typed(
+                            &stmt.query,
+                            &stmt.param_types,
+                            &param_formats,
+                            &params,
+                        )
+                    };
                     self.portals.insert(
                         portal,
                         Portal {
                             query: bound_query,
+                            param_strings,
+                            plan_id: stmt.plan_id,
                             result_formats,
                             cached_result: None,
                         },
@@ -441,24 +529,53 @@ impl Connection {
             }
 
             Message::Execute { portal, max_rows } => {
-                let cached_and_query = self.portals.get_mut(&portal).map(|p| {
-                    (
-                        p.cached_result.take(),
-                        p.query.clone(),
-                        p.result_formats.clone(),
-                    )
+                let portal_key = self.resolve_portal_key(&portal);
+                let cached_and_query = portal_key.and_then(|key| {
+                    self.portals.get_mut(&key).map(|p| {
+                        (
+                            p.cached_result.take(),
+                            p.query.clone(),
+                            p.plan_id,
+                            p.param_strings.clone(),
+                            p.result_formats.clone(),
+                        )
+                    })
                 });
-                if let Some((cached, query, result_formats)) = cached_and_query {
+                if let Some((cached, query, plan_id, param_strings, result_formats)) =
+                    cached_and_query
+                {
                     let txn_sql = query.clone();
+                    let read_only = sql_is_read_only_query(&txn_sql);
                     let result = if let Some(c) = cached {
                         Ok(c)
+                    } else if let (Some(pid), Some(ref exec)) = (plan_id, &self.prepared_exec_handler) {
+                        if read_only {
+                            Self::run_query_blocking(
+                                self.id,
+                                self.query_handler.clone(),
+                                self.authed_handler.clone(),
+                                self.user.to_string(),
+                                txn_sql.clone(),
+                                &self.cancel,
+                            )
+                            .await
+                        } else {
+                            Self::run_prepared_blocking(
+                                self.id,
+                                Arc::clone(exec),
+                                pid,
+                                param_strings,
+                                &self.cancel,
+                            )
+                            .await
+                        }
                     } else {
                         Self::run_query_blocking(
                             self.id,
                             self.query_handler.clone(),
                             self.authed_handler.clone(),
                             self.user.to_string(),
-                            query,
+                            txn_sql.clone(),
                             &self.cancel,
                         )
                         .await
@@ -471,6 +588,12 @@ impl Connection {
                             } else {
                                 result.row_count()
                             };
+                            if !result.columns.is_empty() {
+                                ProtocolCodec::encode_row_description(
+                                    &mut self.write_buf,
+                                    &result.columns,
+                                );
+                            }
                             emit_query_result_rows(
                                 &mut self.write_buf,
                                 &result,
@@ -834,6 +957,31 @@ impl Connection {
         .map_err(|e| format!("query worker failed: {e}"))?
     }
 
+    async fn run_prepared_blocking(
+        conn_id: u64,
+        handler: PreparedExecHandler,
+        plan_id: u64,
+        params: Vec<String>,
+        cancel: &CancelHandle,
+    ) -> Result<QueryResult, String> {
+        if cancel.is_cancelled() {
+            return Err("query canceled".to_string());
+        }
+        let cancel_flag = cancel.flag();
+        tokio::task::spawn_blocking(move || {
+            crate::cluster::set_connection_id(conn_id);
+            if cancel_flag.load(Ordering::Acquire) {
+                crate::cluster::clear_connection_id();
+                return Err("query canceled".to_string());
+            }
+            let result = handler(plan_id, params);
+            crate::cluster::clear_connection_id();
+            result
+        })
+        .await
+        .map_err(|e| format!("prepared query worker failed: {e}"))?
+    }
+
     /// Synchronous dispatch (non-async callers only).
     fn dispatch_query(&self, sql: &str) -> Result<QueryResult, String> {
         if let Some(ref h) = self.authed_handler {
@@ -944,6 +1092,22 @@ impl Connection {
         } else {
             Self::decode_binary_param(oid, bytes)
         }
+    }
+
+    fn substitute_param_strings(query: &str, params: &[String]) -> String {
+        let mut result = query.to_string();
+        for (i, param) in params.iter().enumerate().rev() {
+            let placeholder = format!("${}", i + 1);
+            let value = if param.eq_ignore_ascii_case("null") {
+                "NULL".to_string()
+            } else if param.parse::<i64>().is_ok() || param.parse::<f64>().is_ok() {
+                param.clone()
+            } else {
+                format!("'{}'", param.replace('\'', "''"))
+            };
+            result = result.replace(&placeholder, &value);
+        }
+        result
     }
 
     fn substitute_params_typed(

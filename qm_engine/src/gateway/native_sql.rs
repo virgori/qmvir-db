@@ -2486,8 +2486,8 @@ impl WalSyncPolicy {
     }
 }
 
-const GROUP_COMMIT_DEFAULT_WINDOW_US: u64 = 150;
-const GROUP_COMMIT_DEFAULT_MAX_BATCH: u64 = 128;
+const GROUP_COMMIT_DEFAULT_WINDOW_US: u64 = 250;
+const GROUP_COMMIT_DEFAULT_MAX_BATCH: u64 = 512;
 const WAL_BUF_CAPACITY: usize = 256 * 1024;
 
 type WalWriterHandle = WalBackend;
@@ -2956,6 +2956,14 @@ enum PreparedPlan {
     CountCompiledPredicate {
         table: String,
         terms: Vec<FastCountTerm>,
+    },
+    VectorKnn {
+        table: String,
+        column: String,
+        metric: DistanceMetric,
+        query: PreparedValue,
+        limit: usize,
+        projection: Vec<String>,
     },
 }
 
@@ -3921,9 +3929,12 @@ pub struct NativeSqlEngine {
     /// Production HTAP runtime (MVCC store, segments, planner, spill, PITR).
     pub htap: Arc<crate::htap::HtapRuntime>,
     prepared_plans: Arc<RwLock<HashMap<u64, PreparedPlan>>>,
+    prepared_sql_index: Arc<RwLock<HashMap<String, u64>>>,
     next_prepared_plan_id: Arc<AtomicU64>,
     /// Autocommit rows pending inverted / JSON / trigram / HNSW maintenance.
     secondary_index_pending: Arc<Mutex<AHashMap<String, Vec<(i64, NativeRow)>>>>,
+    /// True while `durable_autocommit_mutation` owns a single WAL append + sync.
+    autocommit_wal_parent: Arc<AtomicBool>,
 }
 
 /// PyO3 wrapper around `NativeSqlEngine` for Python bindings.
@@ -5530,8 +5541,10 @@ impl NativeSqlEngine {
             mvcc_tx_mgr,
             htap,
             prepared_plans: Arc::new(RwLock::new(HashMap::new())),
+            prepared_sql_index: Arc::new(RwLock::new(HashMap::new())),
             next_prepared_plan_id: Arc::new(AtomicU64::new(1)),
             secondary_index_pending: Arc::new(Mutex::new(AHashMap::new())),
+            autocommit_wal_parent: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -5637,8 +5650,10 @@ impl NativeSqlEngine {
             mvcc_tx_mgr,
             htap,
             prepared_plans: Arc::new(RwLock::new(HashMap::new())),
+            prepared_sql_index: Arc::new(RwLock::new(HashMap::new())),
             next_prepared_plan_id: Arc::new(AtomicU64::new(1)),
             secondary_index_pending: Arc::new(Mutex::new(AHashMap::new())),
+            autocommit_wal_parent: Arc::new(AtomicBool::new(false)),
         };
         // 1. Load binary snapshot if available (fast path).
         let snap_start = std::time::Instant::now();
@@ -6409,6 +6424,16 @@ impl NativeSqlEngine {
                 }
             }
             (ColType::Vector(dim), cell) => {
+                if let Cell::Vector {
+                    dim: got,
+                    data,
+                    ..
+                } = &cell
+                {
+                    if *got == *dim && data.len() == *dim {
+                        return Ok(cell);
+                    }
+                }
                 let parsed = Self::parse_vector_cell(&cell).ok_or_else(|| {
                     format!("invalid vector literal for column '{}'", col_name)
                 })?;
@@ -6709,6 +6734,12 @@ impl NativeSqlEngine {
     /// MVCC-aware row lookup with heap / columnar-cache fallback during migration.
     #[inline]
     fn row_at(&self, table: &str, heap: &NativeTable, id: i64) -> Option<NativeRow> {
+        if self.heap_reads_preferred() {
+            if let Some(row) = heap.rows.get(&id) {
+                return Some(row.clone());
+            }
+            return self.row_from_columnar_cache(table, heap, id);
+        }
         self.htap_visible_row(table, id)
             .map(|r| (*r).clone())
             .or_else(|| heap.rows.get(&id).cloned())
@@ -6786,6 +6817,42 @@ impl NativeSqlEngine {
                 }
                 Err(e)
             }
+        }
+    }
+
+    #[inline]
+    fn autocommit_wal_owned_by_parent(&self) -> bool {
+        self.autocommit_wal_parent.load(Ordering::Relaxed) || self.htap_tx_active()
+    }
+
+    #[inline]
+    fn heap_reads_preferred(&self) -> bool {
+        !self.htap_tx_active() && !self.transaction_active()
+    }
+
+    /// OLTP autocommit: heap mutation + one WAL record (no per-row HTAP tx_mgr).
+    fn durable_autocommit_mutation<F>(
+        &self,
+        sql: &str,
+        f: F,
+    ) -> Result<QueryResult, String>
+    where
+        F: FnOnce(&Self) -> Result<QueryResult, String>,
+    {
+        self.autocommit_wal_parent
+            .store(true, Ordering::Relaxed);
+        let result = f(self);
+        self.autocommit_wal_parent
+            .store(false, Ordering::Relaxed);
+        match result {
+            Ok(q) => {
+                if self.data_dir.is_some() {
+                    self.wal_append(sql)?;
+                    self.after_successful_autocommit_wal_mutation()?;
+                }
+                Ok(q)
+            }
+            Err(e) => Err(e),
         }
     }
 
@@ -7279,6 +7346,18 @@ impl NativeSqlEngine {
                     }
             })
         })
+    }
+
+    #[inline]
+    fn table_needs_fk_mutation_checks(&self, table: &str, on_delete: bool) -> bool {
+        if self
+            .tables
+            .with_read(table, |t| !t.foreign_keys.is_empty())
+            .unwrap_or(false)
+        {
+            return true;
+        }
+        self.tables.any_incoming_fk_reference(table, on_delete)
     }
 
     fn catalog_table_has_fk_side_effects(&self, table: &str, on_delete: bool) -> bool {
@@ -9260,12 +9339,21 @@ impl NativeSqlEngine {
     }
 
     pub fn prepare(&self, sql: &str) -> Result<u64, String> {
+        let key = sql.trim().trim_end_matches(';').trim().to_string();
+        if let Ok(idx) = self.prepared_sql_index.read() {
+            if let Some(&plan_id) = idx.get(&key) {
+                return Ok(plan_id);
+            }
+        }
         let plan = self.compile_prepared_plan(sql)?;
         let plan_id = self.next_prepared_plan_id.fetch_add(1, Ordering::Relaxed);
         self.prepared_plans
             .write()
             .map_err(|_| "prepared plan lock poisoned")?
             .insert(plan_id, plan);
+        if let Ok(mut idx) = self.prepared_sql_index.write() {
+            idx.insert(key, plan_id);
+        }
         Ok(plan_id)
     }
 
@@ -9292,6 +9380,12 @@ impl NativeSqlEngine {
         }
         if up.starts_with("SELECT COUNT(*)") {
             return self.compile_prepared_count(s);
+        }
+        if up.starts_with("SELECT")
+            && up.contains(" ORDER BY ")
+            && (up.contains(" <-> ") || up.contains(" <=> ") || up.contains(" <#> "))
+        {
+            return self.compile_prepared_vector_knn(s);
         }
         if up.starts_with("SELECT") {
             return self.compile_prepared_select(s);
@@ -9343,6 +9437,69 @@ impl NativeSqlEngine {
             table,
             columns,
             values,
+        })
+    }
+
+    fn compile_prepared_vector_knn(&self, s: &str) -> Result<PreparedPlan, String> {
+        let up = s.to_ascii_uppercase();
+        if up.contains(" WHERE ") || up.contains(" OFFSET ") {
+            return Err("prepared vector KNN does not support WHERE/OFFSET".to_string());
+        }
+        let table = Self::parse_ident_after(s, "FROM")
+            .ok_or("Invalid prepared vector SELECT FROM")?
+            .trim_matches('"')
+            .to_string();
+        let projection = self.resolve_projection_for_prepare(s, &table)?;
+        let order_idx = up
+            .find(" ORDER BY ")
+            .ok_or("prepared vector KNN requires ORDER BY")?;
+        let after_order = s[order_idx + 10..].trim();
+        let after_order_up = after_order.to_ascii_uppercase();
+        let (metric, op_str) = if after_order_up.contains(" <=> ") {
+            (DistanceMetric::Cosine, " <=> ")
+        } else if after_order_up.contains(" <-> ") {
+            (DistanceMetric::L2, " <-> ")
+        } else if after_order_up.contains(" <#> ") {
+            (DistanceMetric::InnerProduct, " <#> ")
+        } else {
+            return Err("prepared vector KNN requires a distance operator".to_string());
+        };
+        let op_pos = after_order_up
+            .find(op_str)
+            .ok_or("vector operator not found in prepared ORDER BY")?;
+        let column = after_order[..op_pos]
+            .trim()
+            .trim_matches('"')
+            .to_string();
+        let limit = if let Some(li) = after_order_up[op_pos..].find(" LIMIT ") {
+            let abs_li = op_pos + li;
+            after_order[abs_li + 7..]
+                .split_whitespace()
+                .next()
+                .unwrap_or("10")
+                .trim_end_matches(';')
+                .parse::<usize>()
+                .unwrap_or(10)
+        } else {
+            10usize
+        };
+        let query_tok = if let Some(li) = after_order_up[op_pos..].find(" LIMIT ") {
+            let abs_li = op_pos + li;
+            &after_order[op_pos + op_str.len()..abs_li]
+        } else {
+            &after_order[op_pos + op_str.len()..]
+        };
+        let query = Self::parse_prepared_value(query_tok.trim());
+        if !matches!(query, PreparedValue::Param(_)) {
+            return Err("prepared vector KNN requires a parameter query vector".to_string());
+        }
+        Ok(PreparedPlan::VectorKnn {
+            table,
+            column,
+            metric,
+            query,
+            limit,
+            projection,
         })
     }
 
@@ -9485,10 +9642,9 @@ impl NativeSqlEngine {
         } else {
             None
         };
-        if is_mutation && self.data_dir.is_some() && !tx_active {
-            if let Some(sql) = wal_sql.as_deref() {
-                self.wal_append(sql)?;
-            }
+        if is_mutation && !tx_active && self.data_dir.is_some() {
+            self.autocommit_wal_parent
+                .store(true, Ordering::Relaxed);
         }
         let result = match plan {
             PreparedPlan::InsertFast {
@@ -9524,7 +9680,27 @@ impl NativeSqlEngine {
             PreparedPlan::CountCompiledPredicate { table, terms } => {
                 self.execute_prepared_count_compiled(table, terms)
             }
+            PreparedPlan::VectorKnn {
+                table,
+                column,
+                metric,
+                query,
+                limit,
+                projection,
+            } => self.execute_prepared_vector_knn(
+                table,
+                column,
+                *metric,
+                query,
+                *limit,
+                projection,
+                params,
+            ),
         };
+        if is_mutation && !tx_active {
+            self.autocommit_wal_parent
+                .store(false, Ordering::Relaxed);
+        }
         if result.is_ok() && is_mutation && tx_active {
             if let Some(sql) = wal_sql.as_deref() {
                 self.record_transaction_wal(sql)?;
@@ -9532,14 +9708,16 @@ impl NativeSqlEngine {
         }
         if result.is_ok() && is_mutation {
             match plan {
-                PreparedPlan::InsertFast { table, .. }
-                | PreparedPlan::UpdateByPrimaryKey { table, .. }
+                PreparedPlan::UpdateByPrimaryKey { table, .. }
                 | PreparedPlan::DeleteByPrimaryKey { table, .. } => {
                     self.mark_table_data_dirty(table, 1);
                 }
                 _ => {}
             }
             if self.data_dir.is_some() && !tx_active {
+                if let Some(sql) = wal_sql.as_deref() {
+                    self.wal_append(sql)?;
+                }
                 self.after_successful_autocommit_wal_mutation()?;
             }
         }
@@ -9643,10 +9821,18 @@ impl NativeSqlEngine {
 
     fn parse_prepared_value(token: &str) -> PreparedValue {
         let t = token.trim().trim_end_matches(';').trim();
-        if let Some(rest) = t.strip_prefix('$') {
-            if let Ok(idx) = rest.parse::<usize>() {
-                if idx > 0 {
-                    return PreparedValue::Param(idx - 1);
+        if let Some(dollar) = t.find('$') {
+            let rest = &t[dollar + 1..];
+            let digit_len = rest
+                .as_bytes()
+                .iter()
+                .take_while(|b| b.is_ascii_digit())
+                .count();
+            if digit_len > 0 {
+                if let Ok(idx) = rest[..digit_len].parse::<usize>() {
+                    if idx > 0 {
+                        return PreparedValue::Param(idx - 1);
+                    }
                 }
             }
         }
@@ -9757,19 +9943,17 @@ impl NativeSqlEngine {
         table: &str,
         columns: &[String],
     ) -> Result<(), String> {
-        let g = self.tables.to_native_map();
-        let t = g
-            .get(table)
-            .ok_or_else(|| format!("Table '{}' does not exist", table))?;
-        for col in columns {
-            if !t.columns.iter().any(|c| c == col) {
-                return Err(format!(
-                    "column '{}' does not exist on table '{}'",
-                    col, table
-                ));
+        self.tables.with_read(table, |t| {
+            for col in columns {
+                if !t.columns.iter().any(|c| c == col) {
+                    return Err(format!(
+                        "column '{}' does not exist on table '{}'",
+                        col, table
+                    ));
+                }
             }
-        }
-        Ok(())
+            Ok(())
+        })?
     }
 
     fn resolve_projection_for_prepare(
@@ -9778,22 +9962,20 @@ impl NativeSqlEngine {
         table: &str,
     ) -> Result<Vec<String>, String> {
         let select_cols = Self::parse_select_columns(sql);
-        let g = self.tables.to_native_map();
-        let t = g
-            .get(table)
-            .ok_or_else(|| format!("Table '{}' does not exist", table))?;
-        if select_cols.is_empty() {
-            return Ok(t.columns.clone());
-        }
-        for col in &select_cols {
-            if !t.columns.iter().any(|c| c == col) {
-                return Err(format!(
-                    "column '{}' does not exist on table '{}'",
-                    col, table
-                ));
+        self.tables.with_read(table, |t| {
+            if select_cols.is_empty() {
+                return Ok(t.columns.clone());
             }
-        }
-        Ok(select_cols)
+            for col in &select_cols {
+                if !t.columns.iter().any(|c| c == col) {
+                    return Err(format!(
+                        "column '{}' does not exist on table '{}'",
+                        col, table
+                    ));
+                }
+            }
+            Ok(select_cols)
+        })?
     }
 
     fn prepared_columns(t: &NativeTable, projection: &[String]) -> Vec<(String, i32, i16)> {
@@ -9831,13 +10013,38 @@ impl NativeSqlEngine {
             row_map.insert(col.clone(), Self::resolve_prepared_value(value, params)?);
         }
         let id = row_map.get("id").map(|v| v.as_i64()).unwrap_or(0);
-        let mut rows = vec![(
+        let rows = vec![(
             id,
             NativeRow {
                 cols: row_map,
                 last_modified_lsn: 0,
             },
         )];
+        if self.transaction_active() {
+            return self.execute_prepared_insert_txn(table, columns, &rows);
+        }
+        let count = if self.autocommit_wal_owned_by_parent() {
+            self.bulk_insert_rows_fast(table, columns, rows, "", false)?
+        } else {
+            let wal_sql = Self::prepared_wal_sql(
+                &PreparedPlan::InsertFast {
+                    table: table.to_string(),
+                    columns: columns.to_vec(),
+                    values: values.to_vec(),
+                },
+                params,
+            )?;
+            self.bulk_insert_rows_fast(table, columns, rows, &wal_sql, false)?
+        };
+        Ok(Self::empty_ok(&format!("INSERT 0 {}", count)))
+    }
+
+    fn execute_prepared_insert_txn(
+        &self,
+        table: &str,
+        columns: &[String],
+        rows: &[(i64, NativeRow)],
+    ) -> Result<QueryResult, String> {
         let table_indexes: Vec<_> = {
             let indexes = self.index_mgr.indexes.read();
             indexes
@@ -9854,14 +10061,15 @@ impl NativeSqlEngine {
                     .ok_or_else(|| format!("Table '{}' does not exist", table))?;
                 t.ensure_auto_id_initialized();
                 let old_next_auto_id = t.next_auto_id;
-                Self::normalize_insert_rows_for_table(t, &mut rows, false)?;
+                let mut owned = rows.to_vec();
+                Self::normalize_insert_rows_for_table(t, &mut owned, false)?;
                 old_next_auto_id
             };
             if g.get(table)
                 .map(|t| !t.foreign_keys.is_empty())
                 .unwrap_or(false)
             {
-                if let Err(err) = self.check_fk_on_insert(&g, table, &rows) {
+                if let Err(err) = self.check_fk_on_insert(&g, table, rows) {
                     if let Some(t) = g.get_mut(table) {
                         t.next_auto_id = old_next_auto_id;
                     }
@@ -9871,15 +10079,16 @@ impl NativeSqlEngine {
             let t = g
                 .get_mut(table)
                 .ok_or_else(|| format!("Table '{}' does not exist", table))?;
-            if let Err(err) = Self::enforce_constraints_on_insert(t, &mut rows) {
+            let mut owned = rows.to_vec();
+            if let Err(err) = Self::enforce_constraints_on_insert(t, &mut owned) {
                 t.next_auto_id = old_next_auto_id;
                 return Err(err);
             }
-            if let Err(err) = Self::validate_insert_vector_dimensions(t, &rows) {
+            if let Err(err) = Self::validate_insert_vector_dimensions(t, &owned) {
                 t.next_auto_id = old_next_auto_id;
                 return Err(err);
             }
-            let id = rows[0].0;
+            let (id, row) = owned.pop().unwrap();
             if t.rows.contains_key(&id) {
                 t.next_auto_id = old_next_auto_id;
                 return Err(format!(
@@ -9887,10 +10096,7 @@ impl NativeSqlEngine {
                     id
                 ));
             }
-            if self.transaction_active() {
-                self.record_transaction_insert_undo(table, id)?;
-            }
-            let (_, row) = rows.pop().unwrap();
+            self.record_transaction_insert_undo(table, id)?;
             t.rows.insert(id, row.clone());
             for tree in &table_indexes {
                 for col in &tree.columns {
@@ -9904,10 +10110,88 @@ impl NativeSqlEngine {
         }
         self.index_mgr
             .record_writes(table, columns.iter().map(|c| c.as_str()));
-        if !self.transaction_active() {
-            self.buf_pool.invalidate(table);
-        }
         Ok(Self::empty_ok("INSERT 0 1"))
+    }
+
+    fn execute_prepared_vector_knn(
+        &self,
+        table: &str,
+        column: &str,
+        metric: DistanceMetric,
+        query: &PreparedValue,
+        limit: usize,
+        projection: &[String],
+        params: &[String],
+    ) -> Result<QueryResult, String> {
+        let query_cell = Self::resolve_prepared_value(query, params)?;
+        let query_vec = Self::parse_vector_cell(&query_cell)
+            .ok_or_else(|| "prepared vector KNN: invalid query vector".to_string())?;
+        if query_vec.is_empty() {
+            return Err("prepared vector KNN: empty query vector".to_string());
+        }
+        let dim_hint = self
+            .vector_hnsw_catalog
+            .find(table, column, metric)
+            .map(|entry| entry.meta.dim)
+            .filter(|dim| *dim > 0)
+            .unwrap_or_else(|| {
+                self.tables
+                    .with_read_opt(table, |t| Self::vector_column_dim(t, column))
+                    .unwrap_or(0)
+            });
+        if dim_hint != 0 && dim_hint != query_vec.len() {
+            return Err(format!(
+                "vector dimension mismatch: column {} has dim {}, query has dim {}",
+                column,
+                dim_hint,
+                query_vec.len()
+            ));
+        }
+        let mut hits: Option<Vec<(i64, f32)>> = None;
+        if let Some(entry) = self.vector_hnsw_catalog.find(table, column, metric) {
+            if entry.len() > 0 {
+                hits = Some(entry.search(&query_vec, limit));
+            }
+        }
+        if hits.is_none() {
+            let dim = if dim_hint > 0 {
+                dim_hint
+            } else {
+                query_vec.len()
+            };
+            if let Ok(entry) = self.ensure_vector_hnsw_index(table, column, metric, dim) {
+                if entry.len() > 0 {
+                    hits = Some(entry.search(&query_vec, limit));
+                }
+            }
+        }
+        let Some(hits) = hits else {
+            return Ok(QueryResult::select_ids(Arc::new(Vec::new())));
+        };
+        if projection.len() == 1 && projection[0].eq_ignore_ascii_case("id") {
+            let ids: Vec<i64> = hits.into_iter().take(limit).map(|(id, _)| id).collect();
+            return Ok(QueryResult::select_ids(Arc::new(ids)));
+        }
+        let shared = self.table_read_guard(table)?;
+        let t = shared.read();
+        let columns = Self::prepared_columns(&t, projection);
+        let rows_out: Vec<Vec<Option<Vec<u8>>>> = hits
+            .into_iter()
+            .take(limit)
+            .map(|(id, _)| {
+                t.rows
+                    .get(&id)
+                    .map(|row| Self::materialize_prepared_row(id, row, projection))
+                    .unwrap_or_default()
+            })
+            .collect();
+        let row_count = rows_out.len();
+        Ok(QueryResult {
+            columns,
+            rows: rows_out,
+            command_tag: format!("SELECT {}", row_count),
+        ..Default::default()
+        })
     }
 
     fn execute_prepared_select_pk(
@@ -9918,16 +10202,24 @@ impl NativeSqlEngine {
         params: &[String],
     ) -> Result<QueryResult, String> {
         let row_id = Self::resolve_prepared_i64(key, params)?;
-        let g = self.tables.to_native_map();
-        let t = g
-            .get(table)
-            .ok_or_else(|| format!("table \"{}\" does not exist", table))?;
-        let columns = Self::prepared_columns(t, projection);
-        let rows = t
-            .rows
-            .get(&row_id)
-            .map(|row| vec![Self::materialize_prepared_row(row_id, row, projection)])
-            .unwrap_or_default();
+        let shared = self.table_read_guard(table)?;
+        let t = shared.read();
+        let columns = Self::prepared_columns(&t, projection);
+        let rows = if self.heap_reads_preferred() {
+            t.rows
+                .get(&row_id)
+                .map(|row| vec![Self::materialize_prepared_row(row_id, row, projection)])
+                .unwrap_or_default()
+        } else {
+            self.htap_visible_row(table, row_id)
+                .map(|r| vec![Self::materialize_prepared_row(row_id, &r, projection)])
+                .or_else(|| {
+                    t.rows
+                        .get(&row_id)
+                        .map(|row| vec![Self::materialize_prepared_row(row_id, row, projection)])
+                })
+                .unwrap_or_default()
+        };
         Ok(QueryResult {
             command_tag: format!("SELECT {}", rows.len()),
             columns,
@@ -10003,10 +10295,14 @@ impl NativeSqlEngine {
         params: &[String],
     ) -> Result<QueryResult, String> {
         let row_id = Self::resolve_prepared_i64(key, params)?;
-        let mut resolved: Vec<(String, Cell)> = assignments
+        let resolved: Vec<(String, Cell)> = assignments
             .iter()
             .map(|(col, value)| Ok((col.clone(), Self::resolve_prepared_value(value, params)?)))
             .collect::<Result<_, String>>()?;
+        if !self.transaction_active() && !self.table_needs_fk_mutation_checks(table, false) {
+            return self.autocommit_update_by_pk(table, row_id, resolved, "");
+        }
+        let mut resolved = resolved;
         let mut count = 0usize;
         {
             let mut g = self.tables.write();
@@ -10054,6 +10350,9 @@ impl NativeSqlEngine {
         params: &[String],
     ) -> Result<QueryResult, String> {
         let row_id = Self::resolve_prepared_i64(key, params)?;
+        if !self.transaction_active() && !self.table_needs_fk_mutation_checks(table, true) {
+            return self.autocommit_delete_by_pk(table, row_id);
+        }
         let mut deleted = 0usize;
         let mut fk_affected = Vec::new();
         {
@@ -10481,12 +10780,12 @@ impl NativeSqlEngine {
                 if let Some(fast) = self.try_transaction_delete_fast(s) {
                     fast
                 } else if autocommit_wal_mutation {
-                    self.htap_autocommit_mutation(s, |e| e.handle_delete(s))
+                    self.durable_autocommit_mutation(s, |e| e.handle_delete(s))
                 } else {
                     self.handle_delete(s)
                 }
             } else if autocommit_wal_mutation {
-                self.htap_autocommit_mutation(s, |e| e.handle_delete(s))
+                self.durable_autocommit_mutation(s, |e| e.handle_delete(s))
             } else {
                 self.handle_delete(s)
             };
@@ -10514,12 +10813,12 @@ impl NativeSqlEngine {
                 if let Some(fast) = self.try_transaction_insert_fast(s) {
                     fast
                 } else if autocommit_wal_mutation {
-                    self.htap_autocommit_mutation(s, |e| e.handle_insert(s))
+                    self.durable_autocommit_mutation(s, |e| e.handle_insert(s))
                 } else {
                     self.handle_insert(s)
                 }
             } else if autocommit_wal_mutation {
-                self.htap_autocommit_mutation(s, |e| e.handle_insert(s))
+                self.durable_autocommit_mutation(s, |e| e.handle_insert(s))
             } else {
                 self.handle_insert(s)
             };
@@ -10547,12 +10846,12 @@ impl NativeSqlEngine {
                 if let Some(fast) = self.try_transaction_update_fast(s) {
                     fast
                 } else if autocommit_wal_mutation {
-                    self.htap_autocommit_mutation(s, |e| e.handle_update(s))
+                    self.durable_autocommit_mutation(s, |e| e.handle_update(s))
                 } else {
                     self.handle_update(s)
                 }
             } else if autocommit_wal_mutation {
-                self.htap_autocommit_mutation(s, |e| e.handle_update(s))
+                self.durable_autocommit_mutation(s, |e| e.handle_update(s))
             } else {
                 self.handle_update(s)
             };
@@ -10938,10 +11237,28 @@ impl NativeSqlEngine {
             .collect()
     }
 
+    fn looks_like_vector_literal(t: &str) -> bool {
+        let s = t.trim();
+        if !(s.starts_with('[') && s.ends_with(']')) {
+            return false;
+        }
+        let inner = s[1..s.len().saturating_sub(1)].trim();
+        if inner.is_empty() {
+            return true;
+        }
+        inner
+            .split(',')
+            .next()
+            .map(|part| part.trim().parse::<f32>().is_ok())
+            .unwrap_or(false)
+    }
+
     fn parse_value(tok: &str) -> Cell {
         let t = tok.trim();
         let t_lower = t.to_ascii_lowercase();
-        if t_lower.contains("::vector") || (t.starts_with('[') && t.ends_with(']')) {
+        if t_lower.contains("::vector")
+            || (Self::looks_like_vector_literal(t))
+        {
             if let Some(vector) = Self::parse_vector_expr(t) {
                 return Self::vector_cell(vector);
             }
@@ -11062,18 +11379,22 @@ impl NativeSqlEngine {
     fn vector_cell(data: Vec<f32>) -> Cell {
         let dim = data.len();
         let norm = data.iter().map(|x| x * x).sum::<f32>().sqrt();
+        let text = vector_literal_text(&data);
         Cell::Vector {
             dim,
             data,
             norm,
-            text: String::new(),
+            text,
         }
     }
 
     fn cell_vector_dim(cell: &Cell) -> Option<usize> {
         match cell {
             Cell::Vector { dim, data, .. } if *dim == data.len() => Some(*dim),
-            Cell::Text(_) | Cell::Json(_) | Cell::Array(_) => {
+            Cell::Text(s) | Cell::Json(s) if Self::looks_like_vector_literal(s) => {
+                Self::parse_vector_cell(cell).map(|v| v.len())
+            }
+            Cell::Array(arr) => {
                 Self::parse_vector_cell(cell).map(|v| v.len())
             }
             _ => None,
@@ -11124,39 +11445,37 @@ impl NativeSqlEngine {
         table: &NativeTable,
         rows: &[(i64, NativeRow)],
     ) -> Result<(), String> {
-        let mut incoming_dims: HashMap<String, usize> = HashMap::new();
-        for (_id, row) in rows {
-            for (col, cell) in &row.cols {
+        for (idx, col_name) in table.columns.iter().enumerate() {
+            let Some(ColType::Vector(expected)) = table.column_types.get(idx) else {
+                continue;
+            };
+            for (_id, row) in rows {
+                let Some(cell) = row.cols.get(col_name) else {
+                    continue;
+                };
                 if let Some(raw) = Self::invalid_vector_literal(cell) {
                     return Err(format!(
                         "invalid vector literal for column {}: {}",
-                        col, raw
+                        col_name, raw
                     ));
                 }
-                if let Some(dim) = Self::cell_vector_dim(cell) {
-                    match incoming_dims.get(col) {
-                        Some(want) if *want != dim => {
+                match cell {
+                    Cell::Vector { dim, data, .. }
+                        if *dim == *expected && data.len() == *expected =>
+                    {
+                        continue;
+                    }
+                    other => {
+                        let got = Self::cell_vector_dim(other).ok_or_else(|| {
+                            format!("invalid vector literal for column {}", col_name)
+                        })?;
+                        if got != *expected {
                             return Err(format!(
                                 "vector dimension mismatch for column {}: expected {}, got {}",
-                                col, want, dim
+                                col_name, expected, got
                             ));
                         }
-                        Some(_) => {}
-                        None => {
-                            incoming_dims.insert(col.clone(), dim);
-                        }
                     }
-                }
-            }
-        }
-
-        for (col, dim) in incoming_dims {
-            if let Some(want) = Self::expected_vector_dim(table, &col) {
-                if want != dim {
-                    return Err(format!(
-                        "vector dimension mismatch for column {}: expected {}, got {}",
-                        col, want, dim
-                    ));
                 }
             }
         }
@@ -12656,7 +12975,7 @@ impl NativeSqlEngine {
         })??;
 
         self.buf_pool.invalidate(table);
-        if self.data_dir.is_some() {
+        if self.data_dir.is_some() && !self.autocommit_wal_owned_by_parent() {
             self.wal_append(wal_sql)?;
             self.after_successful_autocommit_wal_mutation()?;
         }
@@ -13783,6 +14102,56 @@ impl NativeSqlEngine {
         Some(count)
     }
 
+    fn columnar_filter_row_ids_from_predicate(
+        &self,
+        table: &str,
+        t: &NativeTable,
+        pred: &str,
+        limit: Option<usize>,
+    ) -> Option<Vec<i64>> {
+        let terms = Self::parse_fast_count_terms(pred)?;
+        if terms.is_empty() {
+            return None;
+        }
+        let cc = self.get_or_build_cols(table, t);
+        let mut hit_indices: Option<Vec<usize>> = None;
+        for term in terms {
+            let (col, value) = match term {
+                FastCountTerm::Eq(col, cell) => (col, cell),
+                _ => return None,
+            };
+            let term_hits: Vec<usize> = if let Some(iv) = cc.int_cols.get(col.as_str()) {
+                if let Cell::Int(target) = value {
+                    (0..cc.ids.len())
+                        .filter(|&i| iv[i] == target)
+                        .collect()
+                } else {
+                    return None;
+                }
+            } else if let Some(tv) = cc.text_cols.get(col.as_str()) {
+                let target = value.as_text();
+                (0..cc.ids.len())
+                    .filter(|&i| tv[i] == target)
+                    .collect()
+            } else {
+                return None;
+            };
+            hit_indices = Some(match hit_indices {
+                None => term_hits,
+                Some(prev) => {
+                    let set: HashSet<usize> = term_hits.into_iter().collect();
+                    prev.into_iter().filter(|i| set.contains(i)).collect()
+                }
+            });
+        }
+        let indices = hit_indices?;
+        let mut row_ids: Vec<i64> = indices.iter().map(|&i| cc.ids[i]).collect();
+        if let Some(lim) = limit {
+            row_ids.truncate(lim);
+        }
+        Some(row_ids)
+    }
+
     pub fn validate_secondary_indexes(&self) -> Result<(), String> {
         let tables = self.tables.to_native_map();
         let indexes = self.index_mgr.indexes.read();
@@ -14561,10 +14930,9 @@ impl NativeSqlEngine {
             self.stage_secondary_indexes_for_inserts(table, &index_rows);
         }
 
-        // When wrapped by htap_autocommit_mutation, parent already WAL-appends + syncs.
-        // Doing it here double-counts toward CHECKPOINT_INTERVAL and stalls OLTP.
-        let wal_owned_by_htap = self.htap_tx_active();
-        if !wal_owned_by_htap {
+        // When wrapped by durable/HTAP autocommit parent, caller owns WAL append + sync.
+        let wal_owned_by_parent = self.autocommit_wal_owned_by_parent();
+        if !wal_owned_by_parent {
             self.wal_append(wal_sql)?;
             self.index_mgr.record_writes(table, cols.iter().map(|c| c.as_str()));
             self.mark_table_data_dirty(table, count as u64);
@@ -18758,10 +19126,8 @@ impl NativeSqlEngine {
             // Convert SQL LIKE pattern to simple matching.
             let select_cols = Self::parse_select_columns(s);
             let id_only = select_cols.len() == 1 && select_cols[0] == "id";
-            let g = self.tables.to_native_map();
-            let t = g
-                .get(table)
-                .ok_or(format!("table \"{}\" does not exist", table))?;
+            let shared = self.table_read_guard(table)?;
+            let t = shared.read();
             let out_cols: Vec<String> =
                 if select_cols.is_empty() || (select_cols.len() == 1 && select_cols[0] == "*") {
                     t.columns.clone()
@@ -18895,12 +19261,18 @@ impl NativeSqlEngine {
                             .collect();
                         let mut rows_out: Vec<Vec<Option<Vec<u8>>>> = Vec::new();
                         if limit != Some(0) {
-                            if let Some(row) = self
-                                .htap_visible_row(table, *id_val)
-                                .map(|r| r.as_ref().clone())
-                                .or_else(|| t.rows.get(id_val).cloned())
-                                .or_else(|| self.row_from_columnar_cache(table, &t, *id_val))
-                            {
+                            let row = if self.heap_reads_preferred() {
+                                t.rows
+                                    .get(id_val)
+                                    .cloned()
+                                    .or_else(|| self.row_from_columnar_cache(table, &t, *id_val))
+                            } else {
+                                self.htap_visible_row(table, *id_val)
+                                    .map(|r| r.as_ref().clone())
+                                    .or_else(|| t.rows.get(id_val).cloned())
+                                    .or_else(|| self.row_from_columnar_cache(table, &t, *id_val))
+                            };
+                            if let Some(row) = row {
                                 rows_out.push(Self::materialize_projected_row(
                                     *id_val,
                                     &row,
@@ -18990,6 +19362,37 @@ impl NativeSqlEngine {
         let select_cols = Self::parse_select_columns(s);
         let shared = self.table_read_guard(table)?;
         let t = shared.read();
+        if let Some(row_ids) =
+            self.columnar_filter_row_ids_from_predicate(table, &t, pred_part, limit)
+        {
+            let out_cols: Vec<String> =
+                if select_cols.is_empty() || (select_cols.len() == 1 && select_cols[0] == "*") {
+                    t.columns.clone()
+                } else {
+                    select_cols
+                };
+            let columns: Vec<(String, i32, i16)> = out_cols
+                .iter()
+                .map(|c| {
+                    let o = t.col_oid(c);
+                    let len = match o {
+                        oid::INT8 => 8i16,
+                        oid::FLOAT8 => 8,
+                        _ => -1,
+                    };
+                    (c.clone(), o, len)
+                })
+                .collect();
+            let rows_out =
+                self.materialize_indexed_projection_rows_visible(table, &t, &row_ids, &out_cols);
+            let row_count = rows_out.len();
+            return Ok(QueryResult {
+                columns,
+                rows: rows_out,
+                command_tag: format!("SELECT {}", row_count),
+            ..Default::default()
+            });
+        }
         let out_cols: Vec<String> =
             if select_cols.is_empty() || (select_cols.len() == 1 && select_cols[0] == "*") {
                 t.columns.clone()
@@ -19746,9 +20149,28 @@ impl NativeSqlEngine {
             return None;
         }
         let inner = &s[1..s.len() - 1];
-        let mut out = Vec::new();
-        for part in inner.split(',') {
-            let x = part.trim().parse::<f32>().ok()?;
+        if inner.is_empty() {
+            return Some(Vec::new());
+        }
+        let est = inner.bytes().filter(|b| *b == b',').count() + 1;
+        let mut out = Vec::with_capacity(est);
+        let mut start = 0usize;
+        for (i, b) in inner.bytes().enumerate() {
+            if b == b',' {
+                let part = inner[start..i].trim();
+                if !part.is_empty() {
+                    let x = part.parse::<f32>().ok()?;
+                    if !x.is_finite() {
+                        return None;
+                    }
+                    out.push(x);
+                }
+                start = i + 1;
+            }
+        }
+        let tail = inner[start..].trim();
+        if !tail.is_empty() {
+            let x = tail.parse::<f32>().ok()?;
             if !x.is_finite() {
                 return None;
             }
@@ -19802,7 +20224,7 @@ impl NativeSqlEngine {
                     None
                 }
             }
-            Cell::Text(s) | Cell::Json(s) => {
+            Cell::Text(s) | Cell::Json(s) if Self::looks_like_vector_literal(s) => {
                 let vec = Self::parse_vector_expr(s)?;
                 let norm = vec.iter().map(|x| x * x).sum::<f32>().sqrt();
                 Some((vec, norm, false))

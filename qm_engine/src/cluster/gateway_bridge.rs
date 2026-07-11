@@ -18,7 +18,7 @@ use super::node_registry::ShardEndpointRegistry;
 use super::runtime::ClusterRuntime;
 use super::transport::{NodeClient, TransportServer};
 use crate::gateway::native_sql::NativeSqlEngine;
-use crate::gateway::{AuthQueryHandler, QueryHandler, QueryResult};
+use crate::gateway::{AuthQueryHandler, PrepareHandler, PreparedExecHandler, QueryHandler, QueryResult};
 
 static FORWARD_TXN_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -153,7 +153,12 @@ pub fn spawn_transport_server(
 pub fn routed_query_handlers(
     attach: &ClusterGatewayAttach,
     engine: Arc<NativeSqlEngine>,
-) -> (QueryHandler, AuthQueryHandler) {
+) -> (
+    QueryHandler,
+    AuthQueryHandler,
+    PrepareHandler,
+    PreparedExecHandler,
+) {
     use crate::gateway::session_pool::global_session_pool;
 
     let rt = attach.runtime.clone();
@@ -178,7 +183,7 @@ pub fn routed_query_handlers(
     });
 
     let rt2 = attach.runtime.clone();
-    let eng2 = engine;
+    let eng2 = engine.clone();
     let cfg2 = attach.config.clone();
     let authed: AuthQueryHandler = Arc::new(move |sql: String, user: String| {
         let conn_id = crate::cluster::connection_id();
@@ -197,7 +202,29 @@ pub fn routed_query_handlers(
         )
     });
 
-    (handler, authed)
+    let eng3 = engine.clone();
+    let prepare: PrepareHandler = Arc::new(move |sql: String| {
+        let conn_id = crate::cluster::connection_id();
+        let session = if conn_id != 0 {
+            global_session_pool().session_for_connection(conn_id, &eng3)
+        } else {
+            eng3.new_session()
+        };
+        session.prepare(&sql)
+    });
+
+    let eng4 = engine;
+    let prepared_exec: PreparedExecHandler = Arc::new(move |plan_id, params| {
+        let conn_id = crate::cluster::connection_id();
+        let session = if conn_id != 0 {
+            global_session_pool().session_for_connection(conn_id, &eng4)
+        } else {
+            eng4.new_session()
+        };
+        session.execute_prepared(plan_id, params)
+    });
+
+    (handler, authed, prepare, prepared_exec)
 }
 
 fn spawn_standby_heal_loop(

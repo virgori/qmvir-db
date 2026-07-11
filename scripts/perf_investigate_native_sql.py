@@ -450,8 +450,11 @@ def run_layer_decomposition(qm_engine: Any, iterations: int) -> list[dict[str, A
 
     unique_engine = make_engine(qm_engine)
     execute(unique_engine, "CREATE TABLE layer_string_unique (id INTEGER PRIMARY KEY, category TEXT)")
-    for i in range(1, 2001):
-        execute(unique_engine, f"INSERT INTO layer_string_unique (id, category) VALUES ({i}, 'cat_unique_{i}')")
+    execute(
+        unique_engine,
+        "INSERT INTO layer_string_unique SELECT i, 'cat_unique_' || i "
+        "FROM generate_series(1, 2000) AS t(i)",
+    )
     execute(unique_engine, "CREATE INDEX idx_layer_string_unique_category ON layer_string_unique(category)")
     results.extend(
         [
@@ -500,8 +503,11 @@ def run_batch(qm_engine: Any, iterations: int, max_batch: int) -> list[dict[str,
         def batch_insert(size: int = size) -> None:
             engine = make_engine(qm_engine)
             execute(engine, "CREATE TABLE b (id INTEGER PRIMARY KEY, v INTEGER, name TEXT)")
-            for i in range(1, size + 1):
-                execute(engine, f"INSERT INTO b (id, v, name) VALUES ({i}, {i % 17}, 'n{i}')")
+            execute(
+                engine,
+                f"INSERT INTO b SELECT i, i % 17, 'n' || i "
+                f"FROM generate_series(1, {size}) AS t(i)",
+            )
 
         results.append(bench_latency(f"batch.insert_{size}", reps, batch_insert, warmup=1, category="batch"))
 

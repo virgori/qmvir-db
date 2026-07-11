@@ -601,11 +601,11 @@ def run_qm(
     unique_sync = QmSyncController(qm_mode, sync_policy, sync_every_n, sync_interval_ms, engine_native_sync)
     unique.execute("CREATE TABLE cmp_unique (id INTEGER PRIMARY KEY, category TEXT)")
     unique_sync.sync_now(unique)
-    for i in range(1, 2001):
-        unique.execute(f"INSERT INTO cmp_unique (id, category) VALUES ({i}, 'cat_unique_{i}')")
-        if i % 100 == 0:
-            unique_sync.after_autocommit_mutation(unique)
-    unique_sync.sync_now(unique)
+    unique.execute(
+        "INSERT INTO cmp_unique SELECT i, 'cat_unique_' || i "
+        "FROM generate_series(1, 2000) AS t(i)"
+    )
+    unique_sync.after_autocommit_mutation(unique)
     unique.execute("CREATE INDEX idx_cmp_unique_category ON cmp_unique(category)")
     unique_sync.after_autocommit_mutation(unique)
     results.append(qm_bench("indexed_string_equality_unique", iterations, lambda: unique.execute("SELECT id FROM cmp_unique WHERE category = 'cat_unique_777'"), unique, unique_dir))

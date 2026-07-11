@@ -32,15 +32,12 @@ def seed_qm(rows: int) -> Any:
     qm.execute(
         "CREATE TABLE olap_bench (id INTEGER PRIMARY KEY, grp INTEGER, val DOUBLE, tag TEXT)"
     )
-    batch = 5000
     t0 = time.perf_counter()
-    for start in range(0, rows, batch):
-        end = min(rows, start + batch)
-        values = ",".join(
-            f"({i}, {i % 100}, {(i % 17) / 17.0}, 'tag_{i % 20}')"
-            for i in range(start, end)
-        )
-        qm.execute(f"INSERT INTO olap_bench (id, grp, val, tag) VALUES {values}")
+    qm.execute(
+        f"INSERT INTO olap_bench SELECT "
+        f"i, i % 100, (i % 17) / 17.0, 'tag_' || (i % 20) "
+        f"FROM generate_series(0, {rows - 1}) AS t(i)"
+    )
     load_s = time.perf_counter() - t0
     return qm, load_s
 

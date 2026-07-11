@@ -82,6 +82,9 @@ impl TableMvccStore {
     ) -> Option<Arc<NativeRow>> {
         let shared = self.tables.get(table)?;
         let mvcc = shared.read();
+        if !mvcc.heads.contains_key(&row_id) {
+            return None;
+        }
         let snapshot = self.statement_snapshot(tx_mgr, session_id);
         let registry = self.registry_map();
         let version = visibility::visible_version_for_row(

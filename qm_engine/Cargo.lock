@@ -1943,7 +1943,7 @@ dependencies = [
 
 [[package]]
 name = "qm_engine"
-version = "6.2.7"
+version = "6.2.8"
 dependencies = [
  "aes-gcm",
  "ahash 0.8.12",
