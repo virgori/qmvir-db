@@ -101,14 +101,14 @@ Isolation battery (with `--isolation`):
 - Commit atomicity + no leaked transactions
 - Autocommit uses real tx_mgr
 
-## Mixed workload benchmark
+## HTAP certification
 
 ```bash
 cargo build --release --bin qm --no-default-features
-python3 scripts/htap_mixed_benchmark.py --engine-bin ./qm_engine/target/release/qm --json
+./qm_engine/target/release/qm --data-dir ./data htap certify --isolation
 ```
 
-Runs concurrent OLTP `INSERT` and OLAP `SELECT SUM ... BETWEEN` workers.
+Runs functional HTAP gates plus the MVCC isolation battery.
 
 ## Cluster analytics routing
 

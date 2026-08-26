@@ -19,7 +19,7 @@
 
 QMvir is a **hybrid database engine** (Rust) combining transactional SQL, analytics-style execution, full-text search, and vector similarity in one process. It exposes a **PostgreSQL wire-protocol** gateway for standard clients.
 
-**v6.2.8** fixes node-pg extended-query reads (Bind param substitution, RowDescription) and speeds OLTP prepared DML via per-table autocommit paths and prepared-plan caching. **v6.2.7** fixes UTF-8 panic in UPDATE keyword scan (accents/CJK). **v6.2.6** fixed WHERE-in-literal hang and soft checkpoint. **v6.2.5** fixed HTAP write-lock deadlock. **v6.2.4** deferred checkpoint / group-commit defaults.
+**v6.2.8** fixes extended-query reads (Bind param substitution, RowDescription) and speeds OLTP prepared DML via per-table autocommit paths and prepared-plan caching. **v6.2.7** fixes UTF-8 panic in UPDATE keyword scan (accents/CJK). **v6.2.6** fixed WHERE-in-literal hang and soft checkpoint. **v6.2.5** fixed HTAP write-lock deadlock. **v6.2.4** deferred checkpoint / group-commit defaults.
 
 **v6.2.0** added optional **Production Multi-DC Enterprise HA**: sync WAL replication, automatic failover, meta Raft, 2PC, STONITH, witness, and `qm cluster certify` certification tiers.
 
@@ -39,9 +39,9 @@ QMvir is a **hybrid database engine** (Rust) combining transactional SQL, analyt
 
 ### Installation
 
-#### Option 1: NPM (Recommended)
+#### Option 1: Download Binary
 ```bash
-npm install -g qmvir@6.2.8
+curl -fsSL https://raw.githubusercontent.com/virgori/qmvir-releases/main/install.sh | bash
 qm --version
 ```
 
@@ -49,11 +49,6 @@ qm --version
 ```bash
 cargo build --manifest-path qm_engine/Cargo.toml --release --no-default-features
 ./qm_engine/target/release/qm --data-dir ./data start --admin-password your-secure-password
-```
-
-#### Option 3: Docker
-```bash
-docker run -p 5433:5433 virgori/qmvir:latest
 ```
 
 ### Basic Usage
@@ -110,10 +105,9 @@ Benchmarks must be interpreted by mode. QMvir has fast local/in-memory scalar re
 | **Vector Search (1M)** | 12ms | N/A | N/A | **Native** |
 | **Hybrid Search** | 18ms | N/A | N/A | **Native** |
 
-*Run your own benchmarks:*
+*Run Rust benchmarks:*
 ```bash
-bash benchmarks/run_benchmark_suite.sh
-python3 benchmarks/ci_benchmark_median.py --runs 5
+cargo bench --manifest-path qm_engine/Cargo.toml
 ```
 
 ---
@@ -166,13 +160,12 @@ QMvir uses a **single-engine hybrid architecture** that eliminates data movement
 
 **Index:** [docs/README.md](docs/README.md) · **Tiếng Việt HA:** [docs/ENTERPRISE_HA_GUIDE_VI.md](docs/ENTERPRISE_HA_GUIDE_VI.md)
 
-Historical reports and old audits: [docs/_archive/legacy/](docs/_archive/legacy/) (not maintained).
+Historical Python-era reports and old audits were removed from the active tree.
 
 ### Links
 
 - **Source:** private repo `virgori/qmvir-db` (collaborators only)
 - **Releases:** [virgori/qmvir-releases v6.2.8](https://github.com/virgori/qmvir-releases/releases/tag/v6.2.8)
-- **npm:** [qmvir@6.2.8](https://www.npmjs.com/package/qmvir/v/6.2.8)
 
 ---
 
@@ -208,13 +201,9 @@ QM/
 │   │   ├── executor/    # Query execution & SIMD
 │   │   └── engines/     # Specialized engines
 │   └── Cargo.toml
-├── repo/                # Distribution package
-│   ├── docs/           # Documentation
-│   ├── lib/            # Pre-compiled libraries
-│   └── README.md       # Repository guide
-├── npm/                # Node.js package
-├── benchmarks/         # Performance tests
-└── tests/             # Integration tests
+├── docs/               # Current operator and architecture docs
+├── scripts/            # Release, HA, and remote build helpers
+└── tests/              # Small PyO3 smoke suite
 ```
 
 ---

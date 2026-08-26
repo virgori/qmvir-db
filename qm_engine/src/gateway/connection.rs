@@ -442,7 +442,7 @@ impl Connection {
 
             Message::Query(sql) => {
                 self.state = ConnectionState::Query;
-                self.handle_simple_query(&sql).await?;
+                self.handle_simple_query(sql).await?;
                 if !matches!(self.state, ConnectionState::CopyIn) {
                     self.state = ConnectionState::Ready;
                     ProtocolCodec::encode_ready_for_query(
@@ -549,25 +549,29 @@ impl Connection {
                     let result = if let Some(c) = cached {
                         Ok(c)
                     } else if let (Some(pid), Some(ref exec)) = (plan_id, &self.prepared_exec_handler) {
-                        if read_only {
-                            Self::run_query_blocking(
-                                self.id,
-                                self.query_handler.clone(),
-                                self.authed_handler.clone(),
-                                self.user.to_string(),
-                                txn_sql.clone(),
-                                &self.cancel,
-                            )
-                            .await
+                        if self.cancel.is_cancelled() {
+                            Err("query canceled".to_string())
                         } else {
-                            Self::run_prepared_blocking(
-                                self.id,
-                                Arc::clone(exec),
-                                pid,
-                                param_strings,
-                                &self.cancel,
-                            )
-                            .await
+                            crate::cluster::set_connection_id(self.id);
+                            let result = exec(pid, param_strings);
+                            crate::cluster::clear_connection_id();
+                            match result {
+                                Ok(r) => Ok(r),
+                                // Compiled plan can go stale (e.g. dropped index) —
+                                // fall back to the full SQL path for correctness.
+                                Err(_) if read_only => {
+                                    Self::run_query_blocking(
+                                        self.id,
+                                        self.query_handler.clone(),
+                                        self.authed_handler.clone(),
+                                        self.user.to_string(),
+                                        txn_sql.clone(),
+                                        &self.cancel,
+                                    )
+                                    .await
+                                }
+                                Err(e) => Err(e),
+                            }
                         }
                     } else {
                         Self::run_query_blocking(
@@ -653,10 +657,19 @@ impl Connection {
                     }
                     b'P' => {
                         // Describe portal - row description; cache result to avoid re-execution in Execute.
-                        let query = self.portals.get(&name).map(|p| p.query.clone());
-                        if let Some(query) = query {
+                        let portal_info = self
+                            .portals
+                            .get(&name)
+                            .map(|p| (p.query.clone(), p.plan_id, p.param_strings.clone()));
+                        if let Some((query, plan_id, param_strings)) = portal_info {
                             if sql_is_read_only_query(&query) {
-                                if let Ok(result) = self.dispatch_query(&query) {
+                                // Prefer the compiled prepared plan; fall back to full SQL parse.
+                                let result = match (plan_id, &self.prepared_exec_handler) {
+                                    (Some(pid), Some(exec)) => exec(pid, param_strings)
+                                        .or_else(|_| self.dispatch_query(&query)),
+                                    _ => self.dispatch_query(&query),
+                                };
+                                if let Ok(result) = result {
                                     if !result.columns.is_empty() {
                                         ProtocolCodec::encode_row_description(
                                             &mut self.write_buf,
@@ -761,7 +774,7 @@ impl Connection {
                         copy.table,
                         hex::encode(&copy.buffer)
                     );
-                    self.handle_simple_query(&sql).await?;
+                    self.handle_simple_query(sql).await?;
                     ProtocolCodec::encode_ready_for_query(
                         &mut self.write_buf,
                         self.transaction_status,
@@ -837,15 +850,21 @@ impl Connection {
             self.transaction_status = TransactionStatus::Failed;
             return;
         }
-        let up = sql.trim().to_ascii_uppercase();
-        if up == "BEGIN" || up.starts_with("BEGIN ") {
-            self.transaction_status = TransactionStatus::InTransaction;
-        } else if up == "COMMIT"
-            || up.starts_with("COMMIT ")
-            || up == "ROLLBACK"
-            || up.starts_with("ROLLBACK ")
-        {
-            self.transaction_status = TransactionStatus::Idle;
+        // Only the statement head matters — never uppercase multi-KB payloads.
+        let head = sql.trim();
+        let bytes = head.as_bytes();
+        if bytes.len() >= 5 && bytes[..5].eq_ignore_ascii_case(b"BEGIN") {
+            if bytes.len() == 5 || bytes[5].is_ascii_whitespace() {
+                self.transaction_status = TransactionStatus::InTransaction;
+            }
+        } else if bytes.len() >= 6 && bytes[..6].eq_ignore_ascii_case(b"COMMIT") {
+            if bytes.len() == 6 || bytes[6].is_ascii_whitespace() {
+                self.transaction_status = TransactionStatus::Idle;
+            }
+        } else if bytes.len() >= 8 && bytes[..8].eq_ignore_ascii_case(b"ROLLBACK") {
+            if bytes.len() == 8 || bytes[8].is_ascii_whitespace() {
+                self.transaction_status = TransactionStatus::Idle;
+            }
         }
     }
 
@@ -869,9 +888,8 @@ impl Connection {
     }
 
     /// Handle simple query (Q message)
-    async fn handle_simple_query(&mut self, sql: &str) -> io::Result<()> {
+    async fn handle_simple_query(&mut self, sql: String) -> io::Result<()> {
         let sql_trimmed = sql.trim();
-
         if sql_trimmed.is_empty() {
             ProtocolCodec::encode_empty_query(&mut self.write_buf);
             return Ok(());
@@ -887,13 +905,29 @@ impl Connection {
             return Ok(());
         }
 
-        // Call the query handler off the async runtime (cluster forward uses blocking I/O).
+        // Reuse the decoded Query buffer when already trimmed (Batch INSERT path).
+        let sql_owned = if sql_trimmed.len() == sql.len() {
+            sql
+        } else {
+            sql_trimmed.to_string()
+        };
+        // Peek txn keywords before moving the buffer into the handler.
+        let txn_head = {
+            let b = sql_owned.as_bytes();
+            let n = b.len().min(16);
+            let mut tmp = [0u8; 16];
+            tmp[..n].copy_from_slice(&b[..n]);
+            tmp
+        };
+        let txn_head_len = sql_owned.len().min(16);
+
+        // Execute on this connection task (see run_query_blocking).
         match Self::run_query_blocking(
             self.id,
             self.query_handler.clone(),
             self.authed_handler.clone(),
             self.user.to_string(),
-            sql_trimmed.to_string(),
+            sql_owned,
             &self.cancel,
         )
         .await
@@ -915,18 +949,21 @@ impl Connection {
 
                 // Send command complete
                 ProtocolCodec::encode_command_complete(&mut self.write_buf, &result.command_tag);
-                self.update_txn_status(sql_trimmed, false);
+                let head = std::str::from_utf8(&txn_head[..txn_head_len]).unwrap_or("");
+                self.update_txn_status(head, false);
             }
             Err(e) => {
                 self.send_error("ERROR", "42000", &e).await?;
-                self.update_txn_status(sql_trimmed, true);
+                self.transaction_status = TransactionStatus::Failed;
             }
         }
 
         Ok(())
     }
 
-    /// Run a query on the blocking thread pool (safe for cluster TCP forward).
+    /// Run a query on the connection task. Each pgwire connection processes one
+    /// request at a time, so blocking here does not stall other connections.
+    /// `block_in_place` avoids the spawn_blocking pool queue (critical for 16W).
     async fn run_query_blocking(
         conn_id: u64,
         handler: QueryHandler,
@@ -939,7 +976,7 @@ impl Connection {
             return Err("query canceled".to_string());
         }
         let cancel_flag = cancel.flag();
-        tokio::task::spawn_blocking(move || {
+        tokio::task::block_in_place(|| {
             crate::cluster::set_connection_id(conn_id);
             if cancel_flag.load(Ordering::Acquire) {
                 crate::cluster::clear_connection_id();
@@ -953,8 +990,6 @@ impl Connection {
             crate::cluster::clear_connection_id();
             result
         })
-        .await
-        .map_err(|e| format!("query worker failed: {e}"))?
     }
 
     async fn run_prepared_blocking(
@@ -968,7 +1003,7 @@ impl Connection {
             return Err("query canceled".to_string());
         }
         let cancel_flag = cancel.flag();
-        tokio::task::spawn_blocking(move || {
+        tokio::task::block_in_place(|| {
             crate::cluster::set_connection_id(conn_id);
             if cancel_flag.load(Ordering::Acquire) {
                 crate::cluster::clear_connection_id();
@@ -978,8 +1013,6 @@ impl Connection {
             crate::cluster::clear_connection_id();
             result
         })
-        .await
-        .map_err(|e| format!("prepared query worker failed: {e}"))?
     }
 
     /// Synchronous dispatch (non-async callers only).

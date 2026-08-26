@@ -1,6 +1,6 @@
 //! `qm start` / `qm stop` / `qm status` — daemon lifecycle.
 //!
-//! Replaces the Python `qm_app.py` with a pure-Rust server that:
+//! Pure-Rust server that:
 //! - Starts a PostgreSQL wire protocol gateway (tokio)
 //! - Manages a PID file for single-instance enforcement
 //! - Supports foreground or daemonised operation

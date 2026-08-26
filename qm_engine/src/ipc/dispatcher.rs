@@ -348,7 +348,7 @@ impl NativeDispatcher {
 
 /// Python-exposed Native Hub Dispatcher.
 ///
-/// Replaces `qm_core.hub.dispatcher.HubDispatcher` with a Rust implementation.
+/// Rust dispatcher exposed to Python when the optional PyO3 feature is enabled.
 /// All dispatch methods release the GIL for maximum Python-side concurrency.
 #[cfg(feature = "python")]
 #[pyclass(name = "NativeDispatcher")]

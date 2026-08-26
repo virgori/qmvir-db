@@ -1,1 +1,0 @@
-"""QM Python SDK."""

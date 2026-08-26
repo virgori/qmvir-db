@@ -1,7 +1,7 @@
 /*
  * PL/QM — Lightweight procedural scripting language interpreter.
  *
- * Port of _py_legacy/qm_core/procedures/plqm.py
+ * Native Rust implementation.
  *
  * Supports:
  *   DECLARE var [TYPE] [= expr]

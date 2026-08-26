@@ -503,6 +503,42 @@ impl ProtocolCodec {
         columns: &[(String, i32, i16)],
         formats: &[i16],
     ) {
+        // Fast path: all-text output with no packed INT8 cells — write straight
+        // into `buf` without per-cell clones (hot for full scans of 10k+ rows).
+        let all_text_passthrough = row.iter().enumerate().all(|(i, cell)| {
+            Self::column_format_code(formats, i) == 0
+                && match cell {
+                    Some(bytes) => {
+                        columns.get(i).map(|c| c.1).unwrap_or(oid::TEXT) != oid::INT8
+                            || bytes.len() != 8
+                    }
+                    None => true,
+                }
+        });
+        if all_text_passthrough {
+            let body_len: usize = 2
+                + row
+                    .iter()
+                    .map(|v| match v {
+                        Some(data) => 4 + data.len(),
+                        None => 4,
+                    })
+                    .sum::<usize>();
+            buf.reserve(1 + 4 + body_len);
+            buf.put_u8(b'D');
+            buf.put_i32(body_len as i32 + 4);
+            buf.put_i16(row.len() as i16);
+            for val in row {
+                match val {
+                    Some(data) => {
+                        buf.put_i32(data.len() as i32);
+                        buf.put_slice(data);
+                    }
+                    None => buf.put_i32(-1),
+                }
+            }
+            return;
+        }
         let mut scratch = Vec::with_capacity(row.len());
         for (i, cell) in row.iter().enumerate() {
             let fmt = Self::column_format_code(formats, i);

@@ -34,8 +34,20 @@ fn ct_eq(a: &[u8], b: &[u8]) -> bool {
     diff == 0
 }
 
-/// Default PBKDF2 iteration count (NIST SP 800-132 / OWASP 2023 recommendation).
-const DEFAULT_ITERATIONS: u32 = 600_000;
+/// Default PBKDF2 iteration count. Matches PostgreSQL's default
+/// (`scram_iterations = 4096`, RFC 7677 minimum): clients pay this cost on
+/// every connection, and 600k iterations made each fresh node-pg connect
+/// ~150x more expensive than connecting to PostgreSQL.
+/// Override per deployment via QMVIR_SCRAM_ITERATIONS.
+const DEFAULT_ITERATIONS: u32 = 4096;
+
+fn default_iterations() -> u32 {
+    std::env::var("QMVIR_SCRAM_ITERATIONS")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .filter(|&v| v >= 4096)
+        .unwrap_or(DEFAULT_ITERATIONS)
+}
 
 /// Stored SCRAM credentials for a user.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -50,7 +62,7 @@ impl ScramSecret {
     /// Derive SCRAM credentials from a plaintext password.
     pub fn from_password(password: &str) -> Self {
         let salt: [u8; 16] = rand::random();
-        Self::from_password_with_salt(password, &salt, DEFAULT_ITERATIONS)
+        Self::from_password_with_salt(password, &salt, default_iterations())
     }
 
     pub fn from_password_with_salt(password: &str, salt: &[u8], iterations: u32) -> Self {

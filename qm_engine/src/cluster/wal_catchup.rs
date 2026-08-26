@@ -46,6 +46,10 @@ pub fn durable_entries_after(data_dir: &Path, after_lsn: u64) -> Vec<WalEntry> {
     let mut out = Vec::new();
     for (idx, line) in reader.lines().enumerate() {
         let lsn = DURABLE_LSN_BASE.saturating_add(idx as u64 + 1);
+        // Preallocated WAL tail is zero-filled; first NUL = logical EOF.
+        if matches!(&line, Ok(s) if s.as_bytes().first() == Some(&0)) {
+            break;
+        }
         if lsn <= after_lsn {
             continue;
         }

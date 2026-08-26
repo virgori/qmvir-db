@@ -23,21 +23,9 @@ keywords = [
 
 dependencies = []
 
-[project.scripts]
-qmvir = "qm_app:main"
-qm-server = "qm_app:main"
-qm-bench = "qm_core.bench:print_report"
-
 [project.optional-dependencies]
 dev = [
     "pytest>=8.0",
-    "pytest-asyncio>=0.23",
-    "numpy>=1.26",
-    "msgpack>=1.0",
-    "lark>=1.0",
-    "lz4>=4.0",
-    "zstandard>=0.22",
-    "pytest-benchmark>=4.0",
 ]
 
 [tool.maturin]
@@ -53,5 +41,10 @@ line-length = 100
 select = ["E", "F", "W", "I", "N", "UP", "B", "SIM"]
 
 [tool.pytest.ini_options]
-testpaths = ["tests"]
+testpaths = [
+    "tests/test_rust_engine.py",
+    "tests/test_native_sql_python_bridge_identity_uuid_json.py",
+    "tests/test_python_rust_bridge_columnar.py",
+    "tests/test_python_rust_bridge_true_zero_copy.py",
+]
 asyncio_mode = "auto"

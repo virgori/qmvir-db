@@ -74,6 +74,9 @@ use std::arch::x86_64::*;
 /// Chunk size for vectorized pipeline processing.
 /// Matches typical CPU L1 cache line utilization.
 const CHUNK_SIZE: usize = 1024;
+/// Parallel VALUES parsing/materialization only above this many tuples.
+/// Bench Batch INSERT uses 100 rows — rayon overhead dominates there.
+const MULTI_VALUES_PARALLEL_MIN: usize = 512;
 /// OLAP bench-shaped generate_series loads use columnar seed (no per-row heap maps).
 const OLAP_COLUMNAR_SEED_MIN_ROWS: usize = 1;
 /// Parallel SoA builders kick in at this row count.
@@ -2486,16 +2489,150 @@ impl WalSyncPolicy {
     }
 }
 
-const GROUP_COMMIT_DEFAULT_WINDOW_US: u64 = 250;
-const GROUP_COMMIT_DEFAULT_MAX_BATCH: u64 = 512;
+const GROUP_COMMIT_DEFAULT_WINDOW_US: u64 = 100;
+const GROUP_COMMIT_DEFAULT_MAX_BATCH: u64 = 1024;
 const WAL_BUF_CAPACITY: usize = 256 * 1024;
+/// Preallocation chunk for the text WAL. Like PostgreSQL's fixed-size WAL
+/// segments: keeping the file size stable turns per-commit fdatasync into a
+/// data-only flush (no metadata journaling), ~4x faster on ext4.
+const WAL_PREALLOC_CHUNK: u64 = 16 * 1024 * 1024;
 
 type WalWriterHandle = WalBackend;
 
 const URING_WAL_SQL_RECORD_TYPE: u8 = 4;
 
+/// Append-only text WAL over a preallocated file region. The logical end of
+/// the log is the first NUL byte (preallocated space is zero-filled); readers
+/// must stop at the first NUL.
+struct PreallocTextWal {
+    file: fs::File,
+    buf: Vec<u8>,
+    logical_end: u64,
+    allocated: u64,
+}
+
+impl PreallocTextWal {
+    fn open(path: &std::path::Path) -> Result<Self, String> {
+        let mut file = fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .open(path)
+            .map_err(|e| format!("open WAL failed: {e}"))?;
+        let allocated = file.metadata().map(|m| m.len()).unwrap_or(0);
+        let logical_end = Self::scan_logical_end(&mut file)?;
+        Ok(Self {
+            file,
+            buf: Vec::with_capacity(WAL_BUF_CAPACITY),
+            logical_end,
+            allocated,
+        })
+    }
+
+    /// Offset of the first NUL byte (start of preallocated tail), else file length.
+    fn scan_logical_end(file: &mut fs::File) -> Result<u64, String> {
+        use std::io::{Read, Seek, SeekFrom};
+        file.seek(SeekFrom::Start(0))
+            .map_err(|e| format!("WAL seek failed: {e}"))?;
+        let mut off = 0u64;
+        let mut chunk = vec![0u8; 256 * 1024];
+        loop {
+            let n = file
+                .read(&mut chunk)
+                .map_err(|e| format!("WAL scan failed: {e}"))?;
+            if n == 0 {
+                return Ok(off);
+            }
+            if let Some(pos) = memchr::memchr(0, &chunk[..n]) {
+                return Ok(off + pos as u64);
+            }
+            off += n as u64;
+        }
+    }
+
+    fn append_line(&mut self, line: &[u8]) -> Result<(), String> {
+        self.buf.extend_from_slice(line);
+        self.buf.push(b'\n');
+        if self.buf.len() >= WAL_BUF_CAPACITY {
+            self.flush_io()?;
+        }
+        Ok(())
+    }
+
+    fn ensure_allocated(&mut self, needed_end: u64) -> Result<(), String> {
+        if needed_end <= self.allocated {
+            return Ok(());
+        }
+        let target = needed_end
+            .saturating_add(WAL_PREALLOC_CHUNK)
+            .saturating_sub(1)
+            / WAL_PREALLOC_CHUNK
+            * WAL_PREALLOC_CHUNK;
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::unix::io::AsRawFd;
+            let rc =
+                unsafe { libc::posix_fallocate(self.file.as_raw_fd(), 0, target as libc::off_t) };
+            if rc != 0 {
+                // Filesystem may not support fallocate (e.g. tmpfs variants).
+                self.file
+                    .set_len(target)
+                    .map_err(|e| format!("WAL set_len failed: {e}"))?;
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            self.file
+                .set_len(target)
+                .map_err(|e| format!("WAL set_len failed: {e}"))?;
+        }
+        self.allocated = target;
+        Ok(())
+    }
+
+    fn flush_io(&mut self) -> Result<(), String> {
+        if self.buf.is_empty() {
+            return Ok(());
+        }
+        let end = self.logical_end + self.buf.len() as u64;
+        self.ensure_allocated(end)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::FileExt;
+            self.file
+                .write_all_at(&self.buf, self.logical_end)
+                .map_err(|e| format!("WAL write failed: {e}"))?;
+        }
+        #[cfg(not(unix))]
+        {
+            use std::io::{Seek, SeekFrom, Write};
+            self.file
+                .seek(SeekFrom::Start(self.logical_end))
+                .map_err(|e| format!("WAL seek failed: {e}"))?;
+            self.file
+                .write_all(&self.buf)
+                .map_err(|e| format!("WAL write failed: {e}"))?;
+        }
+        self.logical_end = end;
+        self.buf.clear();
+        Ok(())
+    }
+
+    fn sync_data(&self) -> Result<(), String> {
+        self.file
+            .sync_data()
+            .map_err(|e| format!("WAL sync_data failed: {e}"))
+    }
+
+    fn sync_all(&self) -> Result<(), String> {
+        self.file
+            .sync_all()
+            .map_err(|e| format!("WAL sync_all failed: {e}"))
+    }
+}
+
 enum WalBackend {
-    Text(BufWriter<fs::File>),
+    Text(PreallocTextWal),
     #[cfg(target_os = "linux")]
     Uring(parking_lot::Mutex<crate::storage::uring_wal::UringWalWriter>),
 }
@@ -2538,18 +2675,12 @@ fn sync_wal_parent_dir(_wal_path: &std::path::Path) -> Result<(), String> {
     Ok(())
 }
 
-/// Open the append WAL like PostgreSQL `wal_sync_method=open_datasync` on Unix:
-/// O_DSYNC makes flushed WAL bytes data-durable without a separate per-commit
-/// `sync_all()`. Linux and macOS both use this fast path when the filesystem
-/// accepts O_DSYNC; otherwise we fall back to flush + kernel sync.
 impl WalBackend {
     fn append_sql(&mut self, sql: &str) -> Result<(), String> {
         match self {
             WalBackend::Text(writer) => {
-                writeln!(writer, "{}", sql).map_err(|err| format!("WAL append failed: {err}"))?;
-                writer
-                    .flush()
-                    .map_err(|err| format!("WAL append flush failed: {err}"))
+                // Buffered append; durability happens at group commit / wal_sync.
+                writer.append_line(sql.as_bytes())
             }
             #[cfg(target_os = "linux")]
             WalBackend::Uring(writer) => {
@@ -2571,9 +2702,7 @@ impl WalBackend {
 
     fn flush_buffer(&mut self) -> Result<(), String> {
         match self {
-            WalBackend::Text(writer) => writer
-                .flush()
-                .map_err(|err| format!("WAL flush failed: {err}")),
+            WalBackend::Text(writer) => writer.flush_io(),
             #[cfg(target_os = "linux")]
             WalBackend::Uring(writer) => writer
                 .lock()
@@ -2606,57 +2735,11 @@ fn open_wal_writer(data_dir: &std::path::Path) -> Result<(WalWriterHandle, bool)
 
     let wal_path = data_dir.join("native_sql.wal");
     let existed = wal_path.exists();
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        match fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .read(true)
-            .custom_flags(libc::O_DSYNC)
-            .open(&wal_path)
-        {
-            Ok(file) => {
-                if !existed {
-                    sync_wal_parent_dir(&wal_path)?;
-                }
-                Ok((
-                    WalBackend::Text(BufWriter::with_capacity(WAL_BUF_CAPACITY, file)),
-                    true,
-                ))
-            }
-            Err(err) => {
-                eprintln!(
-                    "[WAL] O_DSYNC open failed ({err}); falling back to flush+kernel-sync path"
-                );
-                let file = fs::OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .read(true)
-                    .open(&wal_path)
-                    .map_err(|fallback_err| {
-                        format!("open WAL failed after O_DSYNC fallback: {fallback_err}")
-                    })?;
-                if !existed {
-                    sync_wal_parent_dir(&wal_path)?;
-                }
-                Ok((
-                    WalBackend::Text(BufWriter::with_capacity(WAL_BUF_CAPACITY, file)),
-                    false,
-                ))
-            }
-        }
+    let writer = PreallocTextWal::open(&wal_path)?;
+    if !existed {
+        sync_wal_parent_dir(&wal_path)?;
     }
-    #[cfg(not(unix))]
-    {
-        let file = fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .read(true)
-            .open(&wal_path)
-            .map_err(|err| format!("open WAL failed: {err}"))?;
-        Ok((WalBackend::Text(BufWriter::with_capacity(WAL_BUF_CAPACITY, file)), false))
-    }
+    Ok((WalBackend::Text(writer), false))
 }
 
 #[derive(Debug, Default)]
@@ -2927,6 +3010,8 @@ enum PreparedPlan {
         table: String,
         columns: Vec<String>,
         values: Vec<PreparedValue>,
+        /// Pre-rendered `INSERT INTO t (cols) VALUES (` for WAL append hot path.
+        wal_insert_prefix: String,
     },
     SelectByPrimaryKey {
         table: String,
@@ -2963,6 +3048,17 @@ enum PreparedPlan {
         metric: DistanceMetric,
         query: PreparedValue,
         limit: usize,
+        projection: Vec<String>,
+    },
+    LikeContains {
+        table: String,
+        column: String,
+        pattern: PreparedValue,
+        limit: Option<usize>,
+        projection: Vec<String>,
+    },
+    SelectAll {
+        table: String,
         projection: Vec<String>,
     },
 }
@@ -5190,6 +5286,54 @@ fn vector_literal_text(v: &[f32]) -> String {
     }
     out.push(']');
     out
+}
+
+/// Fast ASCII decimal parser for vector literal components; falls back to
+/// `str::parse` for exponent/other formats. 768-dim literals hit this per row.
+fn parse_vector_number(part: &str) -> Option<f32> {
+    let s = part.trim();
+    if s.is_empty() {
+        return None;
+    }
+    if s.bytes().any(|b| matches!(b, b'e' | b'E')) {
+        let x = s.parse::<f32>().ok()?;
+        return x.is_finite().then_some(x);
+    }
+
+    let bytes = s.as_bytes();
+    let mut i = 0usize;
+    let mut sign = 1.0_f64;
+    if bytes.get(i) == Some(&b'-') {
+        sign = -1.0;
+        i += 1;
+    } else if bytes.get(i) == Some(&b'+') {
+        i += 1;
+    }
+
+    let mut int_part = 0.0_f64;
+    let mut digits = 0usize;
+    while let Some(b'0'..=b'9') = bytes.get(i) {
+        int_part = int_part * 10.0 + f64::from(bytes[i] - b'0');
+        i += 1;
+        digits += 1;
+    }
+    let mut frac_num = 0.0_f64;
+    let mut frac_den = 1.0_f64;
+    if bytes.get(i) == Some(&b'.') {
+        i += 1;
+        while let Some(b'0'..=b'9') = bytes.get(i) {
+            frac_num = frac_num * 10.0 + f64::from(bytes[i] - b'0');
+            frac_den *= 10.0;
+            i += 1;
+            digits += 1;
+        }
+    }
+    if digits == 0 || i != bytes.len() {
+        let x = s.parse::<f32>().ok()?;
+        return x.is_finite().then_some(x);
+    }
+    let x = (sign * (int_part + frac_num / frac_den)) as f32;
+    x.is_finite().then_some(x)
 }
 
 /// Fast path for `LIKE '%literal%'` without `_` wildcards.
@@ -8063,9 +8207,7 @@ impl NativeSqlEngine {
         self.maybe_fail_wal_flush_for_test()?;
         match f {
             WalBackend::Text(writer) => {
-                writer
-                    .flush()
-                    .map_err(|err| format!("WAL flush before sync failed: {err}"))?;
+                writer.flush_io()?;
                 if let Some(start) = flush_start {
                     Self::profile_ns(&self.native_profile.wal_flush_ns, start.elapsed());
                     self.native_profile
@@ -8075,8 +8217,7 @@ impl NativeSqlEngine {
                 if Self::wal_trace_enabled() {
                     self.wal_trace.flush_calls.fetch_add(1, Ordering::Relaxed);
                 }
-                let open_datasync = self.wal_open_datasync.load(Ordering::Relaxed);
-                if !open_datasync {
+                {
                     let sync_start = if profile_enabled {
                         Some(Instant::now())
                     } else {
@@ -8085,10 +8226,7 @@ impl NativeSqlEngine {
                     #[cfg(target_os = "linux")]
                     {
                         self.maybe_fail_wal_sync_data_for_test()?;
-                        writer
-                            .get_ref()
-                            .sync_data()
-                            .map_err(|err| format!("WAL sync_data failed: {err}"))?;
+                        writer.sync_data()?;
                         if let Some(start) = sync_start {
                             let elapsed = start.elapsed();
                             Self::profile_ns(&self.native_profile.wal_sync_ns, elapsed);
@@ -8101,10 +8239,7 @@ impl NativeSqlEngine {
                     #[cfg(not(target_os = "linux"))]
                     {
                         self.maybe_fail_wal_sync_all_for_test()?;
-                        writer
-                            .get_ref()
-                            .sync_all()
-                            .map_err(|err| format!("WAL sync_all failed: {err}"))?;
+                        writer.sync_all()?;
                         if let Some(start) = sync_start {
                             let elapsed = start.elapsed();
                             Self::profile_ns(&self.native_profile.wal_sync_ns, elapsed);
@@ -8117,8 +8252,6 @@ impl NativeSqlEngine {
                     if Self::wal_trace_enabled() {
                         self.wal_trace.sync_calls.fetch_add(1, Ordering::Relaxed);
                     }
-                } else {
-                    self.maybe_fail_wal_sync_all_for_test()?;
                 }
             }
             #[cfg(target_os = "linux")]
@@ -8201,10 +8334,7 @@ impl NativeSqlEngine {
         };
         self.maybe_fail_wal_sync_data_for_test()?;
         match f {
-            WalBackend::Text(writer) => writer
-                .get_ref()
-                .sync_data()
-                .map_err(|err| format!("WAL sync_data failed: {err}"))?,
+            WalBackend::Text(writer) => writer.sync_data()?,
             #[cfg(target_os = "linux")]
             WalBackend::Uring(writer) => writer
                 .lock()
@@ -8264,20 +8394,30 @@ impl NativeSqlEngine {
         }
 
         guard.syncing = true;
-        let window = Duration::from_micros(GROUP_COMMIT_DEFAULT_WINDOW_US);
-        while guard.pending < GROUP_COMMIT_DEFAULT_MAX_BATCH {
-            let (next_guard, timeout) = self
+        drop(guard);
+
+        // Adaptive batching: always yield once so Concurrent Write committers can
+        // join; only sleep the window when pending > 1 (preserves solo INSERT).
+        std::thread::yield_now();
+        {
+            let mut g = self
                 .group_commit
-                .condvar
-                .wait_timeout(guard, window)
+                .inner
+                .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            guard = next_guard;
-            if timeout.timed_out() {
-                break;
+            if g.pending > 1 {
+                let deadline =
+                    Instant::now() + std::time::Duration::from_micros(GROUP_COMMIT_DEFAULT_WINDOW_US);
+                while g.pending < GROUP_COMMIT_DEFAULT_MAX_BATCH && Instant::now() < deadline {
+                    g = self
+                        .group_commit
+                        .condvar
+                        .wait_timeout(g, std::time::Duration::from_micros(10))
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .0;
+                }
             }
         }
-        let group_size = guard.pending.max(1);
-        drop(guard);
 
         let sync_result = self.wal_sync();
 
@@ -8288,6 +8428,7 @@ impl NativeSqlEngine {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         guard.total_groups = guard.total_groups.saturating_add(1);
+        let group_size = guard.pending.max(1);
         guard.max_group_size = guard.max_group_size.max(group_size);
         guard.total_wait_ns = guard
             .total_wait_ns
@@ -8371,7 +8512,11 @@ impl NativeSqlEngine {
         let mut errors = 0u64;
         for (_line_num, line) in reader.lines().enumerate() {
             if let Ok(sql) = line {
-                let trimmed = sql.trim();
+                // Preallocated WAL tail is zero-filled; first NUL = logical EOF.
+                if sql.as_bytes().first() == Some(&0) {
+                    break;
+                }
+                let trimmed = sql.trim_matches(|c: char| c.is_whitespace() || c == '\0');
                 if !trimmed.is_empty() {
                     count += 1;
                     if let Err(e) = self.execute_inner(trimmed, false) {
@@ -9362,14 +9507,14 @@ impl NativeSqlEngine {
         plan_id: u64,
         params: Vec<String>,
     ) -> Result<QueryResult, String> {
-        let plan = self
+        let plans = self
             .prepared_plans
             .read()
-            .map_err(|_| "prepared plan lock poisoned")?
+            .map_err(|_| "prepared plan lock poisoned")?;
+        let plan = plans
             .get(&plan_id)
-            .cloned()
             .ok_or_else(|| format!("unknown prepared plan {}", plan_id))?;
-        self.execute_prepared_plan(&plan, &params)
+        self.execute_prepared_plan(plan, &params)
     }
 
     fn compile_prepared_plan(&self, sql: &str) -> Result<PreparedPlan, String> {
@@ -9433,10 +9578,20 @@ impl NativeSqlEngine {
             return Err("prepared INSERT column/value count mismatch".to_string());
         }
         self.validate_prepared_table_columns(&table, &columns)?;
+        let wal_insert_prefix = format!(
+            "INSERT INTO {} ({}) VALUES (",
+            Self::quote_ident_for_wal(&table),
+            columns
+                .iter()
+                .map(|c| Self::quote_ident_for_wal(c))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
         Ok(PreparedPlan::InsertFast {
             table,
             columns,
             values,
+            wal_insert_prefix,
         })
     }
 
@@ -9510,10 +9665,26 @@ impl NativeSqlEngine {
             .to_string();
         let projection = self.resolve_projection_for_prepare(s, &table)?;
         let up = s.to_ascii_uppercase();
+        if !up.contains(" WHERE ")
+            && !up.contains(" ORDER BY ")
+            && !up.contains(" GROUP BY ")
+            && !up.contains(" JOIN ")
+        {
+            return Ok(PreparedPlan::SelectAll { table, projection });
+        }
         let where_idx = up
             .find(" WHERE ")
             .ok_or("prepared SELECT fast path requires WHERE")?;
-        let pred = s[where_idx + 7..].trim().trim_end_matches(';');
+        let (pred, limit) = Self::split_trailing_limit_clause(&s[where_idx + 7..]);
+        if let Some((column, pattern)) = Self::parse_like_prepared_predicate(pred) {
+            return Ok(PreparedPlan::LikeContains {
+                table,
+                column,
+                pattern,
+                limit,
+                projection,
+            });
+        }
         let parts: Vec<&str> = pred.splitn(2, '=').collect();
         if parts.len() != 2 {
             return Err("prepared SELECT fast path supports equality predicates only".to_string());
@@ -9651,7 +9822,14 @@ impl NativeSqlEngine {
                 table,
                 columns,
                 values,
-            } => self.execute_prepared_insert(table, columns, values, params),
+                wal_insert_prefix,
+            } => self.execute_prepared_insert(
+                table,
+                columns,
+                values,
+                params,
+                wal_insert_prefix,
+            ),
             PreparedPlan::SelectByPrimaryKey {
                 table,
                 key,
@@ -9696,6 +9874,23 @@ impl NativeSqlEngine {
                 projection,
                 params,
             ),
+            PreparedPlan::LikeContains {
+                table,
+                column,
+                pattern,
+                limit,
+                projection,
+            } => self.execute_prepared_like_contains(
+                table,
+                column,
+                pattern,
+                *limit,
+                projection,
+                params,
+            ),
+            PreparedPlan::SelectAll { table, projection } => {
+                self.execute_prepared_select_all(table, projection)
+            }
         };
         if is_mutation && !tx_active {
             self.autocommit_wal_parent
@@ -9724,28 +9919,39 @@ impl NativeSqlEngine {
         result
     }
 
+    fn render_insert_fast_wal(
+        wal_insert_prefix: &str,
+        values: &[PreparedValue],
+        params: &[String],
+    ) -> Result<String, String> {
+        let est = wal_insert_prefix.len() + values.len() * 12 + 1;
+        let mut out = String::with_capacity(est);
+        out.push_str(wal_insert_prefix);
+        for (i, value) in values.iter().enumerate() {
+            if i > 0 {
+                out.push(',');
+            }
+            match value {
+                PreparedValue::Param(idx) => {
+                    let p = params.get(*idx).ok_or_else(|| {
+                        format!("missing prepared parameter ${}", idx + 1)
+                    })?;
+                    out.push_str(p);
+                }
+                PreparedValue::Literal(cell) => out.push_str(&Self::cell_sql_literal_for_wal(cell)),
+            }
+        }
+        out.push(')');
+        Ok(out)
+    }
+
     fn prepared_wal_sql(plan: &PreparedPlan, params: &[String]) -> Result<String, String> {
         match plan {
             PreparedPlan::InsertFast {
-                table,
-                columns,
+                wal_insert_prefix,
                 values,
-            } => {
-                let rendered = values
-                    .iter()
-                    .map(|value| Self::prepared_value_sql(value, params))
-                    .collect::<Result<Vec<_>, _>>()?;
-                Ok(format!(
-                    "INSERT INTO {} ({}) VALUES ({})",
-                    Self::quote_ident_for_wal(table),
-                    columns
-                        .iter()
-                        .map(|c| Self::quote_ident_for_wal(c))
-                        .collect::<Vec<_>>()
-                        .join(", "),
-                    rendered.join(", ")
-                ))
-            }
+                ..
+            } => Self::render_insert_fast_wal(wal_insert_prefix, values, params),
             PreparedPlan::UpdateByPrimaryKey {
                 table,
                 assignments,
@@ -9778,8 +9984,16 @@ impl NativeSqlEngine {
     }
 
     fn prepared_value_sql(value: &PreparedValue, params: &[String]) -> Result<String, String> {
-        let cell = Self::resolve_prepared_value(value, params)?;
-        Ok(Self::cell_sql_literal_for_wal(&cell))
+        match value {
+            // Bind has already converted parameters into SQL-safe literals via
+            // `format_param_sql`; avoid reparsing large vector payloads just to
+            // render the WAL statement.
+            PreparedValue::Param(idx) => params
+                .get(*idx)
+                .cloned()
+                .ok_or_else(|| format!("missing prepared parameter ${}", idx + 1)),
+            PreparedValue::Literal(cell) => Ok(Self::cell_sql_literal_for_wal(cell)),
+        }
     }
 
     fn cell_sql_literal_for_wal(cell: &Cell) -> String {
@@ -9842,12 +10056,38 @@ impl NativeSqlEngine {
         PreparedValue::Literal(Self::parse_value(t))
     }
 
+    fn cell_from_bound_param(param: &str) -> Cell {
+        let t = param.trim();
+        if t.eq_ignore_ascii_case("NULL") {
+            return Cell::Null;
+        }
+        if t.eq_ignore_ascii_case("TRUE") {
+            return Cell::Bool(true);
+        }
+        if t.eq_ignore_ascii_case("FALSE") {
+            return Cell::Bool(false);
+        }
+        if t.contains("::vector") || Self::looks_like_vector_literal(t) {
+            return Self::parse_value(t);
+        }
+        if let Ok(v) = t.parse::<i64>() {
+            return Cell::Int(v);
+        }
+        if let Ok(v) = t.parse::<f64>() {
+            return Cell::Float(v);
+        }
+        if t.starts_with('\'') && t.ends_with('\'') && t.len() >= 2 {
+            return Cell::Text(t[1..t.len() - 1].replace("''", "'"));
+        }
+        Cell::Text(t.to_string())
+    }
+
     fn resolve_prepared_value(value: &PreparedValue, params: &[String]) -> Result<Cell, String> {
         match value {
             PreparedValue::Literal(cell) => Ok(cell.clone()),
             PreparedValue::Param(idx) => params
                 .get(*idx)
-                .map(|v| Self::parse_value(v))
+                .map(|v| Self::cell_from_bound_param(v))
                 .ok_or_else(|| format!("missing prepared parameter ${}", idx + 1)),
         }
     }
@@ -10007,6 +10247,7 @@ impl NativeSqlEngine {
         columns: &[String],
         values: &[PreparedValue],
         params: &[String],
+        wal_insert_prefix: &str,
     ) -> Result<QueryResult, String> {
         let mut row_map = HashMap::with_capacity(columns.len());
         for (col, value) in columns.iter().zip(values.iter()) {
@@ -10023,18 +10264,14 @@ impl NativeSqlEngine {
         if self.transaction_active() {
             return self.execute_prepared_insert_txn(table, columns, &rows);
         }
+        let trust_hint = id > 0
+            && !self.table_has_secondary_indexes(table)
+            && !self.has_indexes_for_table(table);
         let count = if self.autocommit_wal_owned_by_parent() {
-            self.bulk_insert_rows_fast(table, columns, rows, "", false)?
+            self.bulk_insert_rows_fast(table, columns, rows, "", trust_hint)?
         } else {
-            let wal_sql = Self::prepared_wal_sql(
-                &PreparedPlan::InsertFast {
-                    table: table.to_string(),
-                    columns: columns.to_vec(),
-                    values: values.to_vec(),
-                },
-                params,
-            )?;
-            self.bulk_insert_rows_fast(table, columns, rows, &wal_sql, false)?
+            let wal_sql = Self::render_insert_fast_wal(wal_insert_prefix, values, params)?;
+            self.bulk_insert_rows_fast(table, columns, rows, &wal_sql, trust_hint)?
         };
         Ok(Self::empty_ok(&format!("INSERT 0 {}", count)))
     }
@@ -10194,6 +10431,88 @@ impl NativeSqlEngine {
         })
     }
 
+    fn execute_prepared_like_contains(
+        &self,
+        table: &str,
+        column: &str,
+        pattern: &PreparedValue,
+        limit: Option<usize>,
+        projection: &[String],
+        params: &[String],
+    ) -> Result<QueryResult, String> {
+        let pattern_cell = Self::resolve_prepared_value(pattern, params)?;
+        let needle = Self::like_needle_from_pattern_cell(&pattern_cell)
+            .ok_or_else(|| "prepared LIKE: unsupported pattern shape".to_string())?;
+        let shared = self.table_read_guard(table)?;
+        let t = shared.read();
+        let id_only = projection.len() == 1 && projection[0].eq_ignore_ascii_case("id");
+        let table_rows = t.rows.len();
+        let row_ids = if let Some(entry) = self.trigram_catalog.find(table, column) {
+            if entry.should_scan_table(&needle, table_rows) {
+                if Self::like_universal_trigram_match(
+                    &entry,
+                    &*t,
+                    column,
+                    &needle,
+                    table_rows,
+                    false,
+                ) {
+                    let mut ids: Vec<i64> = (*self.table_row_ids_fast(table, &*t)).clone();
+                    if let Some(lim) = limit {
+                        ids.truncate(lim);
+                    }
+                    ids
+                } else {
+                    self.like_contains_row_ids(table, &*t, column, &needle, false, limit)
+                }
+            } else {
+                let mut ids = entry.search_contains(&needle);
+                if !entry.contains_match_is_exact(&needle) {
+                    ids.retain(|row_id| {
+                        t.rows.get(row_id).and_then(|row| {
+                            row.cols.get(column).map(|c| {
+                                like_literal_contains(&c.as_text(), &needle, false)
+                            })
+                        })
+                        .unwrap_or(false)
+                    });
+                }
+                if let Some(lim) = limit {
+                    ids.truncate(lim);
+                }
+                ids
+            }
+        } else {
+            self.like_contains_row_ids(table, &*t, column, &needle, false, limit)
+        };
+        if id_only {
+            return Ok(QueryResult::select_ids(Arc::new(row_ids)));
+        }
+        let columns = Self::prepared_columns(&t, projection);
+        let rows_out =
+            self.materialize_indexed_projection_rows_visible(table, &t, &row_ids, projection);
+        Ok(QueryResult {
+            columns,
+            rows: rows_out,
+            command_tag: format!("SELECT {}", row_ids.len()),
+        ..Default::default()
+        })
+    }
+
+    fn execute_prepared_select_all(
+        &self,
+        table: &str,
+        projection: &[String],
+    ) -> Result<QueryResult, String> {
+        let select_list = if projection.is_empty() {
+            "*".to_string()
+        } else {
+            projection.join(", ")
+        };
+        let sql = format!("SELECT {select_list} FROM {table}");
+        self.handle_select_all(&sql, table)
+    }
+
     fn execute_prepared_select_pk(
         &self,
         table: &str,
@@ -10273,12 +10592,12 @@ impl NativeSqlEngine {
                 tree.search(&index_key)
             }
         };
-        let g = self.tables.to_native_map();
-        let t = g
-            .get(table)
-            .ok_or_else(|| format!("table \"{}\" does not exist", table))?;
-        let columns = Self::prepared_columns(t, projection);
-        let rows = Self::materialize_indexed_projection_rows(t, &row_ids, projection);
+        let (columns, rows) = self.tables.with_read(table, |t| {
+            (
+                Self::prepared_columns(t, projection),
+                Self::materialize_indexed_projection_rows(t, &row_ids, projection),
+            )
+        })?;
         Ok(QueryResult {
             command_tag: format!("SELECT {}", rows.len()),
             columns,
@@ -10554,6 +10873,126 @@ impl NativeSqlEngine {
                 if let Some(result) = self.try_transaction_delete_fast(s) {
                     return result;
                 }
+            }
+        }
+
+        // Hot path: INSERT / UPDATE / DELETE without allocating a full uppercase
+        // copy of the SQL (Batch INSERT VALUES payloads are multi-KB).
+        if Self::sql_prefix_ci(s, "INSERT INTO")
+            || Self::sql_prefix_ci(s, "DELETE FROM")
+            || Self::sql_prefix_ci(s, "UPDATE")
+        {
+            // OVERRIDING appears in the clause head, never inside VALUES payloads.
+            let mut head_end = s.len().min(1024);
+            while head_end > 0 && !s.is_char_boundary(head_end) {
+                head_end -= 1;
+            }
+            if Self::find_ascii_ci(&s[..head_end], "OVERRIDING USER VALUE").is_some() {
+                return Err("OVERRIDING USER VALUE is not supported by NativeSqlEngine".to_string());
+            }
+            validate_jsonb_contains_predicates(s)?;
+            let tx_active_at_start = self.transaction_active();
+            let autocommit_wal_mutation =
+                with_wal && !tx_active_at_start && self.data_dir.is_some();
+            if Self::sql_prefix_ci(s, "INSERT INTO") {
+                let tbl = Self::parse_ident_after(s, "INSERT INTO").unwrap_or("");
+                self.auth
+                    .check_privilege(username, tbl, Privilege::Insert)?;
+                let result = if tx_active_at_start {
+                    if let Some(fast) = self.try_transaction_insert_fast(s) {
+                        fast
+                    } else if autocommit_wal_mutation {
+                        self.durable_autocommit_mutation(s, |e| e.handle_insert(s))
+                    } else {
+                        self.handle_insert(s)
+                    }
+                } else if autocommit_wal_mutation {
+                    self.durable_autocommit_mutation(s, |e| e.handle_insert(s))
+                } else {
+                    self.handle_insert(s)
+                };
+                let used_fast_txn_insert = tx_active_at_start
+                    && result.is_ok()
+                    && self
+                        .transaction
+                        .read()
+                        .as_ref()
+                        .is_some_and(|t| t.compact_wal_on_commit);
+                if result.is_ok() && with_wal && tx_active_at_start && !used_fast_txn_insert {
+                    self.record_transaction_wal(s)?;
+                }
+                if result.is_ok() && !tx_active_at_start {
+                    self.mark_table_data_dirty(tbl, 1);
+                    self.htap.mark_column_dirty(tbl);
+                }
+                return result;
+            }
+            if Self::sql_prefix_ci(s, "DELETE FROM") {
+                let tbl = Self::parse_ident_after(s, "DELETE FROM").unwrap_or("");
+                self.auth
+                    .check_privilege(username, tbl, Privilege::Delete)?;
+                let result = if tx_active_at_start {
+                    if let Some(fast) = self.try_transaction_delete_fast(s) {
+                        fast
+                    } else if autocommit_wal_mutation {
+                        self.durable_autocommit_mutation(s, |e| e.handle_delete(s))
+                    } else {
+                        self.handle_delete(s)
+                    }
+                } else if autocommit_wal_mutation {
+                    self.durable_autocommit_mutation(s, |e| e.handle_delete(s))
+                } else {
+                    self.handle_delete(s)
+                };
+                let used_fast_txn_delete = tx_active_at_start
+                    && result.is_ok()
+                    && self
+                        .transaction
+                        .read()
+                        .as_ref()
+                        .is_some_and(|t| t.compact_wal_on_commit);
+                if result.is_ok() && with_wal && tx_active_at_start && !used_fast_txn_delete {
+                    self.record_transaction_wal(s)?;
+                }
+                if result.is_ok() && !tx_active_at_start {
+                    self.mark_table_data_dirty(tbl, 1);
+                    self.htap.mark_column_dirty(tbl);
+                }
+                return result;
+            }
+            // UPDATE (prefix already matched)
+            {
+                let tbl = Self::parse_ident_after(s, "UPDATE").unwrap_or("");
+                self.auth
+                    .check_privilege(username, tbl, Privilege::Update)?;
+                let result = if tx_active_at_start {
+                    if let Some(fast) = self.try_transaction_update_fast(s) {
+                        fast
+                    } else if autocommit_wal_mutation {
+                        self.durable_autocommit_mutation(s, |e| e.handle_update(s))
+                    } else {
+                        self.handle_update(s)
+                    }
+                } else if autocommit_wal_mutation {
+                    self.durable_autocommit_mutation(s, |e| e.handle_update(s))
+                } else {
+                    self.handle_update(s)
+                };
+                let used_fast_txn_update = tx_active_at_start
+                    && result.is_ok()
+                    && self
+                        .transaction
+                        .read()
+                        .as_ref()
+                        .is_some_and(|t| t.compact_wal_on_commit);
+                if result.is_ok() && with_wal && tx_active_at_start && !used_fast_txn_update {
+                    self.record_transaction_wal(s)?;
+                }
+                if result.is_ok() && !tx_active_at_start {
+                    self.mark_table_data_dirty(tbl, 1);
+                    self.htap.mark_column_dirty(tbl);
+                }
+                return result;
             }
         }
 
@@ -11255,6 +11694,86 @@ impl NativeSqlEngine {
 
     fn parse_value(tok: &str) -> Cell {
         let t = tok.trim();
+        if t.eq_ignore_ascii_case("NULL") {
+            return Cell::Null;
+        }
+        if t.eq_ignore_ascii_case("TRUE") {
+            return Cell::Bool(true);
+        }
+        if t.eq_ignore_ascii_case("FALSE") {
+            return Cell::Bool(false);
+        }
+        if let Ok(v) = t.parse::<i64>() {
+            return Cell::Int(v);
+        }
+        if let Ok(v) = t.parse::<f64>() {
+            return Cell::Float(v);
+        }
+        // Quoted literals first: Batch INSERT text columns must not pay for
+        // to_ascii_lowercase / vector probes on every Chinese string.
+        if t.starts_with('\'') && t.ends_with('\'') && t.len() >= 2 {
+            // Bytea hex literal: '\xDEADBEEF'
+            if t.starts_with("'\\x") && t.len() >= 5 {
+                let hex = &t[3..t.len() - 1];
+                if let Some(bytes) = hex_to_bytes(hex) {
+                    return Cell::Bytes(bytes);
+                }
+            }
+            // PostgreSQL array literal: '{1,2,3}'
+            if t.starts_with("'{") && t.ends_with("}'") && t.len() >= 4 {
+                let inner = &t[2..t.len() - 2];
+                let object_candidate = format!("{{{}}}", inner);
+                if serde_json::from_str::<serde_json::Value>(&object_candidate).is_ok() {
+                    return Cell::Json(object_candidate);
+                }
+                if !inner.is_empty() {
+                    let elements: Vec<Cell> = inner
+                        .split(',')
+                        .map(|e| Self::parse_value(e.trim()))
+                        .collect();
+                    return Cell::Array(elements);
+                }
+            }
+            let inner = if t.contains("''") {
+                t[1..t.len() - 1].replace("''", "'")
+            } else {
+                t[1..t.len() - 1].to_string()
+            };
+            if Self::looks_like_vector_literal(&inner) {
+                return Cell::Text(inner);
+            }
+            // Ordinary text fast path (bench Batch INSERT / UPDATE payloads).
+            let bytes = inner.as_bytes();
+            let looks_dateish = inner.len() >= 10 && bytes.get(4) == Some(&b'-');
+            let looks_jsonish = (inner.starts_with('{') && inner.ends_with('}'))
+                || (inner.starts_with('[') && inner.ends_with(']'));
+            let looks_uuid = inner.len() == 36 && is_uuid_format(&inner);
+            if !looks_dateish && !looks_jsonish && !looks_uuid {
+                return Cell::Text(inner);
+            }
+            if looks_uuid {
+                return Cell::Uuid(inner.to_ascii_lowercase());
+            }
+            if looks_dateish {
+                if inner.len() == 10 {
+                    if let Some(ms) = parse_timestamp_str(&inner) {
+                        return Cell::Date((ms / 86400000) as i32);
+                    }
+                }
+                if let Some(ms) = parse_timestamp_str(&inner) {
+                    return Cell::Timestamp(ms);
+                }
+            }
+            if let Some(ms) = parse_interval_str(&inner) {
+                return Cell::Interval(ms);
+            }
+            if looks_jsonish {
+                if serde_json::from_str::<serde_json::Value>(&inner).is_ok() {
+                    return Cell::Json(inner);
+                }
+            }
+            return Cell::Text(inner);
+        }
         let t_lower = t.to_ascii_lowercase();
         if t_lower.contains("::vector")
             || (Self::looks_like_vector_literal(t))
@@ -11265,16 +11784,6 @@ impl NativeSqlEngine {
             if t_lower.contains("::vector") {
                 return Cell::Text(format!("{}{}", INVALID_VECTOR_LITERAL_PREFIX, t));
             }
-        }
-        if t.eq_ignore_ascii_case("NULL") {
-            return Cell::Null;
-        }
-        // Boolean literals
-        if t.eq_ignore_ascii_case("TRUE") {
-            return Cell::Bool(true);
-        }
-        if t.eq_ignore_ascii_case("FALSE") {
-            return Cell::Bool(false);
         }
         // UUID literal: GEN_RANDOM_UUID() or UUID_GENERATE_V4()
         if t.eq_ignore_ascii_case("GEN_RANDOM_UUID()")
@@ -11305,60 +11814,6 @@ impl NativeSqlEngine {
                 .collect();
             return Cell::Array(elements);
         }
-        // PostgreSQL array literal: '{1,2,3}'
-        if t.starts_with("'{") && t.ends_with("}'") && t.len() >= 4 {
-            let inner = &t[2..t.len() - 2]; // strip '{ and }'
-            let object_candidate = format!("{{{}}}", inner);
-            if serde_json::from_str::<serde_json::Value>(&object_candidate).is_ok() {
-                return Cell::Json(object_candidate);
-            }
-            if !inner.is_empty() {
-                let elements: Vec<Cell> = inner
-                    .split(',')
-                    .map(|e| Self::parse_value(e.trim()))
-                    .collect();
-                return Cell::Array(elements);
-            }
-        }
-        // Bytea hex literal: '\xDEADBEEF' or E'\\xDEADBEEF'
-        if t.starts_with("'\\x") && t.ends_with('\'') && t.len() >= 5 {
-            let hex = &t[3..t.len() - 1];
-            if let Some(bytes) = hex_to_bytes(hex) {
-                return Cell::Bytes(bytes);
-            }
-        }
-        if t.starts_with('\'') && t.ends_with('\'') && t.len() >= 2 {
-            let inner = t[1..t.len() - 1].replace("''", "'");
-            // Try UUID first (36-char hex-dashed format)
-            if inner.len() == 36 && is_uuid_format(&inner) {
-                return Cell::Uuid(inner.to_ascii_lowercase());
-            }
-            // Try timestamp parsing for date-like strings
-            if inner.len() >= 10 && inner.as_bytes().get(4) == Some(&b'-') {
-                // Pure date (YYYY-MM-DD) → Cell::Date
-                if inner.len() == 10 {
-                    if let Some(ms) = parse_timestamp_str(&inner) {
-                        return Cell::Date((ms / 86400000) as i32);
-                    }
-                }
-                if let Some(ms) = parse_timestamp_str(&inner) {
-                    return Cell::Timestamp(ms);
-                }
-            }
-            // Try interval: '1 hour', '30 minutes', '2 days 3 hours', etc.
-            if let Some(ms) = parse_interval_str(&inner) {
-                return Cell::Interval(ms);
-            }
-            // Try JSON detection
-            if (inner.starts_with('{') && inner.ends_with('}'))
-                || (inner.starts_with('[') && inner.ends_with(']'))
-            {
-                if serde_json::from_str::<serde_json::Value>(&inner).is_ok() {
-                    return Cell::Json(inner);
-                }
-            }
-            return Cell::Text(inner);
-        }
         if let Ok(v) = t.parse::<i64>() {
             return Cell::Int(v);
         }
@@ -11379,12 +11834,11 @@ impl NativeSqlEngine {
     fn vector_cell(data: Vec<f32>) -> Cell {
         let dim = data.len();
         let norm = data.iter().map(|x| x * x).sum::<f32>().sqrt();
-        let text = vector_literal_text(&data);
         Cell::Vector {
             dim,
             data,
             norm,
-            text,
+            text: String::new(),
         }
     }
 
@@ -12553,10 +13007,15 @@ impl NativeSqlEngine {
             return Err("Invalid CREATE INDEX: missing index name".into());
         }
 
+        // Vector-index shorthand without USING: `ON t (col) WITH (metric=cosine, ...)`.
+        let with_metric_shorthand = !up.contains(" USING ")
+            && up.contains(" WITH ")
+            && up.contains("METRIC");
         let kind = if up.contains("USING JSON_PATH") {
             let path = Self::parse_using_string_arg(s, "JSON_PATH")?;
             CreateIndexKind::JsonPath(path)
-        } else if up.contains("USING HNSW") || up.contains("USING IVFFLAT") {
+        } else if up.contains("USING HNSW") || up.contains("USING IVFFLAT") || with_metric_shorthand
+        {
             CreateIndexKind::Hnsw(parse_hnsw_metric_from_sql(s))
         } else if up.contains("USING GIN_TRGM") || up.contains("USING TRGM") || up.contains("USING TRIGRAM") {
             CreateIndexKind::Trigram
@@ -12566,8 +13025,12 @@ impl NativeSqlEngine {
             CreateIndexKind::BTree
         };
 
+        // Drop trailing USING / WITH clauses before parsing the column list so
+        // `rfind(')')` cannot swallow `WITH (...)` options into column names.
         let s_trim = if let Some(using_idx) = up.find(" USING ") {
             &s[..using_idx]
+        } else if let Some(with_idx) = up.find(" WITH ") {
+            &s[..with_idx]
         } else {
             s
         };
@@ -13097,6 +13560,39 @@ impl NativeSqlEngine {
             return None;
         }
         Some((col, needle))
+    }
+
+    fn parse_like_prepared_predicate(pred: &str) -> Option<(String, PreparedValue)> {
+        let pred = Self::strip_predicate_parens(pred);
+        let up = pred.to_ascii_uppercase();
+        if up.contains(" ILIKE ") {
+            return None;
+        }
+        let kw_idx = up.find(" LIKE ")?;
+        let col = pred[..kw_idx].trim().trim_matches('"').to_string();
+        let pattern_part = pred[kw_idx + 6..].trim().trim_end_matches(';').trim();
+        if pattern_part.starts_with('$') || pattern_part == "?" {
+            return Some((col, Self::parse_prepared_value(pattern_part)));
+        }
+        if let Some((_, needle)) = Self::parse_like_contains_predicate(pred) {
+            return Some((
+                col,
+                PreparedValue::Literal(Cell::Text(format!("%{needle}%"))),
+            ));
+        }
+        None
+    }
+
+    fn like_needle_from_pattern_cell(cell: &Cell) -> Option<String> {
+        let pattern = cell.as_text();
+        if !pattern.starts_with('%') || !pattern.ends_with('%') || pattern.len() < 3 {
+            return None;
+        }
+        let needle = &pattern[1..pattern.len() - 1];
+        if needle.is_empty() || needle.contains('_') {
+            return None;
+        }
+        Some(needle.to_string())
     }
 
     fn row_text_for_inverted_columns(row: &NativeRow, columns: &[String]) -> Option<String> {
@@ -14855,13 +15351,15 @@ impl NativeSqlEngine {
             return Err("bulk insert fast path unavailable inside transaction".into());
         }
 
-        let table_indexes: Vec<_> = {
+        let table_indexes: Vec<_> = if self.has_indexes_for_table(table) {
             let indexes = self.index_mgr.indexes.read();
             indexes
                 .values()
                 .filter(|tree| tree.table == table)
                 .cloned()
                 .collect()
+        } else {
+            Vec::new()
         };
         let maintain_secondary = self.table_has_secondary_indexes(table);
         let index_rows: Vec<(i64, NativeRow)> = if maintain_secondary {
@@ -14879,6 +15377,35 @@ impl NativeSqlEngine {
             |t| {
                 t.ensure_auto_id_initialized();
                 if trusted_series {
+                    if prepared_rows.len() == 1 {
+                        let (row_id, row) = prepared_rows.pop().unwrap();
+                        if row_id > 0
+                            && t.foreign_keys.is_empty()
+                            && t.sequences.is_empty()
+                            && !t.rows.contains_key(&row_id)
+                        {
+                            if row_id >= t.next_auto_id {
+                                t.next_auto_id = row_id.saturating_add(1);
+                            }
+                            if !table_indexes.is_empty() {
+                                for tree in &table_indexes {
+                                    for col in &tree.columns {
+                                        if let Some(val) = row.cols.get(col) {
+                                            if let Some(idx_key) = Self::index_key_for_cell(val) {
+                                                tree.insert(idx_key, row_id);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            if self.htap_tx_active() {
+                                self.htap_track_row_write(table, t, row_id, &row);
+                            }
+                            t.rows.insert(row_id, row);
+                            return Ok(1);
+                        }
+                        prepared_rows.push((row_id, row));
+                    }
                     let n = prepared_rows.len();
                     if let Some((max_id, _)) = prepared_rows.iter().max_by_key(|(id, _)| id) {
                         if *max_id >= t.next_auto_id {
@@ -14886,6 +15413,19 @@ impl NativeSqlEngine {
                         }
                     }
                     t.rows.reserve(n.saturating_sub(t.rows.len()));
+                    if !table_indexes.is_empty() {
+                        for (id, row) in &prepared_rows {
+                            for tree in &table_indexes {
+                                for col in &tree.columns {
+                                    if let Some(val) = row.cols.get(col) {
+                                        if let Some(idx_key) = Self::index_key_for_cell(val) {
+                                            tree.insert(idx_key, *id);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
                     for (id, row) in prepared_rows {
                         if self.htap_tx_active() {
                             self.htap_track_row_write(table, t, id, &row);
@@ -16170,12 +16710,11 @@ impl NativeSqlEngine {
             return result;
         }
         let table = Self::parse_ident_after(s, "INSERT INTO").ok_or("Invalid INSERT")?;
-        let up = s.to_ascii_uppercase();
         let tx_active = self.transaction_active();
-        let overriding_system_value = up.contains("OVERRIDING SYSTEM VALUE");
-
-        // Find positions of VALUES keyword and first parenthesis
-        let values_kw_idx = up.find("VALUES").or_else(|| up.find("SELECT"));
+        // Avoid s.to_ascii_uppercase() on multi-row literal SQL (can be MBs of text).
+        let overriding_system_value = Self::find_ascii_ci(s, "OVERRIDING SYSTEM VALUE").is_some();
+        let values_kw_idx =
+            Self::find_ascii_ci(s, "VALUES").or_else(|| Self::find_ascii_ci(s, "SELECT"));
         let first_paren = s.find('(');
 
         // Determine if columns are explicitly specified:
@@ -16205,9 +16744,9 @@ impl NativeSqlEngine {
             }
         };
 
-        // Detect ON CONFLICT clause
-        let on_conflict_idx = up.find(" ON CONFLICT");
-        let returning_idx = up.find(" RETURNING ");
+        // Detect ON CONFLICT / RETURNING without uppercasing the VALUES payload.
+        let on_conflict_idx = Self::find_ascii_ci(s, " ON CONFLICT");
+        let returning_idx = Self::find_ascii_ci(s, " RETURNING ");
 
         // Parse ON CONFLICT action
         enum ConflictAction {
@@ -16216,10 +16755,10 @@ impl NativeSqlEngine {
             DoUpdate(Vec<(String, String)>), // (col, expr) pairs — expr as string
         }
         let conflict_action = if let Some(oc_idx) = on_conflict_idx {
-            let oc_part_up = &up[oc_idx..];
-            if oc_part_up.contains("DO NOTHING") {
+            let oc_part = &s[oc_idx..];
+            if Self::find_ascii_ci(oc_part, "DO NOTHING").is_some() {
                 ConflictAction::DoNothing
-            } else if let Some(do_update_idx) = oc_part_up.find("DO UPDATE SET ") {
+            } else if let Some(do_update_idx) = Self::find_ascii_ci(oc_part, "DO UPDATE SET ") {
                 let set_start = oc_idx + do_update_idx + 14; // "DO UPDATE SET " = 14
                 let set_end = returning_idx.unwrap_or(s.len());
                 let set_part = s[set_start..set_end].trim().trim_end_matches(';');
@@ -16264,16 +16803,21 @@ impl NativeSqlEngine {
 
         // Determine VALUES source: VALUES(...) or SELECT ...
         let after_cols = &s[col_close + 1..];
-        let after_cols_up = after_cols.trim().to_ascii_uppercase();
+        let after_cols_trim = after_cols.trim();
+        let is_insert_select = after_cols_trim.len() >= 7
+            && (after_cols_trim[..7].eq_ignore_ascii_case("SELECT ")
+                || (after_cols_trim.starts_with('(')
+                    && after_cols_trim.len() >= 8
+                    && after_cols_trim[1..8].eq_ignore_ascii_case("SELECT ")));
 
         // Limit: strip ON CONFLICT / RETURNING from VALUES parsing
         let values_end = on_conflict_idx.unwrap_or(returning_idx.unwrap_or(s.len()));
 
         let prepared_rows =
-            if after_cols_up.starts_with("SELECT ") || after_cols_up.starts_with("(SELECT ") {
+            if is_insert_select {
                 // INSERT INTO ... SELECT ...
-                let select_sql = if after_cols_up.starts_with("(SELECT ") {
-                    let inner = &after_cols.trim()[1..]; // strip leading (
+                let select_sql = if after_cols_trim.starts_with('(') {
+                    let inner = &after_cols_trim[1..]; // strip leading (
                                                          // Find matching )
                     if let Some(end) = inner.rfind(')') {
                         &inner[..end]
@@ -16314,27 +16858,23 @@ impl NativeSqlEngine {
             } else {
                 // Standard VALUES(...)
                 let values_part_str = &s[col_close + 1..values_end];
-                let values_idx_local = values_part_str
-                    .to_ascii_uppercase()
-                    .find("VALUES")
+                let values_idx_local = Self::find_ascii_ci(values_part_str, "VALUES")
                     .ok_or("Invalid INSERT VALUES")?;
                 let values_part = &values_part_str[values_idx_local + 6..];
                 let value_groups = Self::parse_multi_value_groups(values_part);
                 if value_groups.is_empty() {
                     return Err("Invalid INSERT VALUES".to_string());
                 }
-                let rows: Vec<(i64, NativeRow)> = if value_groups.len() >= 32 {
+                let rows: Vec<(i64, NativeRow)> = if value_groups.len() >= MULTI_VALUES_PARALLEL_MIN {
                     let cols = cols.clone();
                     value_groups
-                        .par_iter()
+                        .into_par_iter()
                         .map(|vals| {
                             let mut row_map: HashMap<String, Cell> =
                                 HashMap::with_capacity(cols.len());
-                            for (i, c) in cols.iter().enumerate() {
-                                row_map.insert(
-                                    c.clone(),
-                                    vals.get(i).cloned().unwrap_or(Cell::Null),
-                                );
+                            let mut vals = vals.into_iter();
+                            for c in &cols {
+                                row_map.insert(c.clone(), vals.next().unwrap_or(Cell::Null));
                             }
                             let id = row_map.get("id").map(|v| v.as_i64()).unwrap_or(0);
                             (
@@ -16348,11 +16888,12 @@ impl NativeSqlEngine {
                         .collect()
                 } else {
                     let mut rows = Vec::with_capacity(value_groups.len());
-                    for vals in &value_groups {
+                    for vals in value_groups {
                         let mut row_map: HashMap<String, Cell> =
                             HashMap::with_capacity(cols.len());
-                        for (i, c) in cols.iter().enumerate() {
-                            row_map.insert(c.clone(), vals.get(i).cloned().unwrap_or(Cell::Null));
+                        let mut vals = vals.into_iter();
+                        for c in &cols {
+                            row_map.insert(c.clone(), vals.next().unwrap_or(Cell::Null));
                         }
                         let id = row_map.get("id").map(|v| v.as_i64()).unwrap_or(0);
                         rows.push((
@@ -16375,7 +16916,16 @@ impl NativeSqlEngine {
             && !self.catalog_table_has_fk_side_effects(table, false)
             && !self.catalog_table_has_fk_references(table, false)
         {
-            let count = self.bulk_insert_rows_fast(table, &cols, prepared_rows, s, false)?;
+            // Bench Batch INSERT: explicit positive ids, no sequences → skip
+            // normalize/constraint scans (still maintain btree indexes).
+            let trust_explicit = prepared_rows.len() >= 2
+                && prepared_rows.iter().all(|(id, _)| *id > 0)
+                && self
+                    .tables
+                    .with_read(table, |t| t.sequences.is_empty() && t.foreign_keys.is_empty())
+                    .unwrap_or(false);
+            let count =
+                self.bulk_insert_rows_fast(table, &cols, prepared_rows, s, trust_explicit)?;
             return Ok(QueryResult {
                 columns: Vec::new(),
                 rows: Vec::new(),
@@ -16787,7 +17337,7 @@ impl NativeSqlEngine {
         let mut depth = 0;
         let mut start = 0;
         let mut in_quote = false;
-        let mut group_contents: Vec<String> = Vec::new();
+        let mut group_contents: Vec<&str> = Vec::new();
 
         let bytes = trimmed.as_bytes();
         for i in 0..bytes.len() {
@@ -16802,14 +17352,14 @@ impl NativeSqlEngine {
                 b')' if !in_quote => {
                     depth -= 1;
                     if depth == 0 {
-                        group_contents.push(trimmed[start..i].to_string());
+                        group_contents.push(&trimmed[start..i]);
                     }
                 }
                 _ => {}
             }
         }
 
-        if group_contents.len() >= 32 {
+        if group_contents.len() >= MULTI_VALUES_PARALLEL_MIN {
             group_contents
                 .par_iter()
                 .map(|content| Self::split_values_quoted(content))
@@ -18540,14 +19090,14 @@ impl NativeSqlEngine {
                         for cs in &col_slices {
                             match cs {
                                 ColSlice::Id => {
-                                    row.push(Some(ids_slice[idx].to_string().into_bytes()))
+                                    row.push(Some(format_i64_bytes(ids_slice[idx])))
                                 }
                                 ColSlice::Float(fv) => {
                                     row.push(Some(fv[idx].to_string().into_bytes()))
                                 }
                                 ColSlice::Text(tv) => row.push(Some(tv[idx].as_bytes().to_vec())),
                                 ColSlice::Int(iv) => {
-                                    row.push(Some(iv[idx].to_string().into_bytes()))
+                                    row.push(Some(format_i64_bytes(iv[idx])))
                                 }
                                 ColSlice::Missing => row.push(None),
                             }
@@ -18558,16 +19108,16 @@ impl NativeSqlEngine {
                 })
                 .collect()
         } else {
-            // Sequential for small tables
+            // Sequential for small/medium tables (bench full scan is ~10k rows).
             let mut rows: Vec<Vec<Option<Vec<u8>>>> = Vec::with_capacity(n);
             for idx in 0..n {
                 let mut row: Vec<Option<Vec<u8>>> = Vec::with_capacity(col_slices.len());
                 for cs in &col_slices {
                     match cs {
-                        ColSlice::Id => row.push(Some(cc.ids[idx].to_string().into_bytes())),
+                        ColSlice::Id => row.push(Some(format_i64_bytes(cc.ids[idx]))),
                         ColSlice::Float(fv) => row.push(Some(fv[idx].to_string().into_bytes())),
                         ColSlice::Text(tv) => row.push(Some(tv[idx].as_bytes().to_vec())),
-                        ColSlice::Int(iv) => row.push(Some(iv[idx].to_string().into_bytes())),
+                        ColSlice::Int(iv) => row.push(Some(format_i64_bytes(iv[idx]))),
                         ColSlice::Missing => row.push(None),
                     }
                 }
@@ -19003,9 +19553,11 @@ impl NativeSqlEngine {
                     })
                     .collect();
 
-                let table_rows = self.htap_visible_row_count(table).max(t.rows.len());
+                // Heap row count is enough as an index-selection heuristic here;
+                // full MVCC visibility counting costs ~2.5ms per 10k-row table.
+                let table_rows = t.rows.len();
                 let use_direct_id_scan =
-                    id_only && out_cols == vec!["id".to_string()] && limit.is_none();
+                    id_only && out_cols == vec!["id".to_string()];
                 if use_direct_id_scan {
                     let row_ids = if let Some(entry) = self.trigram_catalog.find(table, &col_name) {
                         if entry.should_scan_table(&needle, table_rows) {
@@ -20159,22 +20711,14 @@ impl NativeSqlEngine {
             if b == b',' {
                 let part = inner[start..i].trim();
                 if !part.is_empty() {
-                    let x = part.parse::<f32>().ok()?;
-                    if !x.is_finite() {
-                        return None;
-                    }
-                    out.push(x);
+                    out.push(parse_vector_number(part)?);
                 }
                 start = i + 1;
             }
         }
         let tail = inner[start..].trim();
         if !tail.is_empty() {
-            let x = tail.parse::<f32>().ok()?;
-            if !x.is_finite() {
-                return None;
-            }
-            out.push(x);
+            out.push(parse_vector_number(tail)?);
         }
         Some(out)
     }

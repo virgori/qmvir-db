@@ -27,7 +27,7 @@ QM_ROOT="$(release_root)"
 QM_ENGINE="$QM_ROOT/qm_engine"
 QM_OUT="${QM_RELEASE_OUT:-$QM_ROOT/build/release}"
 
-# Canonical artifact names (must match npm/scripts/postinstall.js).
+# Canonical standalone binary artifact names.
 QM_CANONICAL_ARTIFACTS=(
   qm-macos-arm64
   qm-macos-x86_64
@@ -45,21 +45,10 @@ release_read_cargo_version() {
 
 release_verify_manifest_versions() {
   local want="$1"
-  local py npm cargo app
-  py="$(python3 -c "import tomllib; print(tomllib.load(open('$QM_ROOT/pyproject.toml','rb'))['project']['version'])")"
-  npm="$(python3 -c "import json; print(json.load(open('$QM_ROOT/npm/package.json'))['version'])")"
+  local cargo
   cargo="$(python3 -c "import tomllib; print(tomllib.load(open('$QM_ENGINE/Cargo.toml','rb'))['package']['version'])")"
-  app="$(python3 -c "
-import re
-t=open('$QM_ROOT/qm_app.py').read()
-m=re.search(r'__version__\\s*=\\s*[\"\\']([0-9]+\\.[0-9]+\\.[0-9]+)[\"\\']', t)
-print(m.group(1) if m else '')
-")"
-  for label in pyproject npm cargo qm_app; do
-    :
-  done
-  if [[ "$py" != "$want" || "$npm" != "$want" || "$cargo" != "$want" || "$app" != "$want" ]]; then
-    echo "ERROR: version mismatch (want $want): pyproject=$py npm=$npm cargo=$cargo qm_app=$app" >&2
+  if [[ "$cargo" != "$want" ]]; then
+    echo "ERROR: version mismatch (want $want): cargo=$cargo" >&2
     return 1
   fi
 }
@@ -74,23 +63,7 @@ cargo = root / "qm_engine/Cargo.toml"
 text = cargo.read_text()
 text = re.sub(r'^version = "[0-9]+\.[0-9]+\.[0-9]+"', f'version = "{ver}"', text, count=1, flags=re.M)
 cargo.write_text(text)
-
-pyproj = root / "pyproject.toml"
-pt = pyproj.read_text()
-pt = re.sub(r'^version = "[0-9]+\.[0-9]+\.[0-9]+"', f'version = "{ver}"', pt, count=1, flags=re.M)
-pyproj.write_text(pt)
-
-npm = root / "npm/package.json"
-import json
-nj = json.loads(npm.read_text())
-nj["version"] = ver
-npm.write_text(json.dumps(nj, indent=2) + "\n")
-
-app = root / "qm_app.py"
-at = app.read_text()
-at = re.sub(r'__version__\s*=\s*"[0-9]+\.[0-9]+\.[0-9]+"', f'__version__ = "{ver}"', at, count=1)
-app.write_text(at)
-print(f"synced all manifests to {ver}")
+print(f"synced Cargo.toml to {ver}")
 PY
 }
 

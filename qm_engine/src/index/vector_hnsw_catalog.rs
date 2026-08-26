@@ -422,9 +422,13 @@ pub fn metric_for_distance_op(op: &str) -> Option<DistanceMetric> {
 
 pub fn parse_hnsw_metric_from_sql(sql: &str) -> DistanceMetric {
     let up = sql.to_ascii_uppercase();
-    if up.contains("VECTOR_COSINE_OPS") || up.contains("COSINE_OPS") {
+    if up.contains("VECTOR_COSINE_OPS") || up.contains("COSINE_OPS") || up.contains("COSINE") {
         DistanceMetric::Cosine
-    } else if up.contains("VECTOR_IP_OPS") || up.contains("IP_OPS") {
+    } else if up.contains("VECTOR_IP_OPS")
+        || up.contains("IP_OPS")
+        || up.contains("INNER_PRODUCT")
+        || up.contains("INNERPRODUCT")
+    {
         DistanceMetric::InnerProduct
     } else {
         DistanceMetric::L2

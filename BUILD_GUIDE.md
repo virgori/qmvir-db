@@ -53,7 +53,7 @@ Workflow `Publish Release Binaries (deprecated)` đã tắt.
 
 ### Cách 1: GitHub Actions (từ repo private)
 
-1. Bump version trong `qm_engine/Cargo.toml`, `npm/package.json`, …
+1. Bump version trong `qm_engine/Cargo.toml`.
 2. Push tag: `git tag v6.2.4 && git push origin v6.2.4`
 3. Hoặc **Actions → Release Binaries → Run workflow** với `version: v6.2.4`
 

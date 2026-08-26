@@ -60,10 +60,10 @@ qm --data-dir ./data htap certify --isolation
 
 `--isolation` chay bo kiem tra Jepsen-style: read-your-writes, rollback, commit, autocommit.
 
-## Benchmark hon hop
+## Chung nhan HTAP
 
 ```bash
-python3 scripts/htap_mixed_benchmark.py --engine-bin qm --json
+qm --data-dir ./data htap certify --isolation
 ```
 
 ## Lenh CLI

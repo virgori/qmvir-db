@@ -14,7 +14,6 @@ echo "Build dir: $BUILD_DIR"
 
 # Check dependencies
 command -v git >/dev/null 2>&1 || { echo "git required"; exit 1; }
-command -v python3 >/dev/null 2>&1 || { echo "python3 required"; exit 1; }
 command -v cargo >/dev/null 2>&1 || { echo "rust/cargo required: https://rustup.rs/"; exit 1; }
 
 # Clone source
@@ -32,15 +31,8 @@ git clone --depth 1 --branch "$VERSION" "$REPO_URL" source 2>/dev/null || {
 cd source
 
 # Run build
-if [ -f "scripts/build_release.py" ]; then
-    python3 scripts/build_release.py --install --verify
-elif [ -f "build.sh" ]; then
-    ./build.sh
-else
-    echo "No build script found"
-    exit 1
-fi
+cargo build --manifest-path qm_engine/Cargo.toml --release --no-default-features --bin qm
 
 echo ""
-echo "✓ Build complete!"
-echo "Wheels in: $BUILD_DIR/source/dist/"
+echo "Build complete:"
+echo "$BUILD_DIR/source/qm_engine/target/release/qm"

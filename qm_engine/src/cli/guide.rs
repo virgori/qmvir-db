@@ -157,23 +157,13 @@ UPGRADE PATH
             "\
 QMvir v{version} — QMvir Studio (desktop admin)
 
-QMvir Studio is a native desktop app (Tauri + SolidJS) for SQL editing,
-schema browsing, CSV import/export, and filesystem backups.
+The maintained admin surface in this tree is the Rust web dashboard.
 
-INSTALL (from GitHub releases — tag studio-v*)
-  macOS:   open qmvir-studio_*.dmg
-  Linux:   sudo dpkg -i qmvir-studio_*.deb
-  Windows: run the .msi installer
-
-DEV BUILD (from source)
-  cd qmvir-studio && npm install && npm run tauri dev
-
-CONNECT IN STUDIO
+CONNECT
   • Local folder: point to the same --data-dir used by `qm start`
   • Remote: host 127.0.0.1, port 55433, user admin (pgwire)
 
-STUDIO vs CLI
-  Studio backup  → .tar.gz of the data directory (fast filesystem copy)
+BACKUP
   CLI backup     → .qmvb logical backup (portable, CRC/HMAC, selective tables)
   For engine upgrades, prefer: qm backup / qm restore (.qmvb)
 
@@ -444,8 +434,8 @@ POINT-IN-TIME RECOVERY (PITR)
   qm pitr restore --timestamp <unix> -o ./pitr_out
   qm pitr restore --lsn 42 -o ./pitr_out
 
-MIXED WORKLOAD BENCHMARK
-  python3 scripts/htap_mixed_benchmark.py --engine-bin qm
+HTAP CERTIFICATION
+  qm --data-dir ./data htap certify --isolation
 
 CLUSTER ANALYTICS READS (HA)
   Analytics SELECT can route to async replica when QM_CLUSTER_* is set.

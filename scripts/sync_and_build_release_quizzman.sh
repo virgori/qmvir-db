@@ -50,16 +50,9 @@ echo "=== [3/4] release build on ${SSH_HOST} (linux + windows) ==="
 ssh -o BatchMode=yes "${SSH_HOST}" \
   "bash ${REMOTE_DIR}/qm_engine/scripts/build_release_quizzman.sh ${BUMP_ARGS[*]:-}"
 
-echo "=== [4/5] sync bumped manifests + binaries <- ${SSH_HOST} ==="
+echo "=== [4/5] sync bumped manifest + binaries <- ${SSH_HOST} ==="
 mkdir -p "$ROOT/build/release"
 # Remote --bump updates manifests only on quizzman; pull them back before publish.
-rsync -avz \
-  "${SSH_HOST}:${REMOTE_DIR}/pyproject.toml" \
-  "${SSH_HOST}:${REMOTE_DIR}/qm_app.py" \
-  "$ROOT/"
-rsync -avz \
-  "${SSH_HOST}:${REMOTE_DIR}/npm/package.json" \
-  "$ROOT/npm/"
 rsync -avz \
   "${SSH_HOST}:${REMOTE_DIR}/qm_engine/Cargo.toml" \
   "$ROOT/qm_engine/"

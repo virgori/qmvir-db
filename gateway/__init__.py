@@ -1,2 +1,0 @@
-"""Python gateway compatibility package."""
-

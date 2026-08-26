@@ -124,7 +124,7 @@ VALIDATION (before release / deploy)
   bash scripts/cluster_production_soak.sh         # full soak (30 min+)
 
 PUBLISH / RELEASE
-  • Bump version in pyproject.toml, Cargo.toml, npm/package.json (same semver)
+  • Bump version in qm_engine/Cargo.toml
   • CI Release Gate must pass on main
   • Rebuild binaries, tag vX.Y.Z, then:
       bash scripts/publish_packages.sh --dry-run
@@ -219,7 +219,7 @@ KIEM TRA TRUOC DEPLOY / RELEASE
   bash scripts/cluster_production_soak.sh --quick
 
 PUBLISH
-  • Bump version dong bo (pyproject.toml, Cargo.toml, npm/package.json)
+  • Bump version dong bo trong qm_engine/Cargo.toml
   • CI Release Gate pass tren main
   • Build binary moi, tag vX.Y.Z, publish:
       bash scripts/publish_packages.sh --dry-run

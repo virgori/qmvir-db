@@ -90,6 +90,10 @@ pub fn wal_lines_to_replay(data_dir: &Path, target_lsn: u64) -> Result<Vec<Strin
         if lsn > target_lsn {
             break;
         }
+        // Preallocated WAL tail is zero-filled; first NUL = logical EOF.
+        if line.as_bytes().first() == Some(&0) {
+            break;
+        }
         let sql = line.trim();
         if sql.is_empty() {
             continue;

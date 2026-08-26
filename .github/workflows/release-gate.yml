@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
 
 jobs:
-  rust-python-smoke:
+  rust-smoke:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -17,19 +17,16 @@ jobs:
         with:
           python-version: '3.13'
 
-      - name: Install Python dev dependencies
-        run: python -m pip install -U pip maturin .[dev]
-
-      - name: Cargo check no default features
-        run: cargo check --manifest-path qm_engine/Cargo.toml --no-default-features
-
       - name: Cargo check default features
         run: cargo check --manifest-path qm_engine/Cargo.toml
 
       - name: Cargo test no default features
         run: cargo test --manifest-path qm_engine/Cargo.toml --no-default-features
 
-      - name: Python pytest
+      - name: Install PyO3 test dependencies
+        run: python -m pip install -U pip maturin .[dev]
+
+      - name: Python PyO3 smoke tests
         run: python -m pytest -q
 
       - name: Repo duplicate hygiene
@@ -37,9 +34,6 @@ jobs:
 
       - name: Crash and recovery smoke
         run: cargo test --manifest-path qm_engine/Cargo.toml --no-default-features --test release_crash_recovery
-
-      - name: Benchmark smoke gate
-        run: python scripts/release_benchmark_native_sql.py --quick --build-mode ci --feature-flags default
 
       - name: Enterprise HA gate
         run: bash scripts/enterprise_ha_gate.sh

@@ -7,7 +7,7 @@ root="${root%/}"
 found=0
 
 find "$root" \
-  \( -path "$root/.git" -o -path "$root/target" -o -path "$root/qmvir-studio/src-tauri/target" \) -prune \
+  \( -path "$root/.git" -o -path "$root/target" \) -prune \
   -o -name '* [0-9].*' -type f -print |
   sort |
   while IFS= read -r file; do
@@ -28,7 +28,7 @@ find "$root" \
   done
 
 if find "$root" \
-  \( -path "$root/.git" -o -path "$root/target" -o -path "$root/qmvir-studio/src-tauri/target" \) -prune \
+  \( -path "$root/.git" -o -path "$root/target" \) -prune \
   -o -name '* [0-9].*' -type f -print -quit | grep -q .; then
   echo "error: duplicate space-number files found" >&2
   exit 1

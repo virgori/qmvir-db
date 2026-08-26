@@ -67,7 +67,7 @@ pub fn evaluate_htap_certification(
         id: "mixed_workload",
         title: "OLTP+OLAP concurrent benchmark SLO",
         passed: mixed_bench_passed,
-        detail: "scripts/htap_mixed_benchmark.py".into(),
+        detail: "qm htap certify --isolation".into(),
     });
 
     let htap_functional = gates.iter().take(4).all(|g| g.passed);

@@ -292,7 +292,7 @@ Release Gate (`.github/workflows/release-gate.yml`) runs `enterprise_ha_gate.sh`
 Enterprise HA code can ship in a release when:
 
 1. **Release Gate** passes on `main` (`cargo test --no-default-features`, pytest, HA gate).
-2. **Version bump** — sync semver in `pyproject.toml`, `qm_engine/Cargo.toml`, `npm/package.json`. Do not republish an existing npm/PyPI version.
+2. **Version bump** — sync semver in `qm_engine/Cargo.toml`. Do not republish an existing release version.
 3. **Rebuild** binaries/wheels from current `main` (local `build/release/` artifacts may be stale).
 4. **Tag** `vX.Y.Z` and push — triggers `.github/workflows/release.yml`, or use:
 

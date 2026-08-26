@@ -1,7 +1,7 @@
 /*
  * ProcedureCatalog — Register, look up, and execute stored PL/QM procedures.
  *
- * Port of _py_legacy/qm_core/procedures/catalog.py
+ * Native Rust implementation.
  */
 
 use std::collections::HashMap;

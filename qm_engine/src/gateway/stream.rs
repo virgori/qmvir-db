@@ -70,7 +70,10 @@ impl AsyncWrite for ServerIo {
 }
 
 impl ServerIo {
-    pub fn from_tcp(stream: TcpStream) -> Self {
+    pub fn from_tcp(mut stream: TcpStream) -> Self {
+        // Large Bind payloads + small CommandComplete replies interact badly with
+        // Nagle/delayed-ACK on loopback; node-pg paid ~45ms/op before this.
+        let _ = stream.set_nodelay(true);
         ServerIo::Tcp(stream)
     }
 

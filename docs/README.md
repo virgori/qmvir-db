@@ -1,6 +1,6 @@
-# QMvir Documentation (v6.2.0)
+# QMvir Documentation (v6.2.8)
 
-Canonical documentation for **QMvir 6.2.0** — maintained with the `qm_engine` release.
+Canonical documentation for **QMvir 6.2.8** — maintained with the Rust `qm_engine` release.
 
 ## Primary guides
 
@@ -14,11 +14,8 @@ Canonical documentation for **QMvir 6.2.0** — maintained with the `qm_engine` 
 
 ## Quick links
 
-- **npm:** `npm install qmvir@6.2.0`
-- **Binaries:** [github.com/virgori/qmvir-releases](https://github.com/virgori/qmvir-releases/releases/tag/v6.2.0)
+- **Binaries:** [github.com/virgori/qmvir-releases](https://github.com/virgori/qmvir-releases/releases/tag/v6.2.8)
 - **Certify HA:** `qm cluster certify` (enterprise) · `qm cluster certify --chaos` (jepsen tier)
-- **Build Linux releases on remote host:** `bash scripts/sync_and_build_release_quizzman.sh`
+- **Build Linux/Windows releases on quizzman:** `bash scripts/sync_and_build_release_quizzman.sh`
 
-## Legacy / historical docs
-
-Older audits, benchmark reports, optimization passes, and superseded guides are in **[\_archive/legacy/](_archive/legacy/)** — not maintained for v6.2.0. Use the five primary guides above for current behaviour.
+Historical audits and superseded Python-era docs were removed from the active tree. Use the primary guides above for current behavior.

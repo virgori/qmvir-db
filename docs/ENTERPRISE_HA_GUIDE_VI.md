@@ -217,7 +217,7 @@ CI Release Gate chạy `enterprise_ha_gate.sh` mỗi push lên `main`.
 Có thể publish khi:
 
 1. **Release Gate** pass trên `main`.
-2. **Bump version** — đồng bộ `pyproject.toml`, `qm_engine/Cargo.toml`, `npm/package.json`. Không publish lại version đã có trên npm/PyPI.
+2. **Bump version** — đồng bộ `qm_engine/Cargo.toml`. Không publish lại version đã có.
 3. **Build lại** binary/wheel từ `main` (artifact trong `build/release/` có thể cũ).
 4. **Tag** `vX.Y.Z` và push, hoặc:
 

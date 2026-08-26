@@ -1,6 +1,6 @@
 # QMvir — Danh mục thuật toán & kiến trúc dữ liệu
 
-**Phiên bản:** 6.2.0  
+**Phiên bản:** 6.2.8
 Bản kê theo **crate `qm_engine`**, trỏ tới file triển khai chính. Đọc cùng [QMVIR_ARCHITECTURE.md](QMVIR_ARCHITECTURE.md) · [BASIC_USAGE.md](BASIC_USAGE.md) · [ENTERPRISE_HA_GUIDE.md](ENTERPRISE_HA_GUIDE.md).
 
 ---
@@ -9,15 +9,30 @@ Bản kê theo **crate `qm_engine`**, trỏ tới file triển khai chính. Đ�
 
 | Chủ đề | Thuật toán / cấu trúc | Vị trí code (tham khảo) |
 |--------|---------------------|-------------------------|
-| WAL native SQL | Append log **theo dòng**, flush+fsync | `gateway/native_sql.rs` (`wal_append`, `replay_wal`) |
-| Snapshot engine | Deserialize snapshot nhị phân + replay delta WAL | `gateway/native_sql.rs` (`load_snapshot`, `replay_wal`) |
+| WAL native SQL | Append log **theo dòng**, đồng bộ theo `WalSyncPolicy` (gateway mặc định `group_commit_sync`) | `gateway/native_sql.rs` (`WalSyncPolicy`, `wal_append`, `replay_wal`) |
+| Snapshot engine | Ưu tiên `native_sql.tables.manifest` + snapshot bincode từng bảng; fallback `native_sql.snap` legacy rồi replay delta WAL | `gateway/native_sql.rs` (`load_snapshot`, `replay_wal`) |
 | WAL nhị phân + segment | Records + CRC32, rotation | `storage/wal.rs` |
 | MVCC | Transactions, snapshots (storage engine path) | `storage/transaction.rs` |
+| MVCC table store | MVCC store dùng trực tiếp bởi native gateway | `htap/mod.rs`, `htap/mvcc_store.rs` |
+| MVCC transaction manager | Quản lý transaction, commit timestamp, session context | `mvcc/tx_manager.rs` |
+| MVCC visibility | Snapshot và kiểm tra visibility theo isolation | `mvcc/visibility.rs` |
 | Trang / heap | Page format, serialization | `storage/page.rs` |
 | Buffer / cache | W-TinyLFU & biến thể concurrent | `storage/cache.rs` |
 | WAL Linux io_uring | Queue async append (Linux) | `storage/uring_wal.rs` |
 | Snapshot incremental | Dirty tracking, CRC | `storage/snapshot.rs` |
 | Replication streaming | Wal sender/receiver abstraction | `storage/wal_streaming.rs` |
+
+## 1.1. HTAP
+
+| Chủ đề | Thuật toán / cấu trúc | Vị trí code |
+|--------|-----------------------|-------------|
+| Column segment | Lưu trữ và quét segment dạng cột | `htap/column_segment.rs` |
+| Row segment | Lưu trữ segment dạng hàng cho OLTP | `htap/row_segment.rs` |
+| Columnizer | Chuyển dữ liệu hàng sang segment cột | `htap/columnizer.rs` |
+| HTAP planner | Chọn đường quét và physical plan | `htap/planner.rs` |
+| Spill | Spill dữ liệu trung gian ra disk | `htap/spill.rs` |
+| PITR | Archive/replay WAL và khôi phục theo thời điểm | `htap/pitr.rs` |
+| Certification | Kiểm tra tính đúng đắn của HTAP engine | `htap/certify.rs` |
 
 ---
 
@@ -35,6 +50,11 @@ Bản kê theo **crate `qm_engine`**, trỏ tới file triển khai chính. Đ�
 | Sharded HNSW / inverted | Shard theo khóa | `index/sharded.rs` |
 | Mmap vector store | Vector cố định chiều trên mmap | `index/mmap_store.rs` |
 | WAL inverted | Bảo đảm FTS index có log | `index/wal_inverted.rs` |
+| Inverted catalog | Catalog cho inverted index | `index/inverted_catalog.rs` |
+| JSON path catalog | Catalog chỉ mục JSON path | `index/json_path_catalog.rs` |
+| Trigram catalog | Catalog chỉ mục trigram | `index/trigram_catalog.rs` |
+| Vector HNSW catalog | Catalog metadata cho vector HNSW | `index/vector_hnsw_catalog.rs` |
+| Search checkpoint | Checkpoint tiến trình search/index | `index/search_checkpoint.rs` |
 
 ---
 
@@ -57,7 +77,7 @@ Bản kê theo **crate `qm_engine`**, trỏ tới file triển khai chính. Đ�
 | Chủ đề | Vị trí code |
 |--------|-------------|
 | SQL AST / visitor | `parser/query.rs`, `sqlparser` |
-| Dispatch native vs phase2 | `parser/dispatcher.rs` |
+| Engine dispatch | Dispatcher chọn `NativeEngine`, `VectorEngine`, `HybridEngine`, hoặc `StorageEngine` | `parser/dispatcher.rs` |
 | Adaptive optimizer | `optimizer/adaptive.rs`, `optimizer/rules.rs` |
 
 ---
@@ -85,7 +105,7 @@ Bản kê theo **crate `qm_engine`**, trỏ tới file triển khai chính. Đ�
 
 ---
 
-## 7. Cluster & phân tán (v6.2.0)
+## 7. Cluster & phân tán (v6.2.x)
 
 | Chủ đề | Thuật toán / kỹ thuật | Vị trí code |
 |--------|----------------------|-------------|
@@ -125,6 +145,8 @@ See [ENTERPRISE_HA_GUIDE.md](ENTERPRISE_HA_GUIDE.md).
 | Restore | `backup/restore.rs` |
 | Encrypt (AES-GCM) | `backup/encrypt.rs` |
 | Verify / diff snapshot | `backup/verify.rs`, `backup/snapshot_diff.rs` |
+| Backup prediction / Python bridge | Ước lượng backup và tích hợp PyO3 | `backup/predict.rs`, `backup/pyo3.rs` |
+| PostgreSQL compatibility | Hooks tương thích PostgreSQL | `backup/pg_compat.rs` |
 | Postgres-compatible pg backup hooks (nếu có) | trong module `backup/` |
 
 ---
@@ -134,16 +156,14 @@ See [ENTERPRISE_HA_GUIDE.md](ENTERPRISE_HA_GUIDE.md).
 | Miền | File gợi ý |
 |------|------------|
 | PG protocol & OID | `gateway/protocol.rs`, `gateway/connection.rs` |
-| Native SQL FTS gateway | `gateway/fts.rs` |
 | SCRAM | `gateway/scram.rs`, `gateway/auth.rs` |
-| CDC / tiering / audit | `gateway/cdc.rs`, `gateway/tiering.rs`, `gateway/audit.rs` |
-| Reranker | `gateway/reranker.rs` |
+| Gateway modules hiện có | `gateway/auth.rs`, `gateway/cancel_registry.rs`, `gateway/connection.rs`, `gateway/native_sql.rs`, `gateway/pg_tls.rs`, `gateway/protocol.rs`, `gateway/scram.rs`, `gateway/server.rs`, `gateway/session_pool.rs`, `gateway/stream.rs`, `gateway/table_store.rs` |
 
 ---
 
 ## 11. Chuẩn dựng (release SIMD)
 
-Rustflags theo triple (ví dụ Linux x86-64-v3, Linux ARM Neoverse, macOS `target-cpu=native`): xem `qm_engine/.cargo/config.toml`.
+Rustflags theo triple (ví dụ Linux x86-64-v3, Linux ARM Neoverse, macOS `target-cpu=native`): xem `.cargo/config.toml.example`.
 
 ---
 
