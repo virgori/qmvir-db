@@ -2,7 +2,7 @@
 
 <div align="center">
 
-[![License: Proprietary](https://img.shields.io/badge/License-Proprietary-red.svg)](LICENSE)
+[![License: Source Available](https://img.shields.io/badge/License-Source%20Available-red.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.75+-orange.svg)](https://www.rust-lang.org)
 [![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20Windows-blue.svg)]()
 
@@ -208,7 +208,7 @@ QM/
 
 ## License
 
-QMvir is distributed under the proprietary license in [LICENSE](LICENSE). See that file for usage and distribution terms.
+QMvir is distributed under the VIRGORI Source Available License in [LICENSE](LICENSE). Non-production evaluation, testing, research, and internal experimentation are allowed; commercial production use requires a separate written agreement.
 
 ---
 

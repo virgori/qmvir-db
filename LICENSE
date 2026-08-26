@@ -1,70 +1,111 @@
-# QMvir Database — Proprietary Software License Agreements
+# VIRGORI Source Available License
 
-**Copyright (c) 2025-2026 VIRGORI LAB (dev@virgori.com). All Rights Reserved.**
+**Copyright (c) 2025-2026 VIRGORI LAB (dev@virgori.com). All rights reserved.**
 
-## Table of Contents
+This license governs the QMvir Database software, including source code, binaries, documentation, build scripts, and related materials distributed by VIRGORI LAB (the "Software").
 
-1. [LICENSE GRANT](#1-license-grant)
-2. [PROHIBITED USES & RESTRICTIONS](#2-prohibited-uses--restrictions)
-3. [BINARY DISTRIBUTION](#3-binary-distribution)
-4. [DISCLAIMER OF WARRANTIES](#4-disclaimer-of-warranties)
-5. [LIMITATION OF LIABILITY](#5-limitation-of-liability)
-6. [TERMINATION](#6-termination)
-7. [GOVERNING LAW](#7-governing-law)
+This is a source-available commercial license. It is not an open-source license.
 
----
+## 1. Definitions
 
-## 1. LICENSE GRANT
+"Licensor" means VIRGORI LAB.
 
-Subject to the terms and conditions of this Agreement, **VIRGORI LAB** hereby grants you a **limited, non-exclusive, non-transferable, and revocable** license to install and use the QMvir Database ("Software") solely in machine-readable, compiled binary form for your internal business operations.
+"You" means any individual or legal entity accessing, copying, building, modifying, or using the Software.
 
-This Software is licensed, not sold, and VIRGORI LAB retains all ownership and intellectual property rights.
+"Production Use" means use of the Software to run, support, process, store, serve, or manage real customer, business, organizational, revenue-generating, or mission-critical workloads.
 
-## 2. PROHIBITED USES & RESTRICTIONS
+"Non-Production Use" means development, testing, evaluation, benchmarking, security review, research, education, proof-of-concept work, and internal experimentation that does not process or serve Production Use workloads.
 
-To ensure the integrity of the Software, you expressly agree **NOT** to:
+"Commercial Offering" means offering the Software, or functionality substantially derived from the Software, to third parties as a hosted service, managed service, database-as-a-service, platform feature, packaged product, support product, consulting deliverable, or other commercial product or service.
 
-### Derivatives
-- Copy, modify, adapt, or create derivative works of the source code or any part of the Software without prior explicit written authorization.
+## 2. License Grant
 
-### Commercialization
-- Sublicense, rent, lease, sell, or distribute the Software to any third party or use it as part of a service bureau or provider arrangement.
+Subject to this license, Licensor grants You a limited, worldwide, non-exclusive, non-transferable, revocable, royalty-free license to:
 
-### Reverse Engineering
-- Reverse-engineer, decompile, or disassemble the Software, or otherwise attempt to derive the source code, except to the extent that such activity is expressly permitted by applicable law.
+- view, download, and inspect the source code;
+- build the Software from source;
+- run the Software for Non-Production Use;
+- modify the Software for Non-Production Use;
+- benchmark, evaluate, test, and perform security research on the Software;
+- share feedback, issues, patches, and vulnerability reports with Licensor.
 
-### Branding
-- Alter, obscure, or remove any copyright notices, trademarks, or proprietary legends contained within or on the Software.
+## 3. Commercial and Production Use
 
-## 3. BINARY DISTRIBUTION
+Commercial Production Use requires a separate written commercial license or agreement with Licensor.
 
-Pre-compiled binaries are provided for operational convenience. While you may download and deploy these binaries internally, any form of redistribution—whether for commercial or non-commercial purposes—is strictly prohibited without express written consent from VIRGORI LAB.
+Without a separate written agreement, You may not use the Software for:
 
-## 4. DISCLAIMER OF WARRANTIES
+- Production Use in a commercial environment;
+- a Commercial Offering;
+- paid hosting, managed database service, SaaS, PaaS, or cloud service;
+- resale, sublicensing, rental, leasing, or commercial redistribution;
+- use by or for a third party as part of paid consulting, outsourcing, or service bureau work.
 
-**THE SOFTWARE IS PROVIDED "AS IS" AND "WITH ALL FAULTS."** TO THE MAXIMUM EXTENT PERMITTED BY LAW, VIRGORI LAB DISCLAIMS ALL WARRANTIES, WHETHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE IMPLIED WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE, AND NON-INFRINGEMENT.
+Internal Non-Production Use by a commercial organization is allowed under Section 2.
 
-NO ADVICE OR INFORMATION, WHETHER ORAL OR WRITTEN, SHALL CREATE ANY WARRANTY NOT EXPRESSLY STATED HEREIN.
+## 4. Redistribution Restrictions
 
-## 5. LIMITATION OF LIABILITY
+You may not redistribute the Software, modified versions of the Software, or compiled binaries of the Software to any third party without prior written permission from Licensor.
 
-IN NO EVENT SHALL VIRGORI LAB OR ITS CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, OR CONSEQUENTIAL DAMAGES (INCLUDING LOSS OF PROFITS, DATA, OR BUSINESS INTERRUPTION) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+You may not publish, mirror, package, or make available public builds, container images, package-manager releases, hosted installers, or source archives derived from the Software without prior written permission from Licensor.
 
-## 6. TERMINATION
+## 5. Modifications
 
-This License is effective until terminated. Your rights under this License will terminate automatically and without notice if you fail to comply with any term(s). Upon termination, you shall cease all use of the Software and destroy all copies, full or partial, in your possession.
+You may create and use modifications for Non-Production Use.
 
-## 7. GOVERNING LAW
+You may submit patches, issues, or pull requests to Licensor. Unless otherwise agreed in writing, any contribution You submit to Licensor may be used, modified, relicensed, sublicensed, and distributed by Licensor as part of the Software or related products.
 
-This Agreement shall be governed by and construed in accordance with the laws of the jurisdiction where the copyright holder is established, without regard to conflict of law principles.
+You retain ownership of Your independent work, but this license does not grant You any ownership interest in the Software or Licensor's trademarks, names, branding, or intellectual property.
 
----
+## 6. Reverse Engineering and Circumvention
 
-## Enterprise Licensing
+You may not reverse engineer, decompile, disassemble, remove license checks from, bypass usage controls in, or otherwise attempt to circumvent technical or commercial restrictions in the Software, except to the extent such restriction is prohibited by applicable law.
 
-**For enterprise licensing, partnerships, or custom agreements:**
+Security research and vulnerability testing are allowed for Non-Production Use, provided that You do not access third-party data, disrupt third-party systems, or publicly disclose exploitable issues before giving Licensor a reasonable opportunity to remediate them.
 
-- **Email:** [dev@virgori.com](mailto:dev@virgori.com)
-- **Official Repository:** [github.com/virgori/qmvir](https://github.com/virgori/qmvir)
+## 7. Benchmarking and Public Claims
 
----
+You may run benchmarks for Non-Production Use.
+
+You may not publish benchmark results, comparative performance claims, security claims, or production-readiness claims about the Software without clearly identifying the exact Software version, commit, configuration, hardware, workload, and methodology used.
+
+Licensor does not endorse third-party benchmark results unless expressly stated in writing.
+
+## 8. Notices and Branding
+
+You may not remove, obscure, or alter copyright notices, license notices, proprietary legends, trademarks, or attribution notices included with the Software.
+
+This license does not grant permission to use the names "VIRGORI", "VIRGORI LAB", "QMvir", or any related logo or mark except as necessary to identify the Software accurately.
+
+## 9. Third-Party Software
+
+Third-party dependencies included with or used by the Software remain subject to their own license terms. This license applies only to the Software owned or licensable by Licensor.
+
+## 10. No Warranty
+
+THE SOFTWARE IS PROVIDED "AS IS" AND "WITH ALL FAULTS." TO THE MAXIMUM EXTENT PERMITTED BY LAW, LICENSOR DISCLAIMS ALL WARRANTIES, WHETHER EXPRESS, IMPLIED, STATUTORY, OR OTHERWISE, INCLUDING WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE, TITLE, NON-INFRINGEMENT, SECURITY, AVAILABILITY, AND ERROR-FREE OPERATION.
+
+## 11. Limitation of Liability
+
+TO THE MAXIMUM EXTENT PERMITTED BY LAW, LICENSOR AND ITS CONTRIBUTORS WILL NOT BE LIABLE FOR ANY INDIRECT, INCIDENTAL, SPECIAL, CONSEQUENTIAL, EXEMPLARY, OR PUNITIVE DAMAGES, OR FOR LOSS OF PROFITS, REVENUE, GOODWILL, DATA, BUSINESS INTERRUPTION, OR SYSTEM FAILURE, ARISING FROM OR RELATED TO THE SOFTWARE OR THIS LICENSE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGES.
+
+LICENSOR'S TOTAL LIABILITY FOR ANY CLAIM ARISING FROM OR RELATED TO THE SOFTWARE OR THIS LICENSE WILL NOT EXCEED USD $100.
+
+## 12. Termination
+
+This license is effective until terminated.
+
+Your rights under this license terminate automatically if You violate any term of this license. Upon termination, You must stop using the Software and delete all copies in Your possession or control, including modified versions and compiled binaries.
+
+Sections that by their nature should survive termination will survive, including ownership, restrictions, warranty disclaimers, limitation of liability, and governing law.
+
+## 13. Governing Law
+
+This license is governed by the laws of the jurisdiction where Licensor is established, without regard to conflict-of-law rules.
+
+## 14. Commercial Licensing
+
+For Production Use, enterprise licensing, partnerships, redistribution rights, or custom agreements, contact:
+
+- Email: [dev@virgori.com](mailto:dev@virgori.com)
+- Official repository: [github.com/virgori/qmvir-db](https://github.com/virgori/qmvir-db)
