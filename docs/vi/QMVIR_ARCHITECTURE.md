@@ -1,7 +1,7 @@
 # QMvir / QM Engine — Kiến trúc hiện tại (Rust `qm_engine`)
 
 **Phạm vi:** crate `qm_engine/` (PostgreSQL wire protocol + `NativeSqlEngine`)  
-**Phiên bản:** **6.2.8** - Production Multi-DC Enterprise Certified  
+**Phiên bản:** **6.2.8** - Rust-first release surface  
 **Đồng bộ code:** `qm_engine/Cargo.toml`, module tree trong `qm_engine/src/lib.rs`  
 **Đọc kèm:** [QMVIR_ALGORITHMS.md](QMVIR_ALGORITHMS.md) · [Basic Usage](../en/BASIC_USAGE.md) · [ENTERPRISE_HA_GUIDE.md](ENTERPRISE_HA_GUIDE.md)
 
@@ -14,7 +14,7 @@ QMvir là một **Rust core** phục vụ:
 - Gateway **PostgreSQL wire protocol v3** (tương thích `psql`, JDBC, v.v.).
 - Thực thi SQL qua **`NativeSqlEngine`** — engine đơn khối, tối ưu scan/agg/join/index trong process.
 - **FTS + vector (HNSW)** + **OLAP-style** truy vấn trên cùng luồng dữ liệu native.
-- **Ảnh chụp (snapshot) + WAL dạng văn bản** cho `data_dir` của native engine; module **`storage/`** chứa thêm WAL nhị phân/MVCC dùng cho API Python / lớp lưu trữ phụ trợ.
+- **Ảnh chụp (snapshot) + WAL dạng văn bản** cho `data_dir` của native engine; module **`storage/`** chứa thêm WAL nhị phân/MVCC cho lớp lưu trữ phụ trợ và hướng hợp nhất dài hạn.
 - **HTAP + MVCC READ COMMITTED** gắn trực tiếp vào `NativeSqlEngine`: transaction rõ ràng, autocommit DML qua transaction ngầm, row visibility và column segments.
 
 Điều QMvir **không** cam kết trong hot path hiện tại (xem chi tiết §6):
@@ -24,7 +24,7 @@ QMvir là một **Rust core** phục vụ:
 
 ---
 
-## 2. Biểu đồ luồng đang chạy (production-shaped)
+## 2. Biểu đồ luồng chính
 
 ```
                     ┌─────────────────────────────────────┐
@@ -58,18 +58,18 @@ QMvir là một **Rust core** phục vụ:
 
 | Thư mục | Trách nhiệm trong code thực tế |
 |--------|---------------------------------|
-| `gateway/` | TCP server PG, protocol, SCRAM; **`native_sql`** = hot path SQL; connection, fts, dsl, CDC hooks, rerank… |
+| `gateway/` | TCP server PG, protocol, SCRAM; **`native_sql`** = hot path SQL; connection, FTS/DSL hooks, CDC-oriented plumbing. |
 | `parser/` | `sqlparser` + dispatcher chọn nhánh native / hybrid. |
-| `executor/` | Toán tử vector hóa, batch, JIT, txn executor phụ trợ, hybrid lexical+vector. |
+| `executor/` | Toán tử vector hóa, batch, JIT-expression infrastructure, txn executor phụ trợ, hybrid lexical+vector. |
 | `storage/` | **StorageEngine** nhị phân + WAL có CRC + MVCC transaction + snapshot + buffer cache + **`io_uring`** (Linux) + WAL streaming - lớp lưu trữ song song; **không** thay thế WAL văn bản của `NativeSqlEngine`. |
 | `index/` | B+Tree (mmap page), auto index manager, Roaring, inverted (WAND/BMW), HNSW+PQ, concurrent HNSW, WAL inverted, mmap vector/graph. |
 | `htap/` | Runtime HTAP gắn vào `NativeSqlEngine`: `TransactionManager`, `TableMvccStore`, row/column segments, columnizer, planner, spill, PITR, isolation/certify. |
 | `mvcc/` | Transaction manager READ COMMITTED, visibility, row versions, lock manager, executor helper. |
 | `hub_engine/` | Coordinator / planner / point query / vector gate cho mô hình hub–satellite (Rust). |
-| `cluster/` | **Enterprise HA (v6.2):** shard ring, sync WAL replication, failover, fencing, meta Raft, 2PC, STONITH, witness, chaos battery — opt-in via `QM_CLUSTER_*` |
+| `cluster/` | Shard ring, sync WAL replication, failover, fencing, meta Raft, 2PC, STONITH, witness, chaos battery — opt-in via `QM_CLUSTER_*`; phải certify trong môi trường deploy thật trước khi claim production. |
 | `ipc/` | Ring buffer mmap + dispatcher (hub↔satellite); ít dùng khi mọi thứ in-process. |
 | `backup/` | Backup/restore/encrypt/snapshot diff/verify. |
-| `web/` | Axum: API, studio, WebSocket, dashboard. |
+| `web/` | Axum: local dashboard/API loopback (`qm_web`). |
 | `cli/` | Binary `qm`: start, sql, backup, bench, … |
 | `search/` | Synonym/search helpers. |
 | `procedures/` | PL/QM procedure catalog/runtime phụ trợ. |
@@ -79,7 +79,7 @@ QMvir là một **Rust core** phục vụ:
 | `metrics.rs` | Registry metric. |
 | `types.rs` | Kiểu dùng chung. |
 
-**Feature `python`:** `pyo3` expose gateway, storage, index, hub, IPC, cache, uring WAL, JIT, `PyNativeSqlEngine`. Build CLI thường dùng **`--no-default-features`** để tránh link Python.
+**Feature `python`:** `pyo3` expose một số API cho test/bridge. Build CLI/release mặc định dùng **`--no-default-features`** để giữ surface Rust-only.
 
 ---
 
@@ -94,7 +94,7 @@ QMvir là một **Rust core** phục vụ:
 ### 4.2 NativeSqlEngine (`gateway/native_sql.rs`)
 
 - **SoA / columnar** cache, dictionary encoding, SIMD equality scan (NEON / AVX2+), **Rayon** chunk song song.
-- **JOIN** nhiều dạng (hash/broadcast tùy benchmark path), **GROUP BY** parallel merge, **COPY** Parquet/CSV/binary (theo lộ trình code).
+- **JOIN** nhiều dạng (hash/broadcast tùy path), **GROUP BY** parallel merge, **COPY** Parquet import và `COPY FROM STDIN` qua wire protocol. CLI dump hỗ trợ SQL/CSV/JSONL/Parquet.
 - **Fast path** có thể dispatch sớm cho macro-benchmark / protocol nội bộ (ví dụ token `__QM_FAST_*` nếu có trong tree).
 - **IndexManager** gắn B+Tree / FTS / HNSW theo DDL.
 
@@ -151,10 +151,10 @@ Các audit lịch sử Python-era đã bị loại khỏi active tree; tài li�
 | Artifact | Mục đích |
 |----------|----------|
 | `qm` (CLI) | `cargo build -p qm_engine --release --no-default-features --bin qm` |
-| `qm_web` | HTTP dashboard / API |
-| `libqm_engine` | rlib + cdylib (Python) |
-| `scripts/sync_and_build_release_quizzman.sh` | Sync qua SSH và build Linux/Windows trên server `quizzman` |
-| `qm_engine/scripts/build_release.sh` | macOS binaries only (local); Linux/Windows via `sync_and_build_release_quizzman.sh` |
+| `qm_web` | Local loopback HTTP dashboard / API |
+| `libqm_engine` | rlib + cdylib, Python bridge khi bật feature `python` |
+| `.github/workflows/release-binaries.yml` | Build Linux/macOS/Windows binaries trên GitHub Actions, tránh Mac local quá tải |
+| `scripts/sync_and_build_release_quizzman.sh` | Helper tùy chọn: sync qua SSH và build trên server `quizzman` |
 
 ---
 
@@ -176,7 +176,7 @@ Cluster mode is **opt-in** (`QM_CLUSTER_ENABLE=1`). Single-node remains the defa
 | Layer | Modules | Purpose |
 |-------|---------|---------|
 | Transport | `cluster/transport.rs` | Inter-node TCP + TLS |
-| WAL replication | `cluster/wal_replication.rs`, `wal_buffer.rs` | RPO≈0 sync replicate, write quorum |
+| WAL replication | `cluster/wal_replication.rs`, `wal_buffer.rs` | Sync replication / write quorum; RPO claim cần validate bằng certify/soak |
 | Failover | `cluster/failover.rs`, `fencing.rs` | Auto promotion, epoch fencing |
 | Meta catalog | `cluster/meta_raft_network.rs` | Networked Raft quorum |
 | Distributed txn | `cluster/two_phase_commit.rs`, `pg_distributed.rs` | Cross-shard atomic batches |
@@ -186,17 +186,20 @@ Cluster mode is **opt-in** (`QM_CLUSTER_ENABLE=1`). Single-node remains the defa
 | Certification | `cluster/certify.rs`, `readiness.rs` | Tier scoring + CLI gates |
 | Chaos | `cluster/chaos_battery.rs` | In-process jepsen-style scenarios |
 
-**Certification tiers:** `community` → `enterprise-certified` → `production-multi-dc-full` → `jepsen-certified` (`qm cluster certify --chaos`).
+**Certification tiers:** `community` → `enterprise-certified` → `production-multi-dc-full` → `jepsen-certified` (`qm cluster certify --chaos`). Đây là framework chứng nhận trong code; mỗi deployment cần chạy gate/soak thật trước khi dùng trong claim thương mại.
 
 Full env vars, topology examples, and validation scripts: **[ENTERPRISE_HA_GUIDE.md](ENTERPRISE_HA_GUIDE.md)**.
 
 ---
 
-## 10. Lộ trình / phần “có code, wiring tùy ngữ cảnh”
+## 10. Công nghệ đột phá / chưa claim rộng
 
-- **Cluster** (`cluster/*`): production-ready at v6.2.x with certification gates; enable via `QM_CLUSTER_*` env.
+- **Cluster** (`cluster/*`): có code và certification gates; enable via `QM_CLUSTER_*`. Chỉ claim production cho môi trường đã pass certify/soak tương ứng.
 - **IPC** ring + dispatcher: phục vụ kiến trúc multi-process; mặc định single-process dùng `NativeSqlEngine` trực tiếp.
 - **`native_sql_v2_wip.rs`**: biến thể / thử nghiệm — không thay thế file production trừ khi merge có chủ đích.
+- **JIT native machine code:** hiện có JIT expression IR/cache và vectorized interpretation; phần native-code backend cần wiring/benchmark end-to-end trước khi claim.
+- **Adaptive indexing:** có observer/manager và hooks; policy tự động bật/tắt index là hướng tối ưu theo workload, chưa nên trình bày như tính năng production mặc định.
+- **CDC/streaming platform:** có hooks/WAL streaming modules; chưa claim như ingestion platform hoàn chỉnh nếu chưa có guide vận hành và test production riêng.
 
 ---
 
