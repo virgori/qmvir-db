@@ -1,7 +1,7 @@
 # QMvir — Danh mục thuật toán & kiến trúc dữ liệu
 
 **Phiên bản:** 6.2.8
-Bản kê theo **crate `qm_engine`**, trỏ tới file triển khai chính. Đọc cùng [QMVIR_ARCHITECTURE.md](QMVIR_ARCHITECTURE.md) · [BASIC_USAGE.md](BASIC_USAGE.md) · [ENTERPRISE_HA_GUIDE.md](ENTERPRISE_HA_GUIDE.md).
+Bản kê theo **crate `qm_engine`**, trỏ tới file triển khai chính. Đọc cùng [QMVIR_ARCHITECTURE.md](QMVIR_ARCHITECTURE.md) · [Basic Usage](../en/BASIC_USAGE.md) · [ENTERPRISE_HA_GUIDE.md](ENTERPRISE_HA_GUIDE.md).
 
 ---
 

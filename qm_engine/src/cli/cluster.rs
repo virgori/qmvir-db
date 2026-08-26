@@ -181,7 +181,7 @@ pub fn run_readiness() {
     println!("  • STONITH primary lease — QM_CLUSTER_STONITH=1");
     println!("  • WAL write quorum + durable catch-up");
     println!("  • PG BEGIN/COMMIT distributed txn — QM_CLUSTER_PG_DISTRIBUTED=1");
-    println!("\nFull guide: qm cluster guide  (docs/ENTERPRISE_HA_GUIDE_VI.md)");
+    println!("\nFull guide: qm cluster guide  (docs/vi/ENTERPRISE_HA_GUIDE.md)");
     println!("\nOptional hardening:");
     println!("  • Full mTLS client-auth between all nodes");
     println!("  • Cross-DC witness / region-aware routing");

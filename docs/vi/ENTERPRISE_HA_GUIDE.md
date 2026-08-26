@@ -218,13 +218,12 @@ Có thể publish khi:
 
 1. **Release Gate** pass trên `main`.
 2. **Bump version** — đồng bộ `qm_engine/Cargo.toml`. Không publish lại version đã có.
-3. **Build lại** binary/wheel từ `main` (artifact trong `build/release/` có thể cũ).
-4. **Tag** `vX.Y.Z` và push, hoặc:
+3. **Build binary trên GitHub Actions** từ `main`; không cần build release nặng trên Mac.
+4. **Tag** `vX.Y.Z` và push để chạy `.github/workflows/release-binaries.yml`, hoặc chạy workflow đó thủ công với input version.
 
 ```bash
-cp .env.example .env   # điền token
-bash scripts/publish_packages.sh --dry-run
-bash scripts/publish_packages.sh
+git tag vX.Y.Z
+git push origin vX.Y.Z
 ```
 
 **enterprise-certified** ship với env HA mặc định. **production-multi-dc-full** bật thêm khi deploy — không chặn publish binary.
@@ -263,4 +262,4 @@ bash scripts/publish_packages.sh
 
 - English: [ENTERPRISE_HA_GUIDE.md](./ENTERPRISE_HA_GUIDE.md)
 - CLI: `qm cluster guide --lang vi`
-- Hiệu năng: [QMVIR_PERFORMANCE_GUIDE_VI.md](./QMVIR_PERFORMANCE_GUIDE_VI.md)
+- HTAP: [HTAP_GUIDE.md](HTAP_GUIDE.md)

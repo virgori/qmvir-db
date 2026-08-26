@@ -1,5 +1,5 @@
-# Build bare qm binaries from the private source repo and publish ONLY to
-# virgori/qmvir-releases (no wheels, no npm package, no source tarballs).
+# Build bare qm binaries on GitHub-hosted runners and publish them as a
+# private GitHub Release on this repo. No local Mac release build is required.
 name: Release Binaries
 
 on:
@@ -81,7 +81,7 @@ jobs:
   publish-github:
     needs: build
     runs-on: ubuntu-22.04
-    name: publish / qmvir-releases
+    name: publish / qmvir-db release
     permissions:
       contents: write
 
@@ -96,7 +96,7 @@ jobs:
           fi
           [[ "$tag" == v* ]] || tag="v${tag}"
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
-          echo "Publishing $tag to virgori/qmvir-releases"
+          echo "Publishing $tag to this repository"
 
       - uses: actions/download-artifact@v4
         with:
@@ -109,11 +109,9 @@ jobs:
           echo "=== release assets ==="
           ls -lh release/
 
-      - name: Create release on qmvir-releases
+      - name: Create private repo release
         uses: softprops/action-gh-release@v2
         with:
-          repository: virgori/qmvir-releases
-          token: ${{ secrets.RELEASE_REPO_TOKEN || secrets.SOURCE_REPO_TOKEN }}
           tag_name: ${{ steps.ver.outputs.tag }}
           name: QMvir ${{ steps.ver.outputs.tag }}
           draft: false

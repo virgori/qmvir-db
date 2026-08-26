@@ -1,6 +1,6 @@
 # QMvir — Basic Usage Guide
 
-**Version:** 6.2.0  
+**Version:** 6.2.8  
 **Binary:** `qm` / `qmvir` (Rust, no Python runtime required)  
 **Protocol:** PostgreSQL wire v3 — `psql`, JDBC, any PG client  
 **Default port:** `55433`
@@ -9,25 +9,6 @@
 
 ## 1. Install
 
-### npm (recommended)
-
-```bash
-npm install -g qmvir
-qm --version    # qm 6.2.0
-```
-
-Postinstall downloads the native binary for your OS/arch from [GitHub releases](https://github.com/virgori/qmvir-releases).
-
-### Direct download
-
-```bash
-# Example: Linux x86_64
-curl -LO https://github.com/virgori/qmvir-releases/releases/download/v6.2.0/qm-linux-x86_64
-chmod +x qm-linux-x86_64 && sudo mv qm-linux-x86_64 /usr/local/bin/qm
-```
-
-Supported artifacts: `qm-macos-arm64`, `qm-macos-x86_64`, `qm-linux-x86_64`, `qm-linux-aarch64`, `qm-windows-x86_64.exe`, `qm-windows-aarch64.exe`.
-
 ### Build from source
 
 ```bash
@@ -35,6 +16,8 @@ cd qm_engine
 cargo build --release --no-default-features --bin qm
 ./target/release/qm --version
 ```
+
+Release binaries are built by GitHub Actions from the private source repo. Run `.github/workflows/release-binaries.yml` manually or push a `v*` tag to produce Linux, macOS, and Windows artifacts without compiling on the local Mac.
 
 ---
 
@@ -91,7 +74,7 @@ INSERT INTO docs VALUES (1, 'Rust database', 'QMvir hybrid engine');
 SELECT * FROM docs WHERE body @@ 'database';
 ```
 
-Hybrid lexical + vector search is available via SQL extensions and the JS SDK (`strategy: "hybrid"`).
+Hybrid lexical + vector search is available via SQL extensions.
 
 ---
 
@@ -106,7 +89,7 @@ SELECT id, distance(vec, '[0.01, 0.02, ...]') AS dist
 FROM items ORDER BY dist LIMIT 10;
 ```
 
-HNSW + optional product quantization — see [Algorithms](QMVIR_ALGORITHMS.md).
+HNSW + optional product quantization — see [Algorithms](../vi/QMVIR_ALGORITHMS.md).
 
 ---
 
@@ -132,21 +115,7 @@ qm --data-dir ./mydb start --admin-password secret
 
 ---
 
-## 8. JavaScript / TypeScript SDK
-
-```typescript
-import { QMClient } from "qmvir";
-
-const qm = new QMClient("http://localhost:8400", { apiKey: "your-key" });
-const rows = await qm.find("users", { where: { status: "active" }, limit: 10 });
-const hits = await qm.search("articles", "machine learning", { strategy: "hybrid", limit: 20 });
-```
-
-Install: `npm install qmvir@6.2.0`
-
----
-
-## 9. Useful CLI commands
+## 8. Useful CLI commands
 
 | Command | Purpose |
 |---------|---------|
@@ -163,7 +132,7 @@ Install: `npm install qmvir@6.2.0`
 
 ---
 
-## 10. Configuration highlights
+## 9. Configuration highlights
 
 | Variable | Effect |
 |----------|--------|
@@ -180,7 +149,7 @@ Cluster / HA variables: see [Enterprise HA Guide](ENTERPRISE_HA_GUIDE.md).
 
 | Topic | Document |
 |-------|----------|
-| Architecture | [QMVIR_ARCHITECTURE.md](QMVIR_ARCHITECTURE.md) |
-| Algorithms | [QMVIR_ALGORITHMS.md](QMVIR_ALGORITHMS.md) |
+| Architecture | [QMVIR_ARCHITECTURE.md](../vi/QMVIR_ARCHITECTURE.md) |
+| Algorithms | [QMVIR_ALGORITHMS.md](../vi/QMVIR_ALGORITHMS.md) |
 | Enterprise HA / multi-DC | [ENTERPRISE_HA_GUIDE.md](ENTERPRISE_HA_GUIDE.md) |
-| Enterprise (Tiếng Việt) | [ENTERPRISE_HA_GUIDE_VI.md](ENTERPRISE_HA_GUIDE_VI.md) |
+| Enterprise (Tiếng Việt) | [ENTERPRISE_HA_GUIDE.md](../vi/ENTERPRISE_HA_GUIDE.md) |

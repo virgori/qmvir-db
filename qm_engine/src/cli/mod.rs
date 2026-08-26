@@ -61,7 +61,7 @@ use std::path::PathBuf;
         CLUSTER HA (opt-in via QM_CLUSTER_* env):\n  \
           qm cluster status | health | readiness | certify\n  \
           qm cluster guide                       # deploy checklist\n\n\
-        Docs: https://github.com/virgori/qmvir-releases",
+        Docs: docs/README.md",
     after_help = "EXAMPLES:\n  \
           qm start --admin-password mypass           # Daemon (default)\n  \
           qm start --foreground --admin-password pw  # Foreground mode\n  \

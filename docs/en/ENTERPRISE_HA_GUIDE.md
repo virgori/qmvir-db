@@ -293,13 +293,12 @@ Enterprise HA code can ship in a release when:
 
 1. **Release Gate** passes on `main` (`cargo test --no-default-features`, pytest, HA gate).
 2. **Version bump** — sync semver in `qm_engine/Cargo.toml`. Do not republish an existing release version.
-3. **Rebuild** binaries/wheels from current `main` (local `build/release/` artifacts may be stale).
-4. **Tag** `vX.Y.Z` and push — triggers `.github/workflows/release.yml`, or use:
+3. **Build binaries on GitHub Actions** from current `main`; avoid local Mac release builds.
+4. **Tag** `vX.Y.Z` and push — triggers `.github/workflows/release-binaries.yml`, or run that workflow manually with the version input.
 
 ```bash
-cp .env.example .env   # fill github_token, npmjs_token, pypi_token
-bash scripts/publish_packages.sh --dry-run
-bash scripts/publish_packages.sh
+git tag vX.Y.Z
+git push origin vX.Y.Z
 ```
 
 **enterprise-certified** features ship with default HA env vars. **production-multi-dc-full** is opt-in at deploy time and does not block binary publish.
@@ -339,6 +338,6 @@ bash scripts/publish_packages.sh
 
 ## See also
 
-- Vietnamese guide: [ENTERPRISE_HA_GUIDE_VI.md](./ENTERPRISE_HA_GUIDE_VI.md)
+- Vietnamese guide: [ENTERPRISE_HA_GUIDE.md](../vi/ENTERPRISE_HA_GUIDE.md)
 - Built-in CLI: `qm cluster guide --lang vi`
-- Performance tuning: [QMVIR_PERFORMANCE_GUIDE_VI.md](./QMVIR_PERFORMANCE_GUIDE_VI.md)
+- HTAP guide: [HTAP_GUIDE.md](HTAP_GUIDE.md)

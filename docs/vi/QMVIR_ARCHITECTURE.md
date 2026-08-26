@@ -3,7 +3,7 @@
 **Phạm vi:** crate `qm_engine/` (PostgreSQL wire protocol + `NativeSqlEngine`)  
 **Phiên bản:** **6.2.8** - Production Multi-DC Enterprise Certified  
 **Đồng bộ code:** `qm_engine/Cargo.toml`, module tree trong `qm_engine/src/lib.rs`  
-**Đọc kèm:** [QMVIR_ALGORITHMS.md](QMVIR_ALGORITHMS.md) · [BASIC_USAGE.md](BASIC_USAGE.md) · [ENTERPRISE_HA_GUIDE.md](ENTERPRISE_HA_GUIDE.md)
+**Đọc kèm:** [QMVIR_ALGORITHMS.md](QMVIR_ALGORITHMS.md) · [Basic Usage](../en/BASIC_USAGE.md) · [ENTERPRISE_HA_GUIDE.md](ENTERPRISE_HA_GUIDE.md)
 
 ---
 
@@ -79,7 +79,7 @@ QMvir là một **Rust core** phục vụ:
 | `metrics.rs` | Registry metric. |
 | `types.rs` | Kiểu dùng chung. |
 
-**Feature `python`:** `pyo3` expose gateway, storage, index, hub, IPC, cache, uring WAL, JIT, `PyNativeSqlEngine`. Build CLI/npm thường dùng **`--no-default-features`** để tránh link Python.
+**Feature `python`:** `pyo3` expose gateway, storage, index, hub, IPC, cache, uring WAL, JIT, `PyNativeSqlEngine`. Build CLI thường dùng **`--no-default-features`** để tránh link Python.
 
 ---
 
@@ -142,7 +142,7 @@ Khi document cho user/operator: nêu rõ **giới hạn isolation** nếu worklo
 - Rate limit / lockout (xem code auth).
 - Backup **AES-GCM**; mật khẩu admin qua CLI/env.
 
-Chi tiết lịch sử rà soát: [CODEBASE_AUDIT_2026_04_01.md](_archive/legacy/CODEBASE_AUDIT_2026_04_01.md) (Python + Rust lẫn context cũ — đối chiếu với Rust path hiện tại).
+Các audit lịch sử Python-era đã bị loại khỏi active tree; tài liệu này ưu tiên trạng thái Rust hiện tại.
 
 ---
 
@@ -205,10 +205,9 @@ Full env vars, topology examples, and validation scripts: **[ENTERPRISE_HA_GUIDE
 | Doc | Nội dung |
 |-----|----------|
 | [QMVIR_ALGORITHMS.md](QMVIR_ALGORITHMS.md) | Bảng thuật toán & module |
-| [BASIC_USAGE.md](BASIC_USAGE.md) | Hướng dẫn cơ bản |
+| [BASIC_USAGE.md](../en/BASIC_USAGE.md) | Hướng dẫn cơ bản |
 | [ENTERPRISE_HA_GUIDE.md](ENTERPRISE_HA_GUIDE.md) | HA enterprise / multi-DC |
 | [HTAP_GUIDE.md](HTAP_GUIDE.md) | HTAP, MVCC, planner, PITR |
-| [_archive/legacy/](_archive/legacy/) | Tài liệu lịch sử (không duy trì) |
 
 ---
 

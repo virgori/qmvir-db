@@ -1,21 +1,36 @@
 # QMvir Documentation (v6.2.8)
 
-Canonical documentation for **QMvir 6.2.8** — maintained with the Rust `qm_engine` release.
+Canonical documentation for **QMvir 6.2.8**. Guides are grouped by language, with maintainer-only handoff notes in `internal/`.
 
-## Primary guides
+## English
 
-| # | Document | Description |
-|---|----------|-------------|
-| 1 | [QMVIR_ARCHITECTURE.md](QMVIR_ARCHITECTURE.md) | System architecture — gateway, engine, storage, cluster |
-| 2 | [QMVIR_ALGORITHMS.md](QMVIR_ALGORITHMS.md) | Algorithms & data structures (with source file map) |
-| 3 | [BASIC_USAGE.md](BASIC_USAGE.md) | Install, quick start, SQL, search, vector, backup, CLI |
-| 4 | [ENTERPRISE_HA_GUIDE.md](ENTERPRISE_HA_GUIDE.md) | Enterprise HA, multi-DC, certification, deployment |
-| 4b | [ENTERPRISE_HA_GUIDE_VI.md](ENTERPRISE_HA_GUIDE_VI.md) | Hướng dẫn Enterprise HA (Tiếng Việt) |
+| Document | Description |
+|----------|-------------|
+| [Basic Usage](en/BASIC_USAGE.md) | Install, quick start, SQL, search, vector, backup, CLI |
+| [Enterprise HA](en/ENTERPRISE_HA_GUIDE.md) | Multi-DC deployment, certification, env vars |
+| [HTAP](en/HTAP_GUIDE.md) | HTAP, MVCC, planner, PITR |
 
-## Quick links
+## Vietnamese
 
-- **Binaries:** [github.com/virgori/qmvir-releases](https://github.com/virgori/qmvir-releases/releases/tag/v6.2.8)
-- **Certify HA:** `qm cluster certify` (enterprise) · `qm cluster certify --chaos` (jepsen tier)
-- **Build Linux/Windows releases on quizzman:** `bash scripts/sync_and_build_release_quizzman.sh`
+| Tài liệu | Nội dung |
+|----------|----------|
+| [Kiến trúc](vi/QMVIR_ARCHITECTURE.md) | Gateway, engine, storage, enterprise cluster |
+| [Thuật toán](vi/QMVIR_ALGORITHMS.md) | Data structures & algorithms with source map |
+| [Enterprise HA](vi/ENTERPRISE_HA_GUIDE.md) | Hướng dẫn HA / multi-DC tiếng Việt |
+| [HTAP](vi/HTAP_GUIDE.md) | HTAP / MVCC / PITR tiếng Việt |
+| [Build & Distribution](vi/BUILD_GUIDE.md) | Build, release, GitHub Actions, quizzman helper |
 
-Historical audits and superseded Python-era docs were removed from the active tree. Use the primary guides above for current behavior.
+## Internal
+
+| Document | Purpose |
+|----------|---------|
+| [Bench Optimization Handover](internal/HANDOVER_BENCH_OPT.md) | Maintainer handover notes for benchmark optimization |
+
+## Quick Links
+
+- **Source repo:** private `virgori/qmvir-db`
+- **GitHub release build:** `.github/workflows/release-binaries.yml`
+- **Certify HA:** `qm cluster certify` · `qm cluster certify --chaos`
+- **Remote build helper:** `bash scripts/sync_and_build_release_quizzman.sh`
+
+Historical audits and superseded Python-era docs were removed from the active tree.

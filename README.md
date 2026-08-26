@@ -2,7 +2,6 @@
 
 <div align="center">
 
-[![npm version](https://badge.fury.io/js/qmvir.svg)](https://badge.fury.io/js/qmvir)
 [![License: Proprietary](https://img.shields.io/badge/License-Proprietary-red.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.75+-orange.svg)](https://www.rust-lang.org)
 [![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20Windows-blue.svg)]()
@@ -39,13 +38,7 @@ QMvir is a **hybrid database engine** (Rust) combining transactional SQL, analyt
 
 ### Installation
 
-#### Option 1: Download Binary
-```bash
-curl -fsSL https://raw.githubusercontent.com/virgori/qmvir-releases/main/install.sh | bash
-qm --version
-```
-
-#### Option 2: Build from Source
+#### Build from Source
 ```bash
 cargo build --manifest-path qm_engine/Cargo.toml --release --no-default-features
 ./qm_engine/target/release/qm --data-dir ./data start --admin-password your-secure-password
@@ -153,19 +146,19 @@ QMvir uses a **single-engine hybrid architecture** that eliminates data movement
 
 | # | Guide | Description |
 |---|--------|-------------|
-| 1 | [Architecture](docs/QMVIR_ARCHITECTURE.md) | Gateway, engine, storage, enterprise cluster |
-| 2 | [Algorithms](docs/QMVIR_ALGORITHMS.md) | Data structures & algorithms (with source map) |
-| 3 | [Basic usage](docs/BASIC_USAGE.md) | Install, SQL, search, vector, backup, CLI |
-| 4 | [Enterprise HA](docs/ENTERPRISE_HA_GUIDE.md) | Multi-DC deployment, certification, env vars |
+| 1 | [Architecture](docs/vi/QMVIR_ARCHITECTURE.md) | Gateway, engine, storage, enterprise cluster |
+| 2 | [Algorithms](docs/vi/QMVIR_ALGORITHMS.md) | Data structures & algorithms (with source map) |
+| 3 | [Basic usage](docs/en/BASIC_USAGE.md) | Install, SQL, search, vector, backup, CLI |
+| 4 | [Enterprise HA](docs/en/ENTERPRISE_HA_GUIDE.md) | Multi-DC deployment, certification, env vars |
 
-**Index:** [docs/README.md](docs/README.md) · **Tiếng Việt HA:** [docs/ENTERPRISE_HA_GUIDE_VI.md](docs/ENTERPRISE_HA_GUIDE_VI.md)
+**Index:** [docs/README.md](docs/README.md) · **Tiếng Việt:** [docs/vi/](docs/vi/)
 
 Historical Python-era reports and old audits were removed from the active tree.
 
 ### Links
 
 - **Source:** private repo `virgori/qmvir-db` (collaborators only)
-- **Releases:** [virgori/qmvir-releases v6.2.8](https://github.com/virgori/qmvir-releases/releases/tag/v6.2.8)
+- **Source:** private repo `virgori/qmvir-db` (collaborators only)
 
 ---
 
@@ -201,7 +194,10 @@ QM/
 │   │   ├── executor/    # Query execution & SIMD
 │   │   └── engines/     # Specialized engines
 │   └── Cargo.toml
-├── docs/               # Current operator and architecture docs
+├── docs/               # Current docs grouped by language
+│   ├── en/             # English guides
+│   ├── vi/             # Vietnamese guides
+│   └── internal/       # Maintainer handover notes
 ├── scripts/            # Release, HA, and remote build helpers
 └── tests/              # Small PyO3 smoke suite
 ```
@@ -211,7 +207,7 @@ QM/
 ## 🤝 Community & Support
 
 - **Issues / discussions:** contact maintainers (source repo is private)
-- **Documentation**: [Full documentation site](https://qmvir.readthedocs.io/)
+- **Documentation**: [docs/README.md](docs/README.md)
 
 ---
 
@@ -223,7 +219,7 @@ QMvir is distributed under the proprietary license in [LICENSE](LICENSE). See th
 
 <div align="center">
 
-**[⭐ Star releases](https://github.com/virgori/qmvir-releases) • [📖 Read the docs](https://qmvir.readthedocs.io/) • [🚀 Get started now](#-quick-start)**
+**[📖 Read the docs](docs/README.md) • [🚀 Get started now](#-quick-start)**
 
 Made with ❤️ by the QMvir Team
 

@@ -126,15 +126,15 @@ VALIDATION (before release / deploy)
 PUBLISH / RELEASE
   • Bump version in qm_engine/Cargo.toml
   • CI Release Gate must pass on main
-  • Rebuild binaries, tag vX.Y.Z, then:
-      bash scripts/publish_packages.sh --dry-run
-      bash scripts/publish_packages.sh
+  • Tag vX.Y.Z and push; GitHub Actions builds release binaries:
+      git tag vX.Y.Z
+      git push origin vX.Y.Z
   • enterprise-certified ships with default HA env; production-multi-dc-full
     features are opt-in at deploy time — they do not block binary publish.
 
 DOCS
-  docs/ENTERPRISE_HA_GUIDE.md
-  docs/ENTERPRISE_HA_GUIDE_VI.md
+  docs/en/ENTERPRISE_HA_GUIDE.md
+  docs/vi/ENTERPRISE_HA_GUIDE.md
 
 See also: qm guide notes | qm guide cli
 ",
@@ -221,14 +221,15 @@ KIEM TRA TRUOC DEPLOY / RELEASE
 PUBLISH
   • Bump version dong bo trong qm_engine/Cargo.toml
   • CI Release Gate pass tren main
-  • Build binary moi, tag vX.Y.Z, publish:
-      bash scripts/publish_packages.sh --dry-run
+  • Tag vX.Y.Z va push; GitHub Actions build binary release:
+      git tag vX.Y.Z
+      git push origin vX.Y.Z
   • enterprise-certified ship voi env HA mac dinh; production-multi-dc-full
     bat them khi deploy — khong chan publish binary.
 
 TAI LIEU DAY DU
-  docs/ENTERPRISE_HA_GUIDE_VI.md
-  docs/ENTERPRISE_HA_GUIDE.md
+  docs/vi/ENTERPRISE_HA_GUIDE.md
+  docs/en/ENTERPRISE_HA_GUIDE.md
 ",
         env!("CARGO_PKG_VERSION")
     )

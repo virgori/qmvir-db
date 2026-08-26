@@ -65,7 +65,7 @@ TOPICS
   notes        Important caveats and upgrade tips
 
 QUICK START
-  npm install -g qmvir          # or download qm-* binary from GitHub releases
+  cargo build --release --no-default-features --bin qm
   qm start --admin-password pw    # daemon on 127.0.0.1:55433
   psql -h 127.0.0.1 -p 55433 -U admin
   qm --data-dir ./data sql \"SELECT 1\"
@@ -80,10 +80,9 @@ ESSENTIAL COMMANDS
   qm guide cluster              # HA / multi-DC deploy
   qm guide htap                 # HTAP / MVCC / PITR
 
-Full docs: USAGE_GUIDE_EN.md in the source repo
-HTAP: docs/HTAP_GUIDE.md | docs/HTAP_GUIDE_VI.md
-Performance: docs/QMVIR_PERFORMANCE_GUIDE_VI.md
-HA: docs/ENTERPRISE_HA_GUIDE.md | docs/ENTERPRISE_HA_GUIDE_VI.md
+Full docs: docs/README.md
+HTAP: docs/en/HTAP_GUIDE.md | docs/vi/HTAP_GUIDE.md
+HA: docs/en/ENTERPRISE_HA_GUIDE.md | docs/vi/ENTERPRISE_HA_GUIDE.md
 "
         ),
         GuideTopic::Quickstart => format!(
@@ -91,8 +90,7 @@ HA: docs/ENTERPRISE_HA_GUIDE.md | docs/ENTERPRISE_HA_GUIDE_VI.md
 QMvir v{version} — Quick Start
 
 1) INSTALL
-   npm install -g qmvir
-   # or: curl -LO .../qm-macos-arm64 && chmod +x && sudo mv qm /usr/local/bin/
+   cargo build --release --no-default-features --bin qm
 
 2) DATA DIRECTORY
    qm --data-dir ./mydb <command>     # default: ./data
@@ -257,7 +255,7 @@ PERFORMANCE
   • WAL group commit: see performance guide for tuning scripts
   • Vector HNSW: CREATE INDEX ... USING hnsw after bulk INSERT
 
-More: qm guide backup | qm guide studio | qm guide cluster | USAGE_GUIDE_EN.md
+More: qm guide backup | qm guide studio | qm guide cluster | docs/README.md
 "
         ),
     }
@@ -280,7 +278,7 @@ CHU DE
   notes        Luu y quan trong truoc production
 
 BAT DAU NHANH
-  npm install -g qmvir
+  cargo build --release --no-default-features --bin qm
   qm start --admin-password matkhau
   psql -h 127.0.0.1 -p 55433 -U admin
   qm --data-dir ./data sql \"SELECT 1\"
@@ -294,8 +292,8 @@ LENH THUONG DUNG
   qm guide notes
   qm guide cluster
 
-Tai lieu HTAP: docs/HTAP_GUIDE_VI.md
-HA: docs/ENTERPRISE_HA_GUIDE_VI.md
+Tai lieu HTAP: docs/vi/HTAP_GUIDE.md
+HA: docs/vi/ENTERPRISE_HA_GUIDE.md
 "
         ),
         GuideTopic::Cluster => cluster_guide::cluster_guide_body(&Lang::Vi),
@@ -347,7 +345,7 @@ QMvir v{version} — 使用指南（內建）
   qm guide notes   # 上線前必讀
   qm guide cluster # HA / 多 DC 部署
 
-詳見 USAGE_GUIDE_EN.md
+詳見 docs/README.md
 "
         ),
         GuideTopic::Notes => "\
@@ -447,7 +445,7 @@ FILES (under --data-dir)
   column_segments/        QMCS durable column files
   pitr_manifest.json      last PITR plan output
 
-Full reference: docs/HTAP_GUIDE.md
+Full reference: docs/en/HTAP_GUIDE.md
 "
     )
 }
@@ -480,7 +478,7 @@ CHUNG NHAN & PITR
   qm pitr plan --timestamp <unix>
   qm pitr restore --timestamp <unix> -o ./pitr_out
 
-Tai lieu day du: docs/HTAP_GUIDE_VI.md
+Tai lieu day du: docs/vi/HTAP_GUIDE.md
 "
     )
 }
