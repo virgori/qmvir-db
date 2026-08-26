@@ -108,9 +108,9 @@ Backups support encryption (AES-GCM) when configured.
 ## 7. Web dashboard & REST
 
 ```bash
-# Optional HTTP dashboard (separate binary or flags — see qm guide)
+# Optional local HTTP dashboard (separate binary or flags — see qm guide)
 qm --data-dir ./mydb start --admin-password secret
-# Default REST/WebSocket on configured port (see `qm guide`)
+# Local REST/admin API is exposed by qm_web on its configured loopback port.
 ```
 
 ---

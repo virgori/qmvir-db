@@ -16,7 +16,7 @@
 
 ## Overview
 
-QMvir is a **hybrid database engine** implemented primarily in Rust. The current release surface is the `qm_engine` crate: a `qm` CLI, a PostgreSQL wire-protocol gateway, native SQL execution, WAL/checkpoint persistence, backup/restore, full-text search, vector search, and opt-in HA/cluster modules.
+QMvir is a **Rust-first hybrid database engine**. The active release surface is the `qm_engine` crate: the `qm` CLI, PostgreSQL wire-protocol gateway, native SQL execution, WAL/checkpoint persistence, backup/restore, full-text search, vector search, a local web dashboard, and opt-in HA/cluster modules.
 
 **v6.2.8** fixes extended-query reads (Bind param substitution, RowDescription) and speeds OLTP prepared DML via per-table autocommit paths and prepared-plan caching. **v6.2.7** fixes UTF-8 panic in UPDATE keyword scan (accents/CJK). **v6.2.6** fixed WHERE-in-literal hang and soft checkpoint. **v6.2.5** fixed HTAP write-lock deadlock. **v6.2.4** deferred checkpoint / group-commit defaults.
 
@@ -24,13 +24,12 @@ QMvir is a **hybrid database engine** implemented primarily in Rust. The current
 
 ### What Makes QMvir Special?
 
-- **Hybrid Architecture**: SQL + HTAP-style row/column paths + search + vector index modules in one Rust crate
-- **Rust Hot Path**: PostgreSQL wire protocol, parser/dispatcher, native SQL execution, WAL, backup, and indexing are Rust-first
-- **PostgreSQL Wire Protocol**: Compatible with common PostgreSQL clients for the supported gateway surface
-- **Vector Search**: HNSW with product-quantization support and exact-scan fallback paths
-- **Full-Text Search**: Inverted index modules with WAND/BMW-style retrieval support
-- **Operational Surface**: WAL/checkpoint recovery, backup/restore, SCRAM auth, local web dashboard, and HA certification commands
-- **Experimental / Opt-in R&D**: JIT expression infrastructure, adaptive indexing, IPC hub/satellite routing, and multi-DC HA features exist in code but require workload-specific validation before being marketed as generally production-ready
+- **Hybrid core**: SQL, HTAP-style row/column paths, full-text search, and vector index modules live in one Rust crate.
+- **PostgreSQL gateway**: the server speaks PostgreSQL wire protocol for the supported SQL surface.
+- **Native persistence**: `NativeSqlEngine` uses per-table snapshots plus an append-only SQL WAL.
+- **Search and vectors**: inverted indexes and HNSW/PQ vector search are implemented natively, with fallback paths where needed.
+- **Operational tooling**: CLI commands cover start/stop, SQL execution, backup/restore, inspection, HA checks, and local dashboard access.
+- **Explicit R&D boundary**: JIT native-code execution, adaptive indexing policy, IPC hub/satellite routing, CDC streaming, and multi-DC HA are retained as opt-in or experimental surfaces until validated per workload.
 
 ---
 
@@ -61,12 +60,13 @@ psql -h localhost -p 55433 -U admin -d qm
 ## Features
 
 ### Current Release Surface
-- **OLTP Engine**: SQL transactions with WAL/checkpoint recovery; full storage-wide MVCC remains scoped to the storage/MVCC modules and is not yet a blanket NativeSqlEngine claim
-- **HTAP / Analytics**: Durable column-segment modules, vectorized execution helpers, and planner hooks for analytics-oriented paths
-- **Search Engine**: Full-text search with inverted indexes and WAND optimization
-- **Vector Engine**: HNSW indexes with Product Quantization for similarity search
-- **Backup / Restore**: `.qmvb` backup format, verification, encryption support, and PITR-related metadata paths
-- **Web Dashboard**: Local loopback `qm_web` dashboard and REST endpoints for admin/inspection
+- **Native SQL engine**: SQL DDL/DML/query execution, WAL/checkpoint recovery, and PostgreSQL wire integration.
+- **Transaction scope**: gateway-native transactions support `BEGIN`, `COMMIT`, and `ROLLBACK` with READ COMMITTED semantics. Serializable and savepoint semantics are not claimed for the native gateway path.
+- **HTAP / analytics modules**: durable column segments, vectorized helpers, and planner hooks support analytics-oriented execution paths.
+- **Search engine**: full-text search uses native inverted-index modules with WAND/BMW-style retrieval support.
+- **Vector engine**: HNSW indexes with product-quantization support provide approximate nearest-neighbor search.
+- **Backup / restore**: `.qmvb` backup format, verification, encryption support, and PITR-related metadata paths.
+- **Web dashboard**: `qm_web` exposes a loopback-only Axum dashboard and REST API for local administration.
 
 ### Performance-Oriented Building Blocks
 - **SIMD Acceleration**: AVX2/NEON vectorized operations
@@ -140,8 +140,8 @@ The current runtime is centered on `PostgresGateway` and `NativeSqlEngine`; HTAP
 
 | # | Guide | Description |
 |---|--------|-------------|
-| 1 | [Architecture](docs/vi/QMVIR_ARCHITECTURE.md) | Gateway, engine, storage, enterprise cluster |
-| 2 | [Algorithms](docs/vi/QMVIR_ALGORITHMS.md) | Data structures & algorithms (with source map) |
+| 1 | [Architecture](docs/en/QMVIR_ARCHITECTURE.md) | Gateway, engine, storage, HA boundaries |
+| 2 | [Algorithms](docs/vi/QMVIR_ALGORITHMS.md) | Data structures & algorithms (Vietnamese, with source map) |
 | 3 | [Basic usage](docs/en/BASIC_USAGE.md) | Install, SQL, search, vector, backup, CLI |
 | 4 | [Enterprise HA](docs/en/ENTERPRISE_HA_GUIDE.md) | Multi-DC deployment, certification, env vars |
 

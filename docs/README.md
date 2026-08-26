@@ -6,6 +6,7 @@ Canonical documentation for **QMvir 6.2.8**. Guides are grouped by language, wit
 
 | Document | Description |
 |----------|-------------|
+| [Architecture](en/QMVIR_ARCHITECTURE.md) | Gateway, engine, storage, and HA boundaries |
 | [Basic Usage](en/BASIC_USAGE.md) | Install, quick start, SQL, search, vector, backup, CLI |
 | [Enterprise HA](en/ENTERPRISE_HA_GUIDE.md) | Multi-DC deployment, certification, env vars |
 | [HTAP](en/HTAP_GUIDE.md) | HTAP, MVCC, planner, PITR |

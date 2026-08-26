@@ -1,14 +1,14 @@
 # QMvir Enterprise HA & Production Multi-DC Guide
 
-**Status: Production Multi-DC Enterprise Certified (v6.2.0)** — code-complete end-to-end.
+**Status: Opt-in HA / multi-DC certification framework (v6.2.x).** The code paths exist in the Rust crate, but production claims must be tied to deployment-specific `qm cluster certify` and soak results.
 
 | Layer | Completion |
 |-------|------------|
-| Enterprise HA (A–N) | 100% |
-| Production multi-DC (O–R) | 100% |
-| Witness + chaos + SLA metrics | 100% |
-| `production_multi_dc_certify.sh` | 100% |
-| Publish tag v6.2.0 | Ready |
+| Enterprise HA (A-N) | Implemented as opt-in modules |
+| Production multi-DC (O-R) | Implemented; validate per deployment |
+| Witness + chaos + SLA metrics | Available through certification/metrics paths |
+| `production_multi_dc_certify.sh` | Maintainer validation helper |
+| Release | Built through GitHub Actions from this private repo |
 
 This guide covers cluster high availability (HA), certification tiers, deployment env vars, CLI tooling, validation scripts, and release publish workflow.
 
