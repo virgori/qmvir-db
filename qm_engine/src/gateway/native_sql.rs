@@ -6906,6 +6906,16 @@ impl NativeSqlEngine {
         self.htap.planner.plan_sql(sql, rows, has_col)
     }
 
+    #[inline]
+    fn htap_plan_uses_columnar_fast_path(
+        &self,
+        table: &str,
+        plan: &crate::htap::HtapPhysicalPlan,
+    ) -> bool {
+        matches!(plan.path, crate::htap::planner::ScanPath::ColumnScan)
+            || self.columnar_cached_row_count(table).is_some()
+    }
+
     /// Durable mmap column segment SUM when planner picks ColumnScan (no WHERE).
     fn htap_try_durable_sum(&self, table: &str, agg_col: &str, sql: &str) -> Option<(f64, i64)> {
         if self.htap_plan_sql(sql, table).path != crate::htap::planner::ScanPath::ColumnScan {
@@ -21399,59 +21409,80 @@ impl NativeSqlEngine {
 
         if let Ok(shared) = self.tables.lock_table_read(table) {
             let t = shared.read();
-            let _plan = self.htap_plan_sql(s, table);
-            let cc = self.get_or_build_cols(table, &*t);
+            let plan = self.htap_plan_sql(s, table);
+            let use_columnar_fast_path = self.htap_plan_uses_columnar_fast_path(table, &plan);
+            let cc = if use_columnar_fast_path {
+                Some(self.get_or_build_cols(table, &*t))
+            } else {
+                None
+            };
 
             let (sum, count) = if let Some((filter_col, lo, hi)) = between_filter {
                 // Columnar range filter + sum.
-                if filter_col == "id"
-                    || filter_col == t.columns.first().map(|s| s.as_str()).unwrap_or("")
+                if use_columnar_fast_path
+                    && (filter_col == "id"
+                        || filter_col == t.columns.first().map(|s| s.as_str()).unwrap_or(""))
                 {
                     // Primary key filter: binary search on sorted ids.
-                    let start = cc.ids.partition_point(|x| *x < lo);
-                    let end = cc.ids.partition_point(|x| *x <= hi);
-                    let s = if let Some(fv) = cc.float_cols.get(agg_col.as_str()) {
-                        simd_sum_f64(&fv[start..end])
-                    } else if let Some(iv) = cc.int_cols.get(agg_col.as_str()) {
-                        iv[start..end].iter().map(|v| *v as f64).sum()
+                    if let Some(cc) = cc.as_ref() {
+                        let start = cc.ids.partition_point(|x| *x < lo);
+                        let end = cc.ids.partition_point(|x| *x <= hi);
+                        let s = if let Some(fv) = cc.float_cols.get(agg_col.as_str()) {
+                            simd_sum_f64(&fv[start..end])
+                        } else if let Some(iv) = cc.int_cols.get(agg_col.as_str()) {
+                            iv[start..end].iter().map(|v| *v as f64).sum()
+                        } else {
+                            0.0
+                        };
+                        (s, (end - start) as i64)
                     } else {
-                        0.0
-                    };
-                    (s, (end - start) as i64)
-                } else if let Some(filter_vec) = cc.int_cols.get(filter_col) {
+                        (0.0, 0)
+                    }
+                } else if use_columnar_fast_path {
                     // Non-id integer filter: chunk-based parallel scan + gather.
-                    if let Some(agg_vec) = cc.float_cols.get(agg_col.as_str()) {
-                        let n = filter_vec.len();
-                        if n > CHUNK_SIZE {
-                            // Parallel chunk-based reduction
-                            let (psum, pcnt) = (0..n)
-                                .into_par_iter()
-                                .chunks(CHUNK_SIZE)
-                                .map(|chunk| {
-                                    let mut local_sum = 0.0f64;
-                                    let mut local_cnt = 0i64;
-                                    for i in chunk {
+                    if let Some(cc) = cc.as_ref() {
+                        if let Some(filter_vec) = cc.int_cols.get(filter_col) {
+                            if let Some(agg_vec) = cc.float_cols.get(agg_col.as_str()) {
+                                let n = filter_vec.len();
+                                if n > CHUNK_SIZE {
+                                    // Parallel chunk-based reduction
+                                    let (psum, pcnt) = (0..n)
+                                        .into_par_iter()
+                                        .chunks(CHUNK_SIZE)
+                                        .map(|chunk| {
+                                            let mut local_sum = 0.0f64;
+                                            let mut local_cnt = 0i64;
+                                            for i in chunk {
+                                                let v = filter_vec[i];
+                                                if v >= lo && v <= hi {
+                                                    local_sum += agg_vec[i];
+                                                    local_cnt += 1;
+                                                }
+                                            }
+                                            (local_sum, local_cnt)
+                                        })
+                                        .reduce(
+                                            || (0.0, 0),
+                                            |(s1, c1), (s2, c2)| (s1 + s2, c1 + c2),
+                                        );
+                                    (psum, pcnt)
+                                } else {
+                                    let mut sum = 0.0f64;
+                                    let mut cnt = 0i64;
+                                    for i in 0..n {
                                         let v = filter_vec[i];
                                         if v >= lo && v <= hi {
-                                            local_sum += agg_vec[i];
-                                            local_cnt += 1;
+                                            sum += agg_vec[i];
+                                            cnt += 1;
                                         }
                                     }
-                                    (local_sum, local_cnt)
-                                })
-                                .reduce(|| (0.0, 0), |(s1, c1), (s2, c2)| (s1 + s2, c1 + c2));
-                            (psum, pcnt)
-                        } else {
-                            let mut sum = 0.0f64;
-                            let mut cnt = 0i64;
-                            for i in 0..n {
-                                let v = filter_vec[i];
-                                if v >= lo && v <= hi {
-                                    sum += agg_vec[i];
-                                    cnt += 1;
+                                    (sum, cnt)
                                 }
+                            } else {
+                                (0.0, 0)
                             }
-                            (sum, cnt)
+                        } else {
+                            (0.0, 0)
                         }
                     } else {
                         (0.0, 0)
@@ -21506,8 +21537,28 @@ impl NativeSqlEngine {
                 (simd_sum_f64(&values), n)
             } else {
                 // No filter: sum entire column from columnar cache.
-                if let Some(fv) = cc.float_cols.get(agg_col.as_str()) {
-                    (simd_sum_f64(fv), fv.len() as i64)
+                if use_columnar_fast_path {
+                    if let Some(cc) = cc.as_ref() {
+                        if let Some(fv) = cc.float_cols.get(agg_col.as_str()) {
+                            (simd_sum_f64(fv), fv.len() as i64)
+                        } else {
+                            // Fallback for non-float columns.
+                            let mut values = Vec::new();
+                            for row in t.rows.values() {
+                                values.push(
+                                    row.cols
+                                        .get(agg_col.as_str())
+                                        .cloned()
+                                        .unwrap_or(Cell::Float(0.0))
+                                        .as_f64(),
+                                );
+                            }
+                            let n = values.len() as i64;
+                            (simd_sum_f64(&values), n)
+                        }
+                    } else {
+                        (0.0, 0)
+                    }
                 } else {
                     // Fallback for non-float columns.
                     let mut values = Vec::new();
@@ -21610,28 +21661,111 @@ impl NativeSqlEngine {
 
         if let Ok(shared) = self.tables.lock_table_read(table) {
             let t = shared.read();
-            let cc = self.get_or_build_cols(table, &*t);
-            if let Some((filter_col, lo, hi)) = between_filter {
-                if let Some(filter_vec) = cc.int_cols.get(filter_col) {
-                    if let Some(fv) = cc.float_cols.get(agg_col.as_str()) {
-                        let start = filter_vec.partition_point(|&x| x < lo);
-                        let end = filter_vec.partition_point(|&x| x <= hi);
-                        let sum = simd_sum_f64(&fv[start..end]);
-                        let cnt = (end - start) as f64;
-                        let avg = if cnt > 0.0 { sum / cnt } else { 0.0 };
-                        return Ok(QueryResult {
-                            columns: vec![("avg".to_string(), oid::FLOAT8, 8)],
-                            rows: vec![vec![Some(avg.to_string().into_bytes())]],
-                            command_tag: "SELECT 1".to_string(),
-                            ..Default::default()
-                        });
+            let plan = self.htap_plan_sql(s, table);
+            let use_columnar_fast_path = self.htap_plan_uses_columnar_fast_path(table, &plan);
+            let cc = if use_columnar_fast_path {
+                Some(self.get_or_build_cols(table, &*t))
+            } else {
+                None
+            };
+            let (sum, cnt) = if let Some((filter_col, lo, hi)) = between_filter {
+                if use_columnar_fast_path {
+                    if let Some(cc) = cc.as_ref() {
+                        if let Some(filter_vec) = cc.int_cols.get(filter_col) {
+                            if let Some(fv) = cc.float_cols.get(agg_col.as_str()) {
+                                let start = filter_vec.partition_point(|&x| x < lo);
+                                let end = filter_vec.partition_point(|&x| x <= hi);
+                                (simd_sum_f64(&fv[start..end]), (end - start) as f64)
+                            } else {
+                                let mut s = 0.0;
+                                let mut c = 0.0;
+                                for row in t.rows.values() {
+                                    let col_val = row
+                                        .cols
+                                        .get(filter_col)
+                                        .cloned()
+                                        .unwrap_or(Cell::Int(0))
+                                        .as_i64();
+                                    if col_val >= lo && col_val <= hi {
+                                        s += row
+                                            .cols
+                                            .get(agg_col.as_str())
+                                            .cloned()
+                                            .unwrap_or(Cell::Float(0.0))
+                                            .as_f64();
+                                        c += 1.0;
+                                    }
+                                }
+                                (s, c)
+                            }
+                        } else {
+                            let mut s = 0.0;
+                            let mut c = 0.0;
+                            for row in t.rows.values() {
+                                let col_val = row
+                                    .cols
+                                    .get(filter_col)
+                                    .cloned()
+                                    .unwrap_or(Cell::Int(0))
+                                    .as_i64();
+                                if col_val >= lo && col_val <= hi {
+                                    s += row
+                                        .cols
+                                        .get(agg_col.as_str())
+                                        .cloned()
+                                        .unwrap_or(Cell::Float(0.0))
+                                        .as_f64();
+                                    c += 1.0;
+                                }
+                            }
+                            (s, c)
+                        }
+                    } else {
+                        (0.0, 0.0)
                     }
+                } else {
+                    let mut s = 0.0;
+                    let mut c = 0.0;
+                    for row in t.rows.values() {
+                        let col_val = row
+                            .cols
+                            .get(filter_col)
+                            .cloned()
+                            .unwrap_or(Cell::Int(0))
+                            .as_i64();
+                        if col_val >= lo && col_val <= hi {
+                            s += row
+                                .cols
+                                .get(agg_col.as_str())
+                                .cloned()
+                                .unwrap_or(Cell::Float(0.0))
+                                .as_f64();
+                            c += 1.0;
+                        }
+                    }
+                    (s, c)
                 }
-            }
-            let _plan = self.htap_plan_sql(s, table);
-            let cc = self.get_or_build_cols(table, &*t);
-            let (sum, cnt) = if let Some(fv) = cc.float_cols.get(agg_col.as_str()) {
-                (simd_sum_f64(fv), fv.len() as f64)
+            } else if use_columnar_fast_path {
+                if let Some(cc) = cc.as_ref() {
+                    if let Some(fv) = cc.float_cols.get(agg_col.as_str()) {
+                        (simd_sum_f64(fv), fv.len() as f64)
+                    } else {
+                        let mut s = 0.0;
+                        let mut c = 0.0;
+                        for row in t.rows.values() {
+                            s += row
+                                .cols
+                                .get(agg_col.as_str())
+                                .cloned()
+                                .unwrap_or(Cell::Float(0.0))
+                                .as_f64();
+                            c += 1.0;
+                        }
+                        (s, c)
+                    }
+                } else {
+                    (0.0, 0.0)
+                }
             } else {
                 let mut s = 0.0;
                 let mut c = 0.0;
@@ -21748,10 +21882,13 @@ impl NativeSqlEngine {
         // ── Load rows and convert to AggValue maps ──
         let shared = self.table_read_guard(table)?;
         let t = shared.read();
-        let _plan = self.htap_plan_sql(s, table);
+        let plan = self.htap_plan_sql(s, table);
 
         // ── Fast columnar GROUP BY: single text group col + SUM/COUNT aggs ──
-        if gb_cols.len() == 1 && having_preds.is_empty() {
+        if self.htap_plan_uses_columnar_fast_path(table, &plan)
+            && gb_cols.len() == 1
+            && having_preds.is_empty()
+        {
             let gb_col = &gb_cols[0];
             let cc = self.get_or_build_cols(table, &*t);
             if let Some(grp_vals) = cc.text_cols.get(gb_col.as_str()) {

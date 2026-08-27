@@ -14,25 +14,27 @@ Most immediate performance upside should come from wiring existing planning/inde
 
 ### 1. HTAP Planner Is Only Partially Driving SELECT Execution
 
-Status: partially wired.
+Status: aggregate fast-path gating wired after this audit; broader SELECT dispatch remains.
 
 Evidence:
 
 - `NativeSqlEngine::htap_plan_sql` delegates to `htap/planner.rs` and is used by durable SUM/COUNT helpers.
 - `htap_try_durable_sum`, `htap_try_durable_sum_between`, and `htap_try_durable_count` gate durable column-segment execution on `ScanPath::ColumnScan`.
-- Several aggregate branches compute `let _plan = self.htap_plan_sql(...)` and then proceed with hand-picked column-cache or row fallback logic instead of routing from the plan.
+- SUM, AVG, and GROUP BY fallback branches now use `HtapPhysicalPlan` to decide whether column-cache fast paths are allowed.
+- Broader SELECT/projection/join branches still depend on specialized `NativeSqlEngine` code rather than a unified HTAP physical dispatcher.
 
 Impact:
 
 - Some `SUM`, `AVG`, `COUNT`, and simple aggregate paths benefit from durable column segments or column cache.
-- Broader SELECT, GROUP BY, range, projection, and mixed predicate execution still depends on special-case code in `NativeSqlEngine`.
-- The architecture's planner is not yet the single source of truth for row vs column vs index path selection.
+- Aggregate column-cache execution now follows planner/cache eligibility instead of ignoring `_plan`.
+- Broader SELECT, projection, join, and mixed predicate execution still depends on special-case code in `NativeSqlEngine`.
+- The architecture's planner is closer to the hot path, but not yet the single source of truth for row vs column vs index path selection.
 
 Wire-in target:
 
-1. Replace `_plan` throwaway calls with a small physical dispatch layer.
-2. Start with aggregate/range/GROUP BY because those paths already have columnar fast paths.
-3. Add tests that assert EXPLAIN/planner choice matches the actual executed path, not just reported intent.
+1. Extend the planner-gated dispatch beyond aggregate/range/GROUP BY into projection and join paths.
+2. Add actual-path counters/profiling so EXPLAIN/planner choice can be compared with the path that executed.
+3. Add tests that assert EXPLAIN/planner choice matches actual execution, not just reported intent.
 
 ### 2. Auto Index Manager Records Stats But Does Not Run Autonomous Lifecycle
 
