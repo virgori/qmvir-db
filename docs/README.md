@@ -26,6 +26,7 @@ Canonical documentation for **QMvir 6.2.8**. Guides are grouped by language, wit
 | Document | Purpose |
 |----------|---------|
 | [Bench Optimization Handover](internal/HANDOVER_BENCH_OPT.md) | Maintainer handover notes for benchmark optimization |
+| [Optimization Wiring Audit](internal/OPTIMIZATION_WIRING_AUDIT.md) | Internal audit of optimization modules that are not fully wired into the current SQL hot path |
 
 ## Quick Links
 
