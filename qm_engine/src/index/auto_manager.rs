@@ -441,6 +441,22 @@ impl IndexManager {
         };
     }
 
+    /// Update observed predicate selectivity from an actual query result.
+    ///
+    /// This records "matched rows / table rows", which is the value the
+    /// autonomous indexer expects when deciding whether a predicate is selective
+    /// enough to deserve an index.
+    pub fn update_observed_selectivity(&self, table: &str, col: &str, matched: u64, total: u64) {
+        if total == 0 {
+            return;
+        }
+        let key = (table.to_string(), col.to_string());
+        let mut stats = self.stats.write();
+        let entry = stats.entry(key).or_default();
+        entry.table_rows = total;
+        entry.selectivity = (matched as f64 / total as f64).clamp(0.0, 1.0);
+    }
+
     /// Estimate BETWEEN selectivity from histogram and persist it into stats.
     pub fn update_selectivity_from_histogram_between(
         &self,
@@ -620,29 +636,31 @@ impl IndexManager {
             let remaining_budget = self.remaining_memory_bytes();
             for (name, _tree) in shadow.iter() {
                 if let Some(m) = meta.get(name) {
-                    // Require minimum latency samples before deciding
-                    if m.latency_samples < 20 {
-                        continue; // Not enough data yet
-                    }
-
                     let cb = IndexCostBenefit::compute(m);
 
-                    // Gate 1: speedup must exceed threshold
-                    if cb.speedup_ratio < SHADOW_SPEEDUP_THRESHOLD {
-                        if m.created_at.elapsed().as_secs() > UNUSED_TTL_SECS {
-                            // Shadow tested but not beneficial — drop it
-                            decisions.push(AutoDecision::DropIndex {
-                                name: name.clone(),
-                                reason: format!(
-                                    "shadow speedup {:.2}x < threshold {:.2}x after {} samples",
-                                    cb.speedup_ratio, SHADOW_SPEEDUP_THRESHOLD, m.latency_samples
-                                ),
-                            });
+                    // Gate 1: latency samples are preferred. During bootstrap,
+                    // allow promotion from repeated beneficial shadow hits even
+                    // when a full baseline replay was intentionally skipped.
+                    if m.latency_samples >= 20 {
+                        if cb.speedup_ratio < SHADOW_SPEEDUP_THRESHOLD {
+                            if m.created_at.elapsed().as_secs() > UNUSED_TTL_SECS {
+                                decisions.push(AutoDecision::DropIndex {
+                                    name: name.clone(),
+                                    reason: format!(
+                                        "shadow speedup {:.2}x < threshold {:.2}x after {} samples",
+                                        cb.speedup_ratio,
+                                        SHADOW_SPEEDUP_THRESHOLD,
+                                        m.latency_samples
+                                    ),
+                                });
+                            }
+                            continue;
                         }
+                    } else if m.total_queries < 20 {
                         continue;
                     }
 
-                    // Gate 2: hit ratio must be non-negligible (>10%)
+                    // Gate 2: hit ratio must be non-negligible (>10%).
                     let hit_ratio = m.benefiting_queries as f64 / m.total_queries.max(1) as f64;
                     if hit_ratio < 0.10 {
                         continue; // Too few queries benefit
@@ -788,6 +806,25 @@ impl IndexManager {
         self.building.store(false, Ordering::Release);
     }
 
+    /// Return empty shadow indexes that need table backfill.
+    pub fn shadow_indexes_needing_population(&self) -> Vec<(String, String, Vec<String>)> {
+        let shadow = self.shadow.read();
+        let meta = self.meta.read();
+        shadow
+            .iter()
+            .filter_map(|(name, tree)| {
+                if tree.entry_count() > 0 {
+                    return None;
+                }
+                let m = meta.get(name)?;
+                if m.state != IndexState::Shadow {
+                    return None;
+                }
+                Some((name.clone(), m.table.clone(), m.columns.clone()))
+            })
+            .collect()
+    }
+
     /// Promote a shadow index to the active set.
     fn promote_shadow(&self, name: &str) {
         if let Some(tree) = self.shadow.write().remove(name) {
@@ -801,6 +838,38 @@ impl IndexManager {
     /// Return true if an index build is in progress.
     pub fn is_building(&self) -> bool {
         self.building.load(Ordering::Acquire)
+    }
+
+    /// Find a shadow index for planner-side trial execution.
+    pub fn find_shadow_index(&self, table: &str, column: &str) -> Option<Arc<BPlusTree>> {
+        let shadow = self.shadow.read();
+        let meta = self.meta.read();
+        for (name, tree) in shadow.iter() {
+            let Some(m) = meta.get(name) else {
+                continue;
+            };
+            if m.state == IndexState::Shadow
+                && m.table == table
+                && m.columns.contains(&column.to_string())
+            {
+                return Some(tree.clone());
+            }
+        }
+        None
+    }
+
+    /// Return active/manual and shadow trees for DML maintenance.
+    pub fn trees_for_table_including_shadow(&self, table: &str) -> Vec<Arc<BPlusTree>> {
+        let mut out = Vec::new();
+        {
+            let indexes = self.indexes.read();
+            out.extend(indexes.values().filter(|tree| tree.table == table).cloned());
+        }
+        {
+            let shadow = self.shadow.read();
+            out.extend(shadow.values().filter(|tree| tree.table == table).cloned());
+        }
+        out
     }
 
     // ── Garbage Collection & Memory ─────────────────────────────────────

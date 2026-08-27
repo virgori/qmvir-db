@@ -148,10 +148,7 @@ fn columnar_group_by_i64_dense(
     out
 }
 
-fn columnar_group_by_i64(
-    grp_vals: &[i64],
-    sum_fv: Option<&[f64]>,
-) -> AHashMap<i64, (f64, i64)> {
+fn columnar_group_by_i64(grp_vals: &[i64], sum_fv: Option<&[f64]>) -> AHashMap<i64, (f64, i64)> {
     let n_rows = grp_vals.len();
     if n_rows == 0 {
         return AHashMap::new();
@@ -4009,6 +4006,8 @@ pub struct NativeSqlEngine {
     /// keep the hot DML path free of checkpoint bookkeeping.
     dirty_tracker: Arc<DirtyTracker>,
     last_checkpoint_profile: Arc<RwLock<CheckpointProfile>>,
+    /// Low-frequency autonomous index evaluation trigger.
+    auto_index_cycle_counter: Arc<AtomicU64>,
     /// Authorization manager.
     pub auth: AuthManager,
     /// Buffer Pool — caches dimension hash tables + SoA column stores.
@@ -4054,11 +4053,7 @@ impl PyNativeSqlEngine {
         Self { inner }
     }
 
-    pub fn execute(
-        &self,
-        py: Python<'_>,
-        sql: &str,
-    ) -> PyResult<(Vec<String>, PyObject, String)> {
+    pub fn execute(&self, py: Python<'_>, sql: &str) -> PyResult<(Vec<String>, PyObject, String)> {
         let result = py
             .allow_threads(|| self.inner.execute_packed(sql))
             .map_err(pyo3::exceptions::PyRuntimeError::new_err)?;
@@ -4979,8 +4974,8 @@ impl PyNativeSqlEngine {
                         validity: None,
                     },
                     zero_copy: true,
-                    copy_reason:
-                        "packed SELECT id exposes Arc<[i64]> as Python memoryview".to_string(),
+                    copy_reason: "packed SELECT id exposes Arc<[i64]> as Python memoryview"
+                        .to_string(),
                 }],
                 row_count,
                 classification: ColumnarClassification::ZeroCopyNumericOnly,
@@ -5265,7 +5260,12 @@ fn decode_i64_cell(bytes: &[u8]) -> Option<i64> {
 }
 
 #[inline]
-fn text_contains_needle_bytes(text: &str, needle: &[u8], case_insensitive: bool, ilike_needle: &str) -> bool {
+fn text_contains_needle_bytes(
+    text: &str,
+    needle: &[u8],
+    case_insensitive: bool,
+    ilike_needle: &str,
+) -> bool {
     if case_insensitive {
         text.to_ascii_lowercase()
             .contains(&ilike_needle.to_ascii_lowercase())
@@ -5463,9 +5463,12 @@ fn collect_like_contains_row_ids(
             .rows
             .par_iter()
             .filter_map(|(id, row)| {
-                row.cols.get(col.as_str()).filter(|cell| {
-                    text_contains_needle_bytes(&cell.as_text(), needle_bytes, is_ilike, needle)
-                }).map(|_| *id)
+                row.cols
+                    .get(col.as_str())
+                    .filter(|cell| {
+                        text_contains_needle_bytes(&cell.as_text(), needle_bytes, is_ilike, needle)
+                    })
+                    .map(|_| *id)
             })
             .collect();
         if sort_results {
@@ -5587,7 +5590,10 @@ impl NativeSqlEngine {
                 &mut native,
             );
             if let Some(start) = sync_start {
-                Self::profile_ns(&self.native_profile.columnize_sync_native_ns, start.elapsed());
+                Self::profile_ns(
+                    &self.native_profile.columnize_sync_native_ns,
+                    start.elapsed(),
+                );
             }
         }
         if !Self::htap_skip_columnize() {
@@ -5677,6 +5683,7 @@ impl NativeSqlEngine {
             native_profile: Arc::new(NativeSqlProfileCounters::default()),
             dirty_tracker: Arc::new(DirtyTracker::new()),
             last_checkpoint_profile: Arc::new(RwLock::new(CheckpointProfile::default())),
+            auto_index_cycle_counter: Arc::new(AtomicU64::new(0)),
             auth: AuthManager::new(),
             buf_pool: Arc::new(BufferPool::new()),
             row_lsn_counter: Arc::new(AtomicU64::new(0)),
@@ -5749,8 +5756,7 @@ impl NativeSqlEngine {
             Self::profile_ns(&self.native_profile.dml_pending_stage_ns, start.elapsed());
         }
         let threshold = Self::secondary_index_pending_flush_threshold();
-        if pending_len >= SECONDARY_INDEX_PENDING_CAP
-            || (threshold > 0 && pending_len >= threshold)
+        if pending_len >= SECONDARY_INDEX_PENDING_CAP || (threshold > 0 && pending_len >= threshold)
         {
             self.flush_secondary_index_pending(table);
         }
@@ -5786,6 +5792,7 @@ impl NativeSqlEngine {
             native_profile: Arc::new(NativeSqlProfileCounters::default()),
             dirty_tracker: Arc::new(DirtyTracker::new()),
             last_checkpoint_profile: Arc::new(RwLock::new(CheckpointProfile::default())),
+            auto_index_cycle_counter: Arc::new(AtomicU64::new(0)),
             auth: AuthManager::with_data_dir(dir.clone()),
             buf_pool: Arc::new(BufferPool::new()),
             row_lsn_counter: Arc::new(AtomicU64::new(0)),
@@ -5909,8 +5916,7 @@ impl NativeSqlEngine {
     }
 
     fn txn_profile_enabled() -> bool {
-        std::env::var_os("QMVIR_TXN_PROFILE").is_some()
-            || Self::commit_profile_enabled()
+        std::env::var_os("QMVIR_TXN_PROFILE").is_some() || Self::commit_profile_enabled()
     }
 
     fn txn_skip_publish() -> bool {
@@ -6131,7 +6137,9 @@ impl NativeSqlEngine {
 
     #[cfg(test)]
     fn inject_next_wal_flush_failure_for_test(&self) {
-        self.wal_faults.fail_next_flush.fetch_add(1, Ordering::SeqCst);
+        self.wal_faults
+            .fail_next_flush
+            .fetch_add(1, Ordering::SeqCst);
     }
 
     #[cfg(test)]
@@ -6151,8 +6159,12 @@ impl NativeSqlEngine {
     #[cfg(test)]
     fn clear_wal_fault_injection_for_test(&self) {
         self.wal_faults.fail_next_flush.store(0, Ordering::SeqCst);
-        self.wal_faults.fail_next_sync_all.store(0, Ordering::SeqCst);
-        self.wal_faults.fail_next_sync_data.store(0, Ordering::SeqCst);
+        self.wal_faults
+            .fail_next_sync_all
+            .store(0, Ordering::SeqCst);
+        self.wal_faults
+            .fail_next_sync_data
+            .store(0, Ordering::SeqCst);
     }
 
     fn maybe_fail_wal_flush_for_test(&self) -> Result<(), String> {
@@ -6234,26 +6246,40 @@ impl NativeSqlEngine {
         profile.columnize_collect_ns.store(0, Ordering::Relaxed);
         profile.columnize_sort_ns.store(0, Ordering::Relaxed);
         profile.columnize_extract_ns.store(0, Ordering::Relaxed);
-        profile.columnize_write_segments_ns.store(0, Ordering::Relaxed);
+        profile
+            .columnize_write_segments_ns
+            .store(0, Ordering::Relaxed);
         profile.rollback_rebuild_ns.store(0, Ordering::Relaxed);
         profile.rollback_undo_ns.store(0, Ordering::Relaxed);
         profile.txn_record_change_ns.store(0, Ordering::Relaxed);
-        profile.rollback_snapshot_restore_ns.store(0, Ordering::Relaxed);
+        profile
+            .rollback_snapshot_restore_ns
+            .store(0, Ordering::Relaxed);
         profile.rollback_revert_rows_ns.store(0, Ordering::Relaxed);
-        profile.rollback_revert_indexes_ns.store(0, Ordering::Relaxed);
+        profile
+            .rollback_revert_indexes_ns
+            .store(0, Ordering::Relaxed);
         profile.rollback_mvcc_abort_ns.store(0, Ordering::Relaxed);
         profile.commit_publish_mvcc_ns.store(0, Ordering::Relaxed);
         profile.commit_deferred_index_ns.store(0, Ordering::Relaxed);
         profile.dml_secondary_index_ns.store(0, Ordering::Relaxed);
         profile.dml_pending_stage_ns.store(0, Ordering::Relaxed);
         profile.dml_catalog_snapshot_ns.store(0, Ordering::Relaxed);
-        profile.dml_catalog_snapshot_count.store(0, Ordering::Relaxed);
+        profile
+            .dml_catalog_snapshot_count
+            .store(0, Ordering::Relaxed);
         profile.txn_record_clone_row_ns.store(0, Ordering::Relaxed);
         profile.txn_record_undo_push_ns.store(0, Ordering::Relaxed);
-        profile.txn_record_tombstone_snap_ns.store(0, Ordering::Relaxed);
+        profile
+            .txn_record_tombstone_snap_ns
+            .store(0, Ordering::Relaxed);
         profile.txn_record_index_snap_ns.store(0, Ordering::Relaxed);
-        profile.txn_record_deferred_push_ns.store(0, Ordering::Relaxed);
-        profile.txn_record_heap_mutate_ns.store(0, Ordering::Relaxed);
+        profile
+            .txn_record_deferred_push_ns
+            .store(0, Ordering::Relaxed);
+        profile
+            .txn_record_heap_mutate_ns
+            .store(0, Ordering::Relaxed);
         profile.txn_record_tx_lock_ns.store(0, Ordering::Relaxed);
     }
 
@@ -6293,6 +6319,80 @@ impl NativeSqlEngine {
             .read()
             .values()
             .any(|tree| tree.table == table)
+    }
+
+    fn record_auto_index_query_hit(&self, table: &str, column: &str) {
+        let column = column.trim();
+        if table.is_empty()
+            || column.is_empty()
+            || column == "*"
+            || column.contains(char::is_whitespace)
+        {
+            return;
+        }
+        self.index_mgr.record_query_hit(table, column);
+        self.maybe_run_auto_index_cycle();
+    }
+
+    fn record_auto_index_selectivity(
+        &self,
+        table: &str,
+        column: &str,
+        matched_rows: usize,
+        total_rows: usize,
+    ) {
+        self.index_mgr.update_observed_selectivity(
+            table,
+            column,
+            matched_rows as u64,
+            total_rows as u64,
+        );
+    }
+
+    fn maybe_run_auto_index_cycle(&self) {
+        const AUTO_INDEX_CYCLE_INTERVAL: u64 = 16;
+        if self.transaction_active() {
+            return;
+        }
+        let seq = self
+            .auto_index_cycle_counter
+            .fetch_add(1, Ordering::Relaxed)
+            + 1;
+        if seq % AUTO_INDEX_CYCLE_INTERVAL != 0 {
+            return;
+        }
+        let decisions = self.index_mgr.evaluate();
+        self.index_mgr.apply_decisions(&decisions);
+        self.populate_empty_shadow_indexes();
+        for _removed in self.index_mgr.gc_unused_indexes() {
+            self.mark_index_catalog_dirty(None);
+        }
+    }
+
+    fn populate_empty_shadow_indexes(&self) {
+        for (name, table, columns) in self.index_mgr.shadow_indexes_needing_population() {
+            let entries = match self.tables.with_read(&table, |t| {
+                let mut out = Vec::new();
+                for (&row_id, row) in &t.rows {
+                    for col in &columns {
+                        if let Some(cell) = row.cols.get(col) {
+                            if let Some(key) = Self::index_key_for_cell(cell) {
+                                out.push((key, row_id));
+                            }
+                        }
+                    }
+                }
+                Ok::<Vec<(IndexKey, i64)>, String>(out)
+            }) {
+                Ok(Ok(entries)) => entries,
+                _ => Vec::new(),
+            };
+            let estimated_bytes = (entries.len() as u64).saturating_mul(64);
+            self.index_mgr.populate_shadow(&name, entries);
+            self.index_mgr
+                .update_memory_estimate(&name, estimated_bytes);
+            self.mark_index_catalog_dirty(Some(&table));
+        }
     }
 
     fn mark_table_dirty(
@@ -6371,11 +6471,11 @@ impl NativeSqlEngine {
                 // Reset only after a completed (or intentionally skipped) attempt.
                 // Successful checkpoints clear dirty state; skipped ones leave counter so
                 // the next interval can retry once table locks are free / size shrinks.
-                let _ = engine_bg
-                    .wal_mutations
-                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
-                        Some(v.saturating_sub(CHECKPOINT_INTERVAL))
-                    });
+                let _ = engine_bg.wal_mutations.fetch_update(
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                    |v| Some(v.saturating_sub(CHECKPOINT_INTERVAL)),
+                );
                 engine_bg
                     .checkpoint_in_flight
                     .store(false, Ordering::Release);
@@ -6388,8 +6488,7 @@ impl NativeSqlEngine {
                 .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
                     Some(v.saturating_sub(CHECKPOINT_INTERVAL))
                 });
-            self.checkpoint_in_flight
-                .store(false, Ordering::Release);
+            self.checkpoint_in_flight.store(false, Ordering::Release);
         }
     }
 
@@ -6568,23 +6667,19 @@ impl NativeSqlEngine {
                 }
             }
             (ColType::Vector(dim), cell) => {
-                if let Cell::Vector {
-                    dim: got,
-                    data,
-                    ..
-                } = &cell
-                {
+                if let Cell::Vector { dim: got, data, .. } = &cell {
                     if *got == *dim && data.len() == *dim {
                         return Ok(cell);
                     }
                 }
-                let parsed = Self::parse_vector_cell(&cell).ok_or_else(|| {
-                    format!("invalid vector literal for column '{}'", col_name)
-                })?;
+                let parsed = Self::parse_vector_cell(&cell)
+                    .ok_or_else(|| format!("invalid vector literal for column '{}'", col_name))?;
                 if parsed.len() != *dim {
                     return Err(format!(
                         "vector dimension mismatch for column {}: expected {}, got {}",
-                        col_name, dim, parsed.len()
+                        col_name,
+                        dim,
+                        parsed.len()
                     ));
                 }
                 Ok(Self::vector_cell(parsed))
@@ -6750,16 +6845,13 @@ impl NativeSqlEngine {
     }
 
     pub fn mvcc_transaction_state(&self, tx_id: TxId) -> Option<MvccTxState> {
-        self.htap
-            .tx_mgr
-            .transaction_state(tx_id)
-            .map(|s| match s {
-                crate::mvcc::tx_manager::TxState::Active => MvccTxState::Active,
-                crate::mvcc::tx_manager::TxState::Committed { commit_ts } => {
-                    MvccTxState::Committed { commit_ts }
-                }
-                crate::mvcc::tx_manager::TxState::Aborted => MvccTxState::Aborted,
-            })
+        self.htap.tx_mgr.transaction_state(tx_id).map(|s| match s {
+            crate::mvcc::tx_manager::TxState::Active => MvccTxState::Active,
+            crate::mvcc::tx_manager::TxState::Committed { commit_ts } => {
+                MvccTxState::Committed { commit_ts }
+            }
+            crate::mvcc::tx_manager::TxState::Aborted => MvccTxState::Aborted,
+        })
     }
 
     pub fn execute_vector_with_timing(
@@ -6809,18 +6901,13 @@ impl NativeSqlEngine {
 
     fn htap_plan_sql(&self, sql: &str, table: &str) -> crate::htap::HtapPhysicalPlan {
         let rows = self.table_row_count(table) as u64;
-        let has_col = self.htap.column_segments.has_any_for_table(table)
-            || self.htap.is_column_dirty(table);
+        let has_col =
+            self.htap.column_segments.has_any_for_table(table) || self.htap.is_column_dirty(table);
         self.htap.planner.plan_sql(sql, rows, has_col)
     }
 
     /// Durable mmap column segment SUM when planner picks ColumnScan (no WHERE).
-    fn htap_try_durable_sum(
-        &self,
-        table: &str,
-        agg_col: &str,
-        sql: &str,
-    ) -> Option<(f64, i64)> {
+    fn htap_try_durable_sum(&self, table: &str, agg_col: &str, sql: &str) -> Option<(f64, i64)> {
         if self.htap_plan_sql(sql, table).path != crate::htap::planner::ScanPath::ColumnScan {
             return None;
         }
@@ -6891,12 +6978,7 @@ impl NativeSqlEngine {
     }
 
     /// Point lookup in a columnar-only seeded table (binary search on sorted ids).
-    fn row_from_columnar_cache(
-        &self,
-        table: &str,
-        t: &NativeTable,
-        id: i64,
-    ) -> Option<NativeRow> {
+    fn row_from_columnar_cache(&self, table: &str, t: &NativeTable, id: i64) -> Option<NativeRow> {
         let cc = self.buf_pool.get_cols(table)?;
         let idx = cc.ids.binary_search(&id).ok()?;
         let id_col = t.columns.first().map(|s| s.as_str()).unwrap_or("id");
@@ -6922,11 +7004,7 @@ impl NativeSqlEngine {
     }
 
     /// Real autocommit: implicit BEGIN/COMMIT via HTAP tx_mgr (not WAL-only fake commit).
-    fn htap_autocommit_mutation<F>(
-        &self,
-        sql: &str,
-        f: F,
-    ) -> Result<QueryResult, String>
+    fn htap_autocommit_mutation<F>(&self, sql: &str, f: F) -> Result<QueryResult, String>
     where
         F: FnOnce(&Self) -> Result<QueryResult, String>,
     {
@@ -6937,9 +7015,7 @@ impl NativeSqlEngine {
                 self.htap.mvcc.apply_deferred_touches(tx_id);
                 let dirty = self.htap.tx_mgr.touched_tables_for(tx_id);
                 let commit_ts = self.htap.tx_mgr.commit_transaction(tx_id)?;
-                self.htap
-                    .mvcc
-                    .publish_transaction(tx_id, commit_ts)?;
+                self.htap.mvcc.publish_transaction(tx_id, commit_ts)?;
                 if self.data_dir.is_some() {
                     self.wal_append(sql)?;
                 }
@@ -6975,19 +7051,13 @@ impl NativeSqlEngine {
     }
 
     /// OLTP autocommit: heap mutation + one WAL record (no per-row HTAP tx_mgr).
-    fn durable_autocommit_mutation<F>(
-        &self,
-        sql: &str,
-        f: F,
-    ) -> Result<QueryResult, String>
+    fn durable_autocommit_mutation<F>(&self, sql: &str, f: F) -> Result<QueryResult, String>
     where
         F: FnOnce(&Self) -> Result<QueryResult, String>,
     {
-        self.autocommit_wal_parent
-            .store(true, Ordering::Relaxed);
+        self.autocommit_wal_parent.store(true, Ordering::Relaxed);
         let result = f(self);
-        self.autocommit_wal_parent
-            .store(false, Ordering::Relaxed);
+        self.autocommit_wal_parent.store(false, Ordering::Relaxed);
         match result {
             Ok(q) => {
                 if self.data_dir.is_some() {
@@ -7155,8 +7225,7 @@ impl NativeSqlEngine {
         if n.is_empty() || up.len() < n.len() {
             return false;
         }
-        up.windows(n.len())
-            .any(|w| w.eq_ignore_ascii_case(n))
+        up.windows(n.len()).any(|w| w.eq_ignore_ascii_case(n))
     }
 
     fn find_ascii_ci(haystack: &str, needle: &str) -> Option<usize> {
@@ -7165,8 +7234,7 @@ impl NativeSqlEngine {
         if n.is_empty() {
             return Some(0);
         }
-        up.windows(n.len())
-            .position(|w| w.eq_ignore_ascii_case(n))
+        up.windows(n.len()).position(|w| w.eq_ignore_ascii_case(n))
     }
 
     fn btree_flush_insert_ids(
@@ -7278,8 +7346,7 @@ impl NativeSqlEngine {
             "TXN STATE sizes: undo_rows={undo_rows} inserted={ins_rows} \
              deferred_ins={def_ins} deferred_rep={def_rep} deferred_del={def_del} \
              defer_btree={} compact_wal={}",
-            tx_state.defer_btree_indexes,
-            tx_state.compact_wal_on_commit,
+            tx_state.defer_btree_indexes, tx_state.compact_wal_on_commit,
         );
     }
 
@@ -7332,7 +7399,10 @@ impl NativeSqlEngine {
         if let Some(start) = profile_start {
             Self::profile_ns(&self.native_profile.index_update_ns, start.elapsed());
             if Self::txn_profile_enabled() {
-                Self::profile_ns(&self.native_profile.commit_deferred_index_ns, start.elapsed());
+                Self::profile_ns(
+                    &self.native_profile.commit_deferred_index_ns,
+                    start.elapsed(),
+                );
             }
         }
     }
@@ -7374,7 +7444,10 @@ impl NativeSqlEngine {
                     .clone(),
             );
             if let Some(s) = snap_start {
-                Self::profile_ns(&self.native_profile.txn_record_tombstone_snap_ns, s.elapsed());
+                Self::profile_ns(
+                    &self.native_profile.txn_record_tombstone_snap_ns,
+                    s.elapsed(),
+                );
             }
         }
         if snapshot_indexes && state.index_snapshot.is_none() {
@@ -7587,17 +7660,9 @@ impl NativeSqlEngine {
         }
         let profile = Self::commit_profile_enabled();
         let prepare_start = profile.then(Instant::now);
-        self.htap
-            .mvcc
-            .apply_deferred_touches(tx_state.mvcc_tx_id);
-        let touched = self
-            .htap
-            .tx_mgr
-            .touched_tables_for(tx_state.mvcc_tx_id);
-        let commit_ts = self
-            .htap
-            .tx_mgr
-            .commit_transaction(tx_state.mvcc_tx_id)?;
+        self.htap.mvcc.apply_deferred_touches(tx_state.mvcc_tx_id);
+        let touched = self.htap.tx_mgr.touched_tables_for(tx_state.mvcc_tx_id);
+        let commit_ts = self.htap.tx_mgr.commit_transaction(tx_state.mvcc_tx_id)?;
         if !Self::txn_skip_publish() {
             let publish_start = if Self::txn_profile_enabled() {
                 Some(Instant::now())
@@ -7705,7 +7770,10 @@ impl NativeSqlEngine {
                     let ck_start = profile.then(Instant::now);
                     self.schedule_background_checkpoint();
                     if let Some(start) = ck_start {
-                        Self::profile_ns(&self.native_profile.commit_checkpoint_ns, start.elapsed());
+                        Self::profile_ns(
+                            &self.native_profile.commit_checkpoint_ns,
+                            start.elapsed(),
+                        );
                     }
                 }
             }
@@ -7821,7 +7889,10 @@ impl NativeSqlEngine {
                 }
                 self.buf_pool.clear_all_caches();
                 if let Some(start) = snap_start {
-                    Self::profile_ns(&self.native_profile.rollback_revert_rows_ns, start.elapsed());
+                    Self::profile_ns(
+                        &self.native_profile.rollback_revert_rows_ns,
+                        start.elapsed(),
+                    );
                 }
             } else if insert_only_rollback {
                 let undo_start = txn_prof.then(Instant::now);
@@ -7835,7 +7906,10 @@ impl NativeSqlEngine {
                 }
                 self.buf_pool.clear_all_caches();
                 if let Some(start) = undo_start {
-                    Self::profile_ns(&self.native_profile.rollback_revert_rows_ns, start.elapsed());
+                    Self::profile_ns(
+                        &self.native_profile.rollback_revert_rows_ns,
+                        start.elapsed(),
+                    );
                     Self::profile_ns(&self.native_profile.rollback_undo_ns, start.elapsed());
                 }
             } else if defer_rollback {
@@ -7865,7 +7939,10 @@ impl NativeSqlEngine {
                 }
                 self.buf_pool.clear_all_caches();
                 if let Some(start) = undo_start {
-                    Self::profile_ns(&self.native_profile.rollback_revert_rows_ns, start.elapsed());
+                    Self::profile_ns(
+                        &self.native_profile.rollback_revert_rows_ns,
+                        start.elapsed(),
+                    );
                     Self::profile_ns(&self.native_profile.rollback_undo_ns, start.elapsed());
                 }
             } else {
@@ -7958,11 +8035,7 @@ impl NativeSqlEngine {
         let tables: Vec<String> = state.inserted_rows.keys().cloned().collect();
         let mut staged_any = false;
         for table in tables {
-            let ids = state
-                .inserted_rows
-                .get(&table)
-                .cloned()
-                .unwrap_or_default();
+            let ids = state.inserted_rows.get(&table).cloned().unwrap_or_default();
             let staged = state.insert_wal_staged.entry(table.clone()).or_insert(0);
             while *staged < ids.len() {
                 let row_id = ids[*staged];
@@ -8002,7 +8075,10 @@ impl NativeSqlEngine {
         })?
     }
 
-    fn materialize_txn_insert_wal(&self, tx_state: &TransactionState) -> Result<Vec<String>, String> {
+    fn materialize_txn_insert_wal(
+        &self,
+        tx_state: &TransactionState,
+    ) -> Result<Vec<String>, String> {
         const BATCH: usize = 100;
         let mut lines = Vec::new();
         for (table, ids) in &tx_state.inserted_rows {
@@ -8406,8 +8482,8 @@ impl NativeSqlEngine {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             if g.pending > 1 {
-                let deadline =
-                    Instant::now() + std::time::Duration::from_micros(GROUP_COMMIT_DEFAULT_WINDOW_US);
+                let deadline = Instant::now()
+                    + std::time::Duration::from_micros(GROUP_COMMIT_DEFAULT_WINDOW_US);
                 while g.pending < GROUP_COMMIT_DEFAULT_MAX_BATCH && Instant::now() < deadline {
                     g = self
                         .group_commit
@@ -8583,7 +8659,10 @@ impl NativeSqlEngine {
                 return false;
             }
         };
-        eprintln!("[WAL] Replaying io_uring WAL ({} records)...", records.len());
+        eprintln!(
+            "[WAL] Replaying io_uring WAL ({} records)...",
+            records.len()
+        );
         let start = std::time::Instant::now();
         let mut count = 0u64;
         let mut errors = 0u64;
@@ -9012,8 +9091,7 @@ impl NativeSqlEngine {
                             .store(open_datasync, Ordering::Relaxed);
                     }
                     Err(err) => {
-                        profile.checkpoint_trigger_reason =
-                            format!("failed_wal_reopen: {err}");
+                        profile.checkpoint_trigger_reason = format!("failed_wal_reopen: {err}");
                     }
                 }
             }
@@ -9213,11 +9291,7 @@ impl NativeSqlEngine {
         let cc = self.get_or_build_cols(table, t);
         if let Some(texts) = cc.text_cols.get(col_name) {
             return materialize_like_contains_id_rows_from_col(
-                &cc.ids,
-                texts,
-                needle,
-                is_ilike,
-                limit,
+                &cc.ids, texts, needle, is_ilike, limit,
             );
         }
         let row_ids = collect_like_contains_row_ids(t, col_name, needle, is_ilike, limit, false);
@@ -9622,10 +9696,7 @@ impl NativeSqlEngine {
         let op_pos = after_order_up
             .find(op_str)
             .ok_or("vector operator not found in prepared ORDER BY")?;
-        let column = after_order[..op_pos]
-            .trim()
-            .trim_matches('"')
-            .to_string();
+        let column = after_order[..op_pos].trim().trim_matches('"').to_string();
         let limit = if let Some(li) = after_order_up[op_pos..].find(" LIMIT ") {
             let abs_li = op_pos + li;
             after_order[abs_li + 7..]
@@ -9814,8 +9885,7 @@ impl NativeSqlEngine {
             None
         };
         if is_mutation && !tx_active && self.data_dir.is_some() {
-            self.autocommit_wal_parent
-                .store(true, Ordering::Relaxed);
+            self.autocommit_wal_parent.store(true, Ordering::Relaxed);
         }
         let result = match plan {
             PreparedPlan::InsertFast {
@@ -9823,13 +9893,7 @@ impl NativeSqlEngine {
                 columns,
                 values,
                 wal_insert_prefix,
-            } => self.execute_prepared_insert(
-                table,
-                columns,
-                values,
-                params,
-                wal_insert_prefix,
-            ),
+            } => self.execute_prepared_insert(table, columns, values, params, wal_insert_prefix),
             PreparedPlan::SelectByPrimaryKey {
                 table,
                 key,
@@ -9866,13 +9930,7 @@ impl NativeSqlEngine {
                 limit,
                 projection,
             } => self.execute_prepared_vector_knn(
-                table,
-                column,
-                *metric,
-                query,
-                *limit,
-                projection,
-                params,
+                table, column, *metric, query, *limit, projection, params,
             ),
             PreparedPlan::LikeContains {
                 table,
@@ -9880,21 +9938,14 @@ impl NativeSqlEngine {
                 pattern,
                 limit,
                 projection,
-            } => self.execute_prepared_like_contains(
-                table,
-                column,
-                pattern,
-                *limit,
-                projection,
-                params,
-            ),
+            } => self
+                .execute_prepared_like_contains(table, column, pattern, *limit, projection, params),
             PreparedPlan::SelectAll { table, projection } => {
                 self.execute_prepared_select_all(table, projection)
             }
         };
         if is_mutation && !tx_active {
-            self.autocommit_wal_parent
-                .store(false, Ordering::Relaxed);
+            self.autocommit_wal_parent.store(false, Ordering::Relaxed);
         }
         if result.is_ok() && is_mutation && tx_active {
             if let Some(sql) = wal_sql.as_deref() {
@@ -9933,9 +9984,9 @@ impl NativeSqlEngine {
             }
             match value {
                 PreparedValue::Param(idx) => {
-                    let p = params.get(*idx).ok_or_else(|| {
-                        format!("missing prepared parameter ${}", idx + 1)
-                    })?;
+                    let p = params
+                        .get(*idx)
+                        .ok_or_else(|| format!("missing prepared parameter ${}", idx + 1))?;
                     out.push_str(p);
                 }
                 PreparedValue::Literal(cell) => out.push_str(&Self::cell_sql_literal_for_wal(cell)),
@@ -10427,7 +10478,7 @@ impl NativeSqlEngine {
             columns,
             rows: rows_out,
             command_tag: format!("SELECT {}", row_count),
-        ..Default::default()
+            ..Default::default()
         })
     }
 
@@ -10450,12 +10501,7 @@ impl NativeSqlEngine {
         let row_ids = if let Some(entry) = self.trigram_catalog.find(table, column) {
             if entry.should_scan_table(&needle, table_rows) {
                 if Self::like_universal_trigram_match(
-                    &entry,
-                    &*t,
-                    column,
-                    &needle,
-                    table_rows,
-                    false,
+                    &entry, &*t, column, &needle, table_rows, false,
                 ) {
                     let mut ids: Vec<i64> = (*self.table_row_ids_fast(table, &*t)).clone();
                     if let Some(lim) = limit {
@@ -10469,12 +10515,14 @@ impl NativeSqlEngine {
                 let mut ids = entry.search_contains(&needle);
                 if !entry.contains_match_is_exact(&needle) {
                     ids.retain(|row_id| {
-                        t.rows.get(row_id).and_then(|row| {
-                            row.cols.get(column).map(|c| {
-                                like_literal_contains(&c.as_text(), &needle, false)
+                        t.rows
+                            .get(row_id)
+                            .and_then(|row| {
+                                row.cols
+                                    .get(column)
+                                    .map(|c| like_literal_contains(&c.as_text(), &needle, false))
                             })
-                        })
-                        .unwrap_or(false)
+                            .unwrap_or(false)
                     });
                 }
                 if let Some(lim) = limit {
@@ -10495,7 +10543,7 @@ impl NativeSqlEngine {
             columns,
             rows: rows_out,
             command_tag: format!("SELECT {}", row_ids.len()),
-        ..Default::default()
+            ..Default::default()
         })
     }
 
@@ -10543,7 +10591,7 @@ impl NativeSqlEngine {
             command_tag: format!("SELECT {}", rows.len()),
             columns,
             rows,
-        ..Default::default()
+            ..Default::default()
         })
     }
 
@@ -10602,7 +10650,7 @@ impl NativeSqlEngine {
             command_tag: format!("SELECT {}", rows.len()),
             columns,
             rows,
-        ..Default::default()
+            ..Default::default()
         })
     }
 
@@ -10760,7 +10808,7 @@ impl NativeSqlEngine {
             columns: vec![("count".to_string(), oid::INT8, 8)],
             rows: vec![vec![Some(count.to_string().into_bytes())]],
             command_tag: "SELECT 1".to_string(),
-        ..Default::default()
+            ..Default::default()
         })
     }
 
@@ -10817,7 +10865,7 @@ impl NativeSqlEngine {
             columns: vec![("count".to_string(), oid::INT8, 8)],
             rows: vec![vec![Some(count.to_string().into_bytes())]],
             command_tag: "SELECT 1".to_string(),
-        ..Default::default()
+            ..Default::default()
         })
     }
 
@@ -10857,19 +10905,22 @@ impl NativeSqlEngine {
         if self.transaction_active() {
             if Self::sql_prefix_ci(s, "INSERT INTO") {
                 let tbl = Self::parse_ident_after(s, "INSERT INTO").unwrap_or("");
-                self.auth.check_privilege(username, tbl, Privilege::Insert)?;
+                self.auth
+                    .check_privilege(username, tbl, Privilege::Insert)?;
                 if let Some(result) = self.try_transaction_insert_fast(s) {
                     return result;
                 }
             } else if Self::sql_prefix_ci(s, "UPDATE ") {
                 let tbl = Self::parse_ident_after(s, "UPDATE").unwrap_or("");
-                self.auth.check_privilege(username, tbl, Privilege::Update)?;
+                self.auth
+                    .check_privilege(username, tbl, Privilege::Update)?;
                 if let Some(result) = self.try_transaction_update_fast(s) {
                     return result;
                 }
             } else if Self::sql_prefix_ci(s, "DELETE FROM ") {
                 let tbl = Self::parse_ident_after(s, "DELETE FROM").unwrap_or("");
-                self.auth.check_privilege(username, tbl, Privilege::Delete)?;
+                self.auth
+                    .check_privilege(username, tbl, Privilege::Delete)?;
                 if let Some(result) = self.try_transaction_delete_fast(s) {
                     return result;
                 }
@@ -11432,7 +11483,7 @@ impl NativeSqlEngine {
             columns: vec![("QUERY PLAN".to_string(), oid::TEXT, -1)],
             rows: vec![vec![Some(plan.into_bytes())]],
             command_tag: "EXPLAIN".to_string(),
-        ..Default::default()
+            ..Default::default()
         })
     }
 
@@ -11607,7 +11658,7 @@ impl NativeSqlEngine {
             columns: vec![],
             rows: vec![],
             command_tag: tag.to_string(),
-        ..Default::default()
+            ..Default::default()
         }
     }
 
@@ -11775,9 +11826,7 @@ impl NativeSqlEngine {
             return Cell::Text(inner);
         }
         let t_lower = t.to_ascii_lowercase();
-        if t_lower.contains("::vector")
-            || (Self::looks_like_vector_literal(t))
-        {
+        if t_lower.contains("::vector") || (Self::looks_like_vector_literal(t)) {
             if let Some(vector) = Self::parse_vector_expr(t) {
                 return Self::vector_cell(vector);
             }
@@ -11848,9 +11897,7 @@ impl NativeSqlEngine {
             Cell::Text(s) | Cell::Json(s) if Self::looks_like_vector_literal(s) => {
                 Self::parse_vector_cell(cell).map(|v| v.len())
             }
-            Cell::Array(arr) => {
-                Self::parse_vector_cell(cell).map(|v| v.len())
-            }
+            Cell::Array(arr) => Self::parse_vector_cell(cell).map(|v| v.len()),
             _ => None,
         }
     }
@@ -12998,7 +13045,9 @@ impl NativeSqlEngine {
     }
 
     /// Index kind parsed from CREATE INDEX ... USING ...
-    fn parse_create_index_spec(s: &str) -> Result<(String, String, Vec<String>, CreateIndexKind), String> {
+    fn parse_create_index_spec(
+        s: &str,
+    ) -> Result<(String, String, Vec<String>, CreateIndexKind), String> {
         let up = s.to_ascii_uppercase();
         let on_idx = up.find(" ON ").ok_or("Invalid CREATE INDEX: missing ON")?;
         let idx_kw = up.find("INDEX").ok_or("Invalid CREATE INDEX")?;
@@ -13008,16 +13057,18 @@ impl NativeSqlEngine {
         }
 
         // Vector-index shorthand without USING: `ON t (col) WITH (metric=cosine, ...)`.
-        let with_metric_shorthand = !up.contains(" USING ")
-            && up.contains(" WITH ")
-            && up.contains("METRIC");
+        let with_metric_shorthand =
+            !up.contains(" USING ") && up.contains(" WITH ") && up.contains("METRIC");
         let kind = if up.contains("USING JSON_PATH") {
             let path = Self::parse_using_string_arg(s, "JSON_PATH")?;
             CreateIndexKind::JsonPath(path)
         } else if up.contains("USING HNSW") || up.contains("USING IVFFLAT") || with_metric_shorthand
         {
             CreateIndexKind::Hnsw(parse_hnsw_metric_from_sql(s))
-        } else if up.contains("USING GIN_TRGM") || up.contains("USING TRGM") || up.contains("USING TRIGRAM") {
+        } else if up.contains("USING GIN_TRGM")
+            || up.contains("USING TRGM")
+            || up.contains("USING TRIGRAM")
+        {
             CreateIndexKind::Trigram
         } else if up.contains("USING GIN") || up.contains("USING INVERTED") {
             CreateIndexKind::InvertedGin
@@ -13035,7 +13086,9 @@ impl NativeSqlEngine {
             s
         };
         let up_trim = s_trim.to_ascii_uppercase();
-        let on_idx = up_trim.find(" ON ").ok_or("Invalid CREATE INDEX: missing ON")?;
+        let on_idx = up_trim
+            .find(" ON ")
+            .ok_or("Invalid CREATE INDEX: missing ON")?;
 
         let after_on = &s_trim[on_idx + 4..];
         let after_on_up = after_on.to_ascii_uppercase();
@@ -13103,9 +13156,7 @@ impl NativeSqlEngine {
         if quote != '\'' && quote != '"' {
             return Err("path argument must be quoted".into());
         }
-        let end = rest[1..]
-            .find(quote)
-            .ok_or("unterminated path argument")?;
+        let end = rest[1..].find(quote).ok_or("unterminated path argument")?;
         Ok(rest[1..1 + end].to_string())
     }
 
@@ -13306,7 +13357,10 @@ impl NativeSqlEngine {
 
     fn profile_catalog_snapshot(&self, start: Instant) {
         if Self::native_profile_enabled() {
-            Self::profile_ns(&self.native_profile.dml_catalog_snapshot_ns, start.elapsed());
+            Self::profile_ns(
+                &self.native_profile.dml_catalog_snapshot_ns,
+                start.elapsed(),
+            );
             self.native_profile
                 .dml_catalog_snapshot_count
                 .fetch_add(1, Ordering::Relaxed);
@@ -13346,11 +13400,7 @@ impl NativeSqlEngine {
         }
     }
 
-    fn autocommit_delete_by_pk(
-        &self,
-        table: &str,
-        row_id: i64,
-    ) -> Result<QueryResult, String> {
+    fn autocommit_delete_by_pk(&self, table: &str, row_id: i64) -> Result<QueryResult, String> {
         let lookup_start = if Self::native_profile_enabled() {
             Some(Instant::now())
         } else {
@@ -13459,11 +13509,7 @@ impl NativeSqlEngine {
         }
     }
 
-    fn maintain_vector_hnsw_indexes_for_rows(
-        &self,
-        table: &str,
-        rows: &[(i64, &NativeRow)],
-    ) {
+    fn maintain_vector_hnsw_indexes_for_rows(&self, table: &str, rows: &[(i64, &NativeRow)]) {
         if rows.is_empty() || Self::vector_skip_hnsw_maintain() {
             return;
         }
@@ -13672,7 +13718,9 @@ impl NativeSqlEngine {
                 let g = self.tables.to_native_map();
                 if let Some(t) = g.get(&table) {
                     for (&row_id, row) in &t.rows {
-                        if let Some(text) = Self::row_text_for_inverted_columns(row, &entry.meta.columns) {
+                        if let Some(text) =
+                            Self::row_text_for_inverted_columns(row, &entry.meta.columns)
+                        {
                             if let Ok(doc_id) = u32::try_from(row_id) {
                                 entry.index_row(doc_id, &text);
                             }
@@ -13682,18 +13730,13 @@ impl NativeSqlEngine {
                 entry.finalize_if_needed();
             }
             CreateIndexKind::JsonPath(path) => {
-                let entry = self.json_path_catalog.create_index(
-                    name,
-                    table.clone(),
-                    col,
-                    path,
-                );
+                let entry = self
+                    .json_path_catalog
+                    .create_index(name, table.clone(), col, path);
                 self.backfill_json_path_index(&entry, &table)?;
             }
             CreateIndexKind::Trigram => {
-                let entry = self
-                    .trigram_catalog
-                    .create_index(name, table.clone(), col);
+                let entry = self.trigram_catalog.create_index(name, table.clone(), col);
                 self.backfill_trigram_index(&entry, &table)?;
             }
             CreateIndexKind::Hnsw(metric) => {
@@ -13707,13 +13750,9 @@ impl NativeSqlEngine {
                         col
                     )
                 })?;
-                let entry = self.vector_hnsw_catalog.create_index(
-                    name,
-                    table.clone(),
-                    col,
-                    dim,
-                    metric,
-                );
+                let entry =
+                    self.vector_hnsw_catalog
+                        .create_index(name, table.clone(), col, dim, metric);
                 self.backfill_vector_hnsw_index(&entry, &table)?;
             }
             CreateIndexKind::BTree => {
@@ -13815,7 +13854,7 @@ impl NativeSqlEngine {
             columns: vec![("analyze".to_string(), oid::TEXT, -1)],
             rows: vec![vec![Some(msg.as_bytes().to_vec())]],
             command_tag: format!("ANALYZE {}", total_analyzed),
-        ..Default::default()
+            ..Default::default()
         })
     }
 
@@ -13835,7 +13874,7 @@ impl NativeSqlEngine {
             columns,
             rows,
             command_tag: format!("SELECT {}", n),
-        ..Default::default()
+            ..Default::default()
         })
     }
 
@@ -13893,7 +13932,7 @@ impl NativeSqlEngine {
                 columns,
                 rows,
                 command_tag: format!("SELECT {}", n),
-            ..Default::default()
+                ..Default::default()
             });
         }
 
@@ -13926,7 +13965,7 @@ impl NativeSqlEngine {
             columns,
             rows,
             command_tag: format!("SELECT {}", n),
-        ..Default::default()
+            ..Default::default()
         })
     }
 
@@ -14021,7 +14060,7 @@ impl NativeSqlEngine {
             columns,
             rows: rows_out,
             command_tag: format!("SELECT {}", n),
-        ..Default::default()
+            ..Default::default()
         })
     }
 
@@ -14089,9 +14128,7 @@ impl NativeSqlEngine {
             return self.copy_from_stdin_inline(table, hex_payload.trim());
         }
         if after_from.eq_ignore_ascii_case("STDIN") {
-            return Err(
-                "COPY FROM STDIN requires PostgreSQL CopyData wire protocol".into(),
-            );
+            return Err("COPY FROM STDIN requires PostgreSQL CopyData wire protocol".into());
         }
 
         let path = Self::extract_quoted_path(after_from)
@@ -14236,7 +14273,7 @@ impl NativeSqlEngine {
             columns: vec![("copy".to_string(), oid::TEXT, -1)],
             rows: vec![vec![Some(msg.as_bytes().to_vec())]],
             command_tag: msg,
-        ..Default::default()
+            ..Default::default()
         })
     }
 
@@ -14425,7 +14462,7 @@ impl NativeSqlEngine {
 
     fn indexed_or_eq_row_ids(&self, table: &str, pred: &str) -> Option<Vec<i64>> {
         let (col, keys) = Self::parse_or_eq_index_terms(pred)?;
-        self.index_mgr.record_query_hit(table, &col);
+        self.record_auto_index_query_hit(table, &col);
         let tree = self.index_mgr.find_index(table, &col)?;
         self.index_mgr.record_index_use(&tree.name);
 
@@ -14553,10 +14590,7 @@ impl NativeSqlEngine {
     ) -> Option<i64> {
         let cc = self.get_or_build_cols(table, t);
         match key {
-            IndexKey::Integer(v) => cc
-                .int_cols
-                .get(col)
-                .map(|iv| columnar_count_eq_i64(iv, *v)),
+            IndexKey::Integer(v) => cc.int_cols.get(col).map(|iv| columnar_count_eq_i64(iv, *v)),
             _ => None,
         }
     }
@@ -14618,17 +14652,13 @@ impl NativeSqlEngine {
             };
             let term_hits: Vec<usize> = if let Some(iv) = cc.int_cols.get(col.as_str()) {
                 if let Cell::Int(target) = value {
-                    (0..cc.ids.len())
-                        .filter(|&i| iv[i] == target)
-                        .collect()
+                    (0..cc.ids.len()).filter(|&i| iv[i] == target).collect()
                 } else {
                     return None;
                 }
             } else if let Some(tv) = cc.text_cols.get(col.as_str()) {
                 let target = value.as_text();
-                (0..cc.ids.len())
-                    .filter(|&i| tv[i] == target)
-                    .collect()
+                (0..cc.ids.len()).filter(|&i| tv[i] == target).collect()
             } else {
                 return None;
             };
@@ -14885,11 +14915,7 @@ impl NativeSqlEngine {
         } else {
             None
         };
-        let indexes = self.index_mgr.indexes.read();
-        for (_name, tree) in indexes.iter() {
-            if tree.table != table {
-                continue;
-            }
+        for tree in self.index_mgr.trees_for_table_including_shadow(table) {
             for col in &tree.columns {
                 if let Some(cell) = row.cols.get(col) {
                     if let Some(key) = Self::index_key_for_cell(cell) {
@@ -14913,11 +14939,7 @@ impl NativeSqlEngine {
         } else {
             None
         };
-        let indexes = self.index_mgr.indexes.read();
-        for (_name, tree) in indexes.iter() {
-            if tree.table != table {
-                continue;
-            }
+        for tree in self.index_mgr.trees_for_table_including_shadow(table) {
             for col in &tree.columns {
                 if let Some(cell) = row.cols.get(col) {
                     if let Some(key) = Self::index_key_for_cell(cell) {
@@ -14981,11 +15003,7 @@ impl NativeSqlEngine {
         } else {
             None
         };
-        let indexes = self.index_mgr.indexes.read();
-        for (_name, tree) in indexes.iter() {
-            if tree.table != table {
-                continue;
-            }
+        for tree in self.index_mgr.trees_for_table_including_shadow(table) {
             for col in &tree.columns {
                 // Check if this column is being changed.
                 if let Some((_, new_val)) = new_vals.iter().find(|(c, _)| c == col) {
@@ -15016,7 +15034,9 @@ impl NativeSqlEngine {
             }
         }
         for entry in self.json_path_catalog.indexes_for_table(table) {
-            let touched = new_vals.iter().any(|(col, _)| col == &entry.meta.key.column);
+            let touched = new_vals
+                .iter()
+                .any(|(col, _)| col == &entry.meta.key.column);
             if touched {
                 self.remove_json_path_indexes_for_row(table, row_id, old_row);
                 let mut merged_row = old_row.clone();
@@ -15027,7 +15047,9 @@ impl NativeSqlEngine {
             }
         }
         for entry in self.trigram_catalog.indexes_for_table(table) {
-            let touched = new_vals.iter().any(|(col, _)| col == &entry.meta.key.column);
+            let touched = new_vals
+                .iter()
+                .any(|(col, _)| col == &entry.meta.key.column);
             if touched {
                 self.remove_trigram_indexes_for_row(table, row_id, old_row);
                 let mut merged_row = old_row.clone();
@@ -15329,7 +15351,7 @@ impl NativeSqlEngine {
                 columns,
                 rows: returning_rows,
                 command_tag: format!("DELETE {deleted}"),
-            ..Default::default()
+                ..Default::default()
             });
         }
         Ok(Self::empty_ok(&format!("DELETE {deleted}")))
@@ -15474,12 +15496,14 @@ impl NativeSqlEngine {
         let wal_owned_by_parent = self.autocommit_wal_owned_by_parent();
         if !wal_owned_by_parent {
             self.wal_append(wal_sql)?;
-            self.index_mgr.record_writes(table, cols.iter().map(|c| c.as_str()));
+            self.index_mgr
+                .record_writes(table, cols.iter().map(|c| c.as_str()));
             self.mark_table_data_dirty(table, count as u64);
             self.buf_pool.invalidate(table);
             let _ = self.after_successful_autocommit_wal_mutation();
         } else {
-            self.index_mgr.record_writes(table, cols.iter().map(|c| c.as_str()));
+            self.index_mgr
+                .record_writes(table, cols.iter().map(|c| c.as_str()));
             self.mark_table_data_dirty(table, count as u64);
             self.buf_pool.invalidate(table);
         }
@@ -15539,8 +15563,7 @@ impl NativeSqlEngine {
 
     /// Dictionary-backed tag column (`tag_{i % 20}`) for OLAP series seed.
     fn build_olap_series_tag_col(ids: &[i64]) -> Vec<String> {
-        let tags: Arc<[String; 20]> =
-            Arc::new(std::array::from_fn(|k| format!("tag_{k}")));
+        let tags: Arc<[String; 20]> = Arc::new(std::array::from_fn(|k| format!("tag_{k}")));
         if ids.len() >= OLAP_SOA_PARALLEL_MIN_ROWS {
             ids.par_iter()
                 .map(|i| tags[i.rem_euclid(20) as usize].clone())
@@ -15553,7 +15576,10 @@ impl NativeSqlEngine {
     }
 
     /// Legacy SoA builder (includes tag strings) for heap materialization paths.
-    fn build_olap_series_soa(start: i64, count: usize) -> (Vec<i64>, Vec<i64>, Vec<f64>, Vec<String>) {
+    fn build_olap_series_soa(
+        start: i64,
+        count: usize,
+    ) -> (Vec<i64>, Vec<i64>, Vec<f64>, Vec<String>) {
         let (ids, grp, val) = Self::build_olap_series_numeric_soa(start, count);
         let tags: Arc<[String; 20]> = Arc::new(std::array::from_fn(|k| format!("tag_{k}")));
         let tag: Vec<String> = if count >= OLAP_SOA_PARALLEL_MIN_ROWS {
@@ -15679,7 +15705,7 @@ impl NativeSqlEngine {
             columns: Vec::new(),
             rows: Vec::new(),
             command_tag: format!("COPY {}", count),
-        ..Default::default()
+            ..Default::default()
         })
     }
 
@@ -15688,9 +15714,7 @@ impl NativeSqlEngine {
             .map_err(|_| "COPY STDIN: payload must be UTF-8 text".to_string())?;
         let mut rows: Vec<(i64, NativeRow)> = Vec::new();
         let cols: Vec<String> = self.tables.with_read(table, |t| t.columns.clone())?;
-        let mut next_id = self
-            .tables
-            .with_read(table, |t| t.next_auto_id.max(1))?;
+        let mut next_id = self.tables.with_read(table, |t| t.next_auto_id.max(1))?;
 
         for line in text.lines() {
             if line.trim().is_empty() {
@@ -15981,7 +16005,10 @@ impl NativeSqlEngine {
             Ok(())
         })?;
         if let Some(start) = heap_start {
-            Self::profile_ns(&self.native_profile.txn_record_heap_mutate_ns, start.elapsed());
+            Self::profile_ns(
+                &self.native_profile.txn_record_heap_mutate_ns,
+                start.elapsed(),
+            );
         }
         let ids: Vec<i64> = inserts.iter().map(|ins| ins.id).collect();
         let undo_start = Self::txn_profile_enabled().then(Instant::now);
@@ -16010,15 +16037,18 @@ impl NativeSqlEngine {
                     state.wal_sql.push(line);
                 }
             }
-            *state
-                .insert_wal_staged
-                .entry(table.clone())
-                .or_insert(0) += ids.len();
+            *state.insert_wal_staged.entry(table.clone()).or_insert(0) += ids.len();
         }
         if let Some(start) = undo_start {
-            Self::profile_ns(&self.native_profile.txn_record_undo_push_ns, start.elapsed());
+            Self::profile_ns(
+                &self.native_profile.txn_record_undo_push_ns,
+                start.elapsed(),
+            );
             if has_table_indexes {
-                Self::profile_ns(&self.native_profile.txn_record_deferred_push_ns, start.elapsed());
+                Self::profile_ns(
+                    &self.native_profile.txn_record_deferred_push_ns,
+                    start.elapsed(),
+                );
             }
         }
         Ok(())
@@ -16041,32 +16071,38 @@ impl NativeSqlEngine {
         let mut undo_entries: Vec<(i64, Option<NativeRow>)> = Vec::with_capacity(updates.len());
         let mut replacements: Vec<(i64, NativeRow)> = Vec::new();
         let heap_start = Self::txn_profile_enabled().then(Instant::now);
-        self.tables.with_write(table.as_str(), |t| -> Result<(), String> {
-            let col_idx = t
-                .columns
-                .iter()
-                .position(|c| c == col)
-                .ok_or_else(|| format!("column \"{col}\" does not exist"))?;
-            if !matches!(t.column_types.get(col_idx), Some(ColType::Integer)) {
-                return Err(format!("execute_batch UPDATE requires integer column {col}"));
-            }
-            for upd in updates {
-                let Some(row) = t.rows.get_mut(&upd.row_id) else {
-                    continue;
-                };
-                let old_row = row.clone();
-                let current = row.cols.get(col.as_str()).map(|c| c.as_i64()).unwrap_or(0);
-                row.cols
-                    .insert(col.clone(), Cell::Int(current.saturating_add(delta)));
-                if has_table_indexes {
-                    replacements.push((upd.row_id, old_row.clone()));
+        self.tables
+            .with_write(table.as_str(), |t| -> Result<(), String> {
+                let col_idx = t
+                    .columns
+                    .iter()
+                    .position(|c| c == col)
+                    .ok_or_else(|| format!("column \"{col}\" does not exist"))?;
+                if !matches!(t.column_types.get(col_idx), Some(ColType::Integer)) {
+                    return Err(format!(
+                        "execute_batch UPDATE requires integer column {col}"
+                    ));
                 }
-                undo_entries.push((upd.row_id, Some(old_row)));
-            }
-            Ok(())
-        })?;
+                for upd in updates {
+                    let Some(row) = t.rows.get_mut(&upd.row_id) else {
+                        continue;
+                    };
+                    let old_row = row.clone();
+                    let current = row.cols.get(col.as_str()).map(|c| c.as_i64()).unwrap_or(0);
+                    row.cols
+                        .insert(col.clone(), Cell::Int(current.saturating_add(delta)));
+                    if has_table_indexes {
+                        replacements.push((upd.row_id, old_row.clone()));
+                    }
+                    undo_entries.push((upd.row_id, Some(old_row)));
+                }
+                Ok(())
+            })?;
         if let Some(start) = heap_start {
-            Self::profile_ns(&self.native_profile.txn_record_heap_mutate_ns, start.elapsed());
+            Self::profile_ns(
+                &self.native_profile.txn_record_heap_mutate_ns,
+                start.elapsed(),
+            );
         }
         let undo_start = Self::txn_profile_enabled().then(Instant::now);
         let mut tx = self.transaction.write();
@@ -16096,9 +16132,15 @@ impl NativeSqlEngine {
             ));
         }
         if let Some(start) = undo_start {
-            Self::profile_ns(&self.native_profile.txn_record_undo_push_ns, start.elapsed());
+            Self::profile_ns(
+                &self.native_profile.txn_record_undo_push_ns,
+                start.elapsed(),
+            );
             if has_table_indexes {
-                Self::profile_ns(&self.native_profile.txn_record_deferred_push_ns, start.elapsed());
+                Self::profile_ns(
+                    &self.native_profile.txn_record_deferred_push_ns,
+                    start.elapsed(),
+                );
             }
         }
         Ok(())
@@ -16146,7 +16188,10 @@ impl NativeSqlEngine {
             }
         })?;
         if let Some(start) = heap_start {
-            Self::profile_ns(&self.native_profile.txn_record_heap_mutate_ns, start.elapsed());
+            Self::profile_ns(
+                &self.native_profile.txn_record_heap_mutate_ns,
+                start.elapsed(),
+            );
         }
         if removed.is_empty() {
             return Ok(());
@@ -16180,9 +16225,15 @@ impl NativeSqlEngine {
                 .extend(deferred_deletes);
         }
         if let Some(start) = undo_start {
-            Self::profile_ns(&self.native_profile.txn_record_undo_push_ns, start.elapsed());
+            Self::profile_ns(
+                &self.native_profile.txn_record_undo_push_ns,
+                start.elapsed(),
+            );
             if has_table_indexes {
-                Self::profile_ns(&self.native_profile.txn_record_deferred_push_ns, start.elapsed());
+                Self::profile_ns(
+                    &self.native_profile.txn_record_deferred_push_ns,
+                    start.elapsed(),
+                );
             }
         }
         Ok(())
@@ -16419,9 +16470,7 @@ impl NativeSqlEngine {
             return Ok(Cell::Int(n));
         }
         if expr.starts_with('\'') && expr.ends_with('\'') {
-            return Ok(Cell::Text(
-                expr[1..expr.len() - 1].replace("''", "'"),
-            ));
+            return Ok(Cell::Text(expr[1..expr.len() - 1].replace("''", "'")));
         }
         if let Some(v) = Self::eval_series_mod_var(expr, var, i) {
             return Ok(Cell::Int(v));
@@ -16483,10 +16532,7 @@ impl NativeSqlEngine {
     ) -> Result<usize, String> {
         let prefix = prefix.to_string();
         let text_col = text_col.to_string();
-        let id_col = cols
-            .first()
-            .cloned()
-            .unwrap_or_else(|| "id".to_string());
+        let id_col = cols.first().cloned().unwrap_or_else(|| "id".to_string());
         let build = |offset: usize| {
             let id = start.saturating_add(offset as i64);
             let mut row_map = HashMap::with_capacity(2);
@@ -16625,7 +16671,7 @@ impl NativeSqlEngine {
         let select_exprs = Self::split_top_level_csv(s[select_idx + 6..from_idx].trim());
         if select_exprs.len() != cols.len() {
             return Some(Err(
-                "generate_series INSERT: SELECT column count mismatch".to_string(),
+                "generate_series INSERT: SELECT column count mismatch".to_string()
             ));
         }
 
@@ -16639,7 +16685,8 @@ impl NativeSqlEngine {
             return Some(Ok(Self::empty_ok("INSERT 0 0")));
         }
 
-        if Self::is_olap_series_template(&select_exprs, &var) && count >= OLAP_COLUMNAR_SEED_MIN_ROWS
+        if Self::is_olap_series_template(&select_exprs, &var)
+            && count >= OLAP_COLUMNAR_SEED_MIN_ROWS
         {
             return Some(
                 self.bulk_seed_olap_series_columnar(&table, &cols, start, count, s)
@@ -16688,11 +16735,12 @@ impl NativeSqlEngine {
                     },
                 ))
             };
-            let built: Result<Vec<(i64, NativeRow)>, String> = if count >= OLAP_SOA_PARALLEL_MIN_ROWS {
-                (0..count).into_par_iter().map(build_row).collect()
-            } else {
-                (0..count).map(build_row).collect()
-            };
+            let built: Result<Vec<(i64, NativeRow)>, String> =
+                if count >= OLAP_SOA_PARALLEL_MIN_ROWS {
+                    (0..count).into_par_iter().map(build_row).collect()
+                } else {
+                    (0..count).map(build_row).collect()
+                };
             match built {
                 Ok(rows) => rows,
                 Err(err) => return Some(Err(err)),
@@ -16813,37 +16861,84 @@ impl NativeSqlEngine {
         // Limit: strip ON CONFLICT / RETURNING from VALUES parsing
         let values_end = on_conflict_idx.unwrap_or(returning_idx.unwrap_or(s.len()));
 
-        let prepared_rows =
-            if is_insert_select {
-                // INSERT INTO ... SELECT ...
-                let select_sql = if after_cols_trim.starts_with('(') {
-                    let inner = &after_cols_trim[1..]; // strip leading (
-                                                         // Find matching )
-                    if let Some(end) = inner.rfind(')') {
-                        &inner[..end]
-                    } else {
-                        inner
-                    }
+        let prepared_rows = if is_insert_select {
+            // INSERT INTO ... SELECT ...
+            let select_sql = if after_cols_trim.starts_with('(') {
+                let inner = &after_cols_trim[1..]; // strip leading (
+                                                   // Find matching )
+                if let Some(end) = inner.rfind(')') {
+                    &inner[..end]
                 } else {
-                    let sel_end = on_conflict_idx
-                        .map(|i| i - (s.len() - after_cols.len()))
-                        .unwrap_or(after_cols.len());
-                    let sel_end = returning_idx
-                        .map(|i| std::cmp::min(sel_end, i - (s.len() - after_cols.len())))
-                        .unwrap_or(sel_end);
-                    after_cols[..sel_end].trim().trim_end_matches(';')
-                };
-                let select_result = self.handle_select(select_sql)?;
-                let mut rows = Vec::with_capacity(select_result.rows.len());
-                for row_data in &select_result.rows {
+                    inner
+                }
+            } else {
+                let sel_end = on_conflict_idx
+                    .map(|i| i - (s.len() - after_cols.len()))
+                    .unwrap_or(after_cols.len());
+                let sel_end = returning_idx
+                    .map(|i| std::cmp::min(sel_end, i - (s.len() - after_cols.len())))
+                    .unwrap_or(sel_end);
+                after_cols[..sel_end].trim().trim_end_matches(';')
+            };
+            let select_result = self.handle_select(select_sql)?;
+            let mut rows = Vec::with_capacity(select_result.rows.len());
+            for row_data in &select_result.rows {
+                let mut row_map: HashMap<String, Cell> = HashMap::with_capacity(cols.len());
+                for (i, c) in cols.iter().enumerate() {
+                    let cell = if let Some(Some(bytes)) = row_data.get(i) {
+                        Self::parse_value(&String::from_utf8_lossy(bytes))
+                    } else {
+                        Cell::Null
+                    };
+                    row_map.insert(c.clone(), cell);
+                }
+                let id = row_map.get("id").map(|v| v.as_i64()).unwrap_or(0);
+                rows.push((
+                    id,
+                    NativeRow {
+                        cols: row_map,
+                        last_modified_lsn: 0,
+                    },
+                ));
+            }
+            rows
+        } else {
+            // Standard VALUES(...)
+            let values_part_str = &s[col_close + 1..values_end];
+            let values_idx_local =
+                Self::find_ascii_ci(values_part_str, "VALUES").ok_or("Invalid INSERT VALUES")?;
+            let values_part = &values_part_str[values_idx_local + 6..];
+            let value_groups = Self::parse_multi_value_groups(values_part);
+            if value_groups.is_empty() {
+                return Err("Invalid INSERT VALUES".to_string());
+            }
+            let rows: Vec<(i64, NativeRow)> = if value_groups.len() >= MULTI_VALUES_PARALLEL_MIN {
+                let cols = cols.clone();
+                value_groups
+                    .into_par_iter()
+                    .map(|vals| {
+                        let mut row_map: HashMap<String, Cell> = HashMap::with_capacity(cols.len());
+                        let mut vals = vals.into_iter();
+                        for c in &cols {
+                            row_map.insert(c.clone(), vals.next().unwrap_or(Cell::Null));
+                        }
+                        let id = row_map.get("id").map(|v| v.as_i64()).unwrap_or(0);
+                        (
+                            id,
+                            NativeRow {
+                                cols: row_map,
+                                last_modified_lsn: 0,
+                            },
+                        )
+                    })
+                    .collect()
+            } else {
+                let mut rows = Vec::with_capacity(value_groups.len());
+                for vals in value_groups {
                     let mut row_map: HashMap<String, Cell> = HashMap::with_capacity(cols.len());
-                    for (i, c) in cols.iter().enumerate() {
-                        let cell = if let Some(Some(bytes)) = row_data.get(i) {
-                            Self::parse_value(&String::from_utf8_lossy(bytes))
-                        } else {
-                            Cell::Null
-                        };
-                        row_map.insert(c.clone(), cell);
+                    let mut vals = vals.into_iter();
+                    for c in &cols {
+                        row_map.insert(c.clone(), vals.next().unwrap_or(Cell::Null));
                     }
                     let id = row_map.get("id").map(|v| v.as_i64()).unwrap_or(0);
                     rows.push((
@@ -16855,59 +16950,9 @@ impl NativeSqlEngine {
                     ));
                 }
                 rows
-            } else {
-                // Standard VALUES(...)
-                let values_part_str = &s[col_close + 1..values_end];
-                let values_idx_local = Self::find_ascii_ci(values_part_str, "VALUES")
-                    .ok_or("Invalid INSERT VALUES")?;
-                let values_part = &values_part_str[values_idx_local + 6..];
-                let value_groups = Self::parse_multi_value_groups(values_part);
-                if value_groups.is_empty() {
-                    return Err("Invalid INSERT VALUES".to_string());
-                }
-                let rows: Vec<(i64, NativeRow)> = if value_groups.len() >= MULTI_VALUES_PARALLEL_MIN {
-                    let cols = cols.clone();
-                    value_groups
-                        .into_par_iter()
-                        .map(|vals| {
-                            let mut row_map: HashMap<String, Cell> =
-                                HashMap::with_capacity(cols.len());
-                            let mut vals = vals.into_iter();
-                            for c in &cols {
-                                row_map.insert(c.clone(), vals.next().unwrap_or(Cell::Null));
-                            }
-                            let id = row_map.get("id").map(|v| v.as_i64()).unwrap_or(0);
-                            (
-                                id,
-                                NativeRow {
-                                    cols: row_map,
-                                    last_modified_lsn: 0,
-                                },
-                            )
-                        })
-                        .collect()
-                } else {
-                    let mut rows = Vec::with_capacity(value_groups.len());
-                    for vals in value_groups {
-                        let mut row_map: HashMap<String, Cell> =
-                            HashMap::with_capacity(cols.len());
-                        let mut vals = vals.into_iter();
-                        for c in &cols {
-                            row_map.insert(c.clone(), vals.next().unwrap_or(Cell::Null));
-                        }
-                        let id = row_map.get("id").map(|v| v.as_i64()).unwrap_or(0);
-                        rows.push((
-                            id,
-                            NativeRow {
-                                cols: row_map,
-                                last_modified_lsn: 0,
-                            },
-                        ));
-                    }
-                    rows
-                };
-                rows
             };
+            rows
+        };
 
         if matches!(conflict_action, ConflictAction::None)
             && returning_cols.is_empty()
@@ -16922,7 +16967,9 @@ impl NativeSqlEngine {
                 && prepared_rows.iter().all(|(id, _)| *id > 0)
                 && self
                     .tables
-                    .with_read(table, |t| t.sequences.is_empty() && t.foreign_keys.is_empty())
+                    .with_read(table, |t| {
+                        t.sequences.is_empty() && t.foreign_keys.is_empty()
+                    })
                     .unwrap_or(false);
             let count =
                 self.bulk_insert_rows_fast(table, &cols, prepared_rows, s, trust_explicit)?;
@@ -16930,7 +16977,7 @@ impl NativeSqlEngine {
                 columns: Vec::new(),
                 rows: Vec::new(),
                 command_tag: format!("INSERT 0 {}", count),
-            ..Default::default()
+                ..Default::default()
             });
         }
 
@@ -17239,7 +17286,7 @@ impl NativeSqlEngine {
                 columns,
                 rows: returning_rows,
                 command_tag: format!("INSERT 0 {}", inserted_count),
-            ..Default::default()
+                ..Default::default()
             });
         }
 
@@ -17627,7 +17674,7 @@ impl NativeSqlEngine {
                 columns,
                 rows: returning_rows,
                 command_tag: format!("UPDATE {count}"),
-            ..Default::default()
+                ..Default::default()
             });
         }
         Ok(Self::empty_ok(&format!("UPDATE {count}")))
@@ -18564,7 +18611,7 @@ impl NativeSqlEngine {
             columns: merged_columns.unwrap_or_default(),
             rows: all_rows,
             command_tag: format!("SELECT {}", row_count),
-        ..Default::default()
+            ..Default::default()
         })
     }
 
@@ -18622,7 +18669,7 @@ impl NativeSqlEngine {
             columns,
             rows: current_rows,
             command_tag: format!("SELECT {}", n),
-        ..Default::default()
+            ..Default::default()
         })
     }
 
@@ -18678,7 +18725,7 @@ impl NativeSqlEngine {
             columns,
             rows,
             command_tag: format!("SELECT {}", n),
-        ..Default::default()
+            ..Default::default()
         })
     }
 
@@ -18968,7 +19015,7 @@ impl NativeSqlEngine {
             columns,
             rows: rows_out,
             command_tag: format!("SELECT {}", n),
-        ..Default::default()
+            ..Default::default()
         })
     }
 
@@ -19043,7 +19090,7 @@ impl NativeSqlEngine {
                 columns,
                 rows: rows_out,
                 command_tag: format!("SELECT {}", row_count),
-            ..Default::default()
+                ..Default::default()
             });
         }
 
@@ -19089,16 +19136,12 @@ impl NativeSqlEngine {
                         let mut row: Vec<Option<Vec<u8>>> = Vec::with_capacity(col_slices.len());
                         for cs in &col_slices {
                             match cs {
-                                ColSlice::Id => {
-                                    row.push(Some(format_i64_bytes(ids_slice[idx])))
-                                }
+                                ColSlice::Id => row.push(Some(format_i64_bytes(ids_slice[idx]))),
                                 ColSlice::Float(fv) => {
                                     row.push(Some(fv[idx].to_string().into_bytes()))
                                 }
                                 ColSlice::Text(tv) => row.push(Some(tv[idx].as_bytes().to_vec())),
-                                ColSlice::Int(iv) => {
-                                    row.push(Some(format_i64_bytes(iv[idx])))
-                                }
+                                ColSlice::Int(iv) => row.push(Some(format_i64_bytes(iv[idx]))),
                                 ColSlice::Missing => row.push(None),
                             }
                         }
@@ -19131,7 +19174,7 @@ impl NativeSqlEngine {
             columns,
             rows: rows_out,
             command_tag: format!("SELECT {}", row_count),
-        ..Default::default()
+            ..Default::default()
         })
     }
 
@@ -19305,7 +19348,7 @@ impl NativeSqlEngine {
                     columns,
                     rows: rows_out,
                     command_tag: format!("SELECT {}", row_count),
-                ..Default::default()
+                    ..Default::default()
                 });
             }
         }
@@ -19404,7 +19447,7 @@ impl NativeSqlEngine {
             columns,
             rows: rows_out,
             command_tag: format!("SELECT {}", row_count),
-        ..Default::default()
+            ..Default::default()
         })
     }
 
@@ -19417,7 +19460,7 @@ impl NativeSqlEngine {
             columns: vec![("?column?".to_string(), oid::TEXT, -1)],
             rows: vec![vec![Some(val.as_bytes().to_vec())]],
             command_tag: "SELECT 1".to_string(),
-        ..Default::default()
+            ..Default::default()
         })
     }
 
@@ -19478,7 +19521,7 @@ impl NativeSqlEngine {
                 columns,
                 rows: rows_out,
                 command_tag: format!("SELECT {}", row_count),
-            ..Default::default()
+                ..Default::default()
             });
         }
 
@@ -19520,7 +19563,7 @@ impl NativeSqlEngine {
                 columns,
                 rows: rows_out,
                 command_tag: format!("SELECT {}", row_count),
-            ..Default::default()
+                ..Default::default()
             });
         }
 
@@ -19534,12 +19577,13 @@ impl NativeSqlEngine {
                     select_cols.len() == 1 && (select_cols[0] == "id" || select_cols[0] == "*");
                 let shared = self.table_read_guard(table)?;
                 let t = shared.read();
-                let out_cols: Vec<String> =
-                    if select_cols.is_empty() || (select_cols.len() == 1 && select_cols[0] == "*") {
-                        t.columns.clone()
-                    } else {
-                        select_cols
-                    };
+                let out_cols: Vec<String> = if select_cols.is_empty()
+                    || (select_cols.len() == 1 && select_cols[0] == "*")
+                {
+                    t.columns.clone()
+                } else {
+                    select_cols
+                };
                 let columns: Vec<(String, i32, i16)> = out_cols
                     .iter()
                     .map(|c| {
@@ -19556,18 +19600,12 @@ impl NativeSqlEngine {
                 // Heap row count is enough as an index-selection heuristic here;
                 // full MVCC visibility counting costs ~2.5ms per 10k-row table.
                 let table_rows = t.rows.len();
-                let use_direct_id_scan =
-                    id_only && out_cols == vec!["id".to_string()];
+                let use_direct_id_scan = id_only && out_cols == vec!["id".to_string()];
                 if use_direct_id_scan {
                     let row_ids = if let Some(entry) = self.trigram_catalog.find(table, &col_name) {
                         if entry.should_scan_table(&needle, table_rows) {
                             if Self::like_universal_trigram_match(
-                                &entry,
-                                &*t,
-                                &col_name,
-                                &needle,
-                                table_rows,
-                                is_ilike,
+                                &entry, &*t, &col_name, &needle, table_rows, is_ilike,
                             ) {
                                 return Ok(QueryResult::select_ids(
                                     self.table_row_ids_fast(table, &*t),
@@ -19582,12 +19620,18 @@ impl NativeSqlEngine {
                             let mut row_ids = entry.search_contains(&needle);
                             if !entry.contains_match_is_exact(&needle) {
                                 row_ids.retain(|row_id| {
-                                    t.rows.get(row_id).and_then(|row| {
-                                        row.cols.get(col_name.as_str()).map(|c| {
-                                            like_literal_contains(&c.as_text(), &needle, is_ilike)
+                                    t.rows
+                                        .get(row_id)
+                                        .and_then(|row| {
+                                            row.cols.get(col_name.as_str()).map(|c| {
+                                                like_literal_contains(
+                                                    &c.as_text(),
+                                                    &needle,
+                                                    is_ilike,
+                                                )
+                                            })
                                         })
-                                    })
-                                    .unwrap_or(false)
+                                        .unwrap_or(false)
                                 });
                             }
                             if let Some(lim) = limit {
@@ -19596,9 +19640,7 @@ impl NativeSqlEngine {
                             row_ids
                         }
                     } else {
-                        self.like_contains_row_ids(
-                            table, &*t, &col_name, &needle, is_ilike, limit,
-                        )
+                        self.like_contains_row_ids(table, &*t, &col_name, &needle, is_ilike, limit)
                     };
                     return Ok(QueryResult::select_ids(Arc::new(row_ids)));
                 }
@@ -19607,12 +19649,7 @@ impl NativeSqlEngine {
                 if let Some(entry) = self.trigram_catalog.find(table, &col_name) {
                     if entry.should_scan_table(&needle, table_rows) {
                         if Self::like_universal_trigram_match(
-                            &entry,
-                            &*t,
-                            &col_name,
-                            &needle,
-                            table_rows,
-                            is_ilike,
+                            &entry, &*t, &col_name, &needle, table_rows, is_ilike,
                         ) {
                             let cached_ids = self.table_row_ids_fast(table, &*t);
                             if id_only && out_cols == vec!["id".to_string()] {
@@ -19633,14 +19670,14 @@ impl NativeSqlEngine {
                             );
                         } else if !exact_trigram {
                             row_ids.retain(|row_id| {
-                                t.rows.get(row_id).and_then(|row| {
-                                    row.cols
-                                        .get(col_name.as_str())
-                                        .map(|c| {
+                                t.rows
+                                    .get(row_id)
+                                    .and_then(|row| {
+                                        row.cols.get(col_name.as_str()).map(|c| {
                                             like_literal_contains(&c.as_text(), &needle, is_ilike)
                                         })
-                                })
-                                .unwrap_or(false)
+                                    })
+                                    .unwrap_or(false)
                             });
                         }
                         if let Some(lim) = limit {
@@ -19648,9 +19685,8 @@ impl NativeSqlEngine {
                         }
                     }
                 } else {
-                    row_ids = self.like_contains_row_ids(
-                        table, &*t, &col_name, &needle, is_ilike, limit,
-                    );
+                    row_ids =
+                        self.like_contains_row_ids(table, &*t, &col_name, &needle, is_ilike, limit);
                 }
 
                 let rows_out = if id_only && out_cols == vec!["id".to_string()] {
@@ -19663,7 +19699,7 @@ impl NativeSqlEngine {
                     columns,
                     rows: rows_out,
                     command_tag: format!("SELECT {}", row_count),
-                ..Default::default()
+                    ..Default::default()
                 });
             }
             let is_ilike = pred_up.contains(" ILIKE ");
@@ -19737,7 +19773,7 @@ impl NativeSqlEngine {
                 columns,
                 rows: rows_out,
                 command_tag: format!("SELECT {}", row_count),
-            ..Default::default()
+                ..Default::default()
             });
         }
 
@@ -19771,13 +19807,14 @@ impl NativeSqlEngine {
             } else {
                 &row_ids
             };
-            let rows_out = Self::materialize_indexed_projection_rows(&*t, materialize_ids, &out_cols);
+            let rows_out =
+                Self::materialize_indexed_projection_rows(&*t, materialize_ids, &out_cols);
             let row_count = rows_out.len();
             return Ok(QueryResult {
                 columns,
                 rows: rows_out,
                 command_tag: format!("SELECT {}", row_count),
-            ..Default::default()
+                ..Default::default()
             });
         }
 
@@ -19826,9 +19863,7 @@ impl NativeSqlEngine {
                             };
                             if let Some(row) = row {
                                 rows_out.push(Self::materialize_projected_row(
-                                    *id_val,
-                                    &row,
-                                    &out_cols,
+                                    *id_val, &row, &out_cols,
                                 ));
                             }
                         }
@@ -19837,14 +19872,14 @@ impl NativeSqlEngine {
                             columns,
                             rows: rows_out,
                             command_tag: format!("SELECT {}", row_count),
-                        ..Default::default()
+                            ..Default::default()
                         });
                     }
                 }
             }
 
             // Record stats for auto-indexer
-            self.index_mgr.record_query_hit(table, col_name);
+            self.record_auto_index_query_hit(table, col_name);
 
             // Try B+Tree index lookup
             if let Some(tree) = self.index_mgr.find_index(table, col_name) {
@@ -19853,8 +19888,7 @@ impl NativeSqlEngine {
                 if let Ok(shared) = self.tables.lock_table_read(table) {
                     let t = shared.read();
                     let select_cols = Self::parse_select_columns(s);
-                    let id_only_query =
-                        select_cols.len() == 1 && select_cols[0] == "id";
+                    let id_only_query = select_cols.len() == 1 && select_cols[0] == "id";
                     let out_cols: Vec<String> = if select_cols.is_empty()
                         || (select_cols.len() == 1 && select_cols[0] == "*")
                     {
@@ -19881,19 +19915,68 @@ impl NativeSqlEngine {
                     } else {
                         &row_ids
                     };
-                    let id_only =
-                        id_only_query && out_cols == vec!["id".to_string()];
+                    let id_only = id_only_query && out_cols == vec!["id".to_string()];
                     let rows_out = if id_only {
                         materialize_id_rows(materialize_ids)
                     } else {
                         Self::materialize_indexed_projection_rows(&*t, materialize_ids, &out_cols)
                     };
                     let row_count = rows_out.len();
+                    self.record_auto_index_selectivity(table, col_name, row_count, t.rows.len());
                     return Ok(QueryResult {
                         columns,
                         rows: rows_out,
                         command_tag: format!("SELECT {}", row_count),
-                    ..Default::default()
+                        ..Default::default()
+                    });
+                }
+            } else if let Some(tree) = self.index_mgr.find_shadow_index(table, col_name) {
+                let row_ids = tree.search(&idx_key);
+                self.index_mgr
+                    .record_shadow_observation(&tree.name, !row_ids.is_empty());
+                if let Ok(shared) = self.tables.lock_table_read(table) {
+                    let t = shared.read();
+                    let select_cols = Self::parse_select_columns(s);
+                    let id_only_query = select_cols.len() == 1 && select_cols[0] == "id";
+                    let out_cols: Vec<String> = if select_cols.is_empty()
+                        || (select_cols.len() == 1 && select_cols[0] == "*")
+                    {
+                        t.columns.clone()
+                    } else {
+                        select_cols
+                    };
+                    let columns: Vec<(String, i32, i16)> = out_cols
+                        .iter()
+                        .map(|c| {
+                            let o = t.col_oid(c);
+                            let len = match o {
+                                oid::INT8 => 8i16,
+                                oid::FLOAT8 => 8,
+                                _ => -1,
+                            };
+                            (c.clone(), o, len)
+                        })
+                        .collect();
+                    let limited_row_ids;
+                    let materialize_ids = if let Some(lim) = limit {
+                        limited_row_ids = row_ids.into_iter().take(lim).collect::<Vec<_>>();
+                        &limited_row_ids
+                    } else {
+                        &row_ids
+                    };
+                    let id_only = id_only_query && out_cols == vec!["id".to_string()];
+                    let rows_out = if id_only {
+                        materialize_id_rows(materialize_ids)
+                    } else {
+                        Self::materialize_indexed_projection_rows(&*t, materialize_ids, &out_cols)
+                    };
+                    let row_count = rows_out.len();
+                    self.record_auto_index_selectivity(table, col_name, row_count, t.rows.len());
+                    return Ok(QueryResult {
+                        columns,
+                        rows: rows_out,
+                        command_tag: format!("SELECT {}", row_count),
+                        ..Default::default()
                     });
                 }
             }
@@ -19907,7 +19990,7 @@ impl NativeSqlEngine {
             if eq_parts.len() >= 1 {
                 let col_hint = eq_parts[0].trim().trim_matches('"');
                 if col_hint != "id" {
-                    self.index_mgr.record_query_hit(table, col_hint);
+                    self.record_auto_index_query_hit(table, col_hint);
                 }
             }
         }
@@ -19938,11 +20021,14 @@ impl NativeSqlEngine {
             let rows_out =
                 self.materialize_indexed_projection_rows_visible(table, &t, &row_ids, &out_cols);
             let row_count = rows_out.len();
+            if let Some((col_name_owned, _)) = Self::parse_indexable_eq_predicate(pred_part) {
+                self.record_auto_index_selectivity(table, &col_name_owned, row_count, t.rows.len());
+            }
             return Ok(QueryResult {
                 columns,
                 rows: rows_out,
                 command_tag: format!("SELECT {}", row_count),
-            ..Default::default()
+                ..Default::default()
             });
         }
         let out_cols: Vec<String> =
@@ -19977,11 +20063,14 @@ impl NativeSqlEngine {
             }
         }
         let row_count = rows_out.len();
+        if let Some((col_name_owned, _)) = Self::parse_indexable_eq_predicate(pred_part) {
+            self.record_auto_index_selectivity(table, &col_name_owned, row_count, t.rows.len());
+        }
         Ok(QueryResult {
             columns,
             rows: rows_out,
             command_tag: format!("SELECT {}", row_count),
-        ..Default::default()
+            ..Default::default()
         })
     }
 
@@ -20043,10 +20132,7 @@ impl NativeSqlEngine {
         let op_pos = after_order_up
             .find(&op_str.to_ascii_uppercase())
             .ok_or_else(|| "Vector operator not found in ORDER BY".to_string())?;
-        let vec_col = after_order[..op_pos]
-            .trim()
-            .trim_matches('"')
-            .to_string();
+        let vec_col = after_order[..op_pos].trim().trim_matches('"').to_string();
 
         let limit = if let Some(li) = after_order_up[op_pos..].find(" LIMIT ") {
             let abs_li = op_pos + li;
@@ -20099,7 +20185,9 @@ impl NativeSqlEngine {
         if dim_hint != query_vec.len() {
             return Err(format!(
                 "vector dimension mismatch: column {} has dim {}, query has dim {}",
-                vec_col, dim_hint, query_vec.len()
+                vec_col,
+                dim_hint,
+                query_vec.len()
             ));
         }
 
@@ -20312,7 +20400,7 @@ impl NativeSqlEngine {
                     columns,
                     rows: Vec::new(),
                     command_tag: "SELECT 0".to_string(),
-                ..Default::default()
+                    ..Default::default()
                 };
                 let total_ms = total_start.elapsed().as_secs_f64() * 1000.0;
                 let timing = if include_timing {
@@ -20338,15 +20426,17 @@ impl NativeSqlEngine {
             if dim_hint != query_vec.len() {
                 return Err(format!(
                     "vector dimension mismatch: column {} has dim {}, query has dim {}",
-                    vec_col, dim_hint, query_vec.len()
+                    vec_col,
+                    dim_hint,
+                    query_vec.len()
                 ));
             }
 
             let mut hnsw_hits: Option<Vec<(i64, f32)>> = None;
             let mut hnsw_rows_scanned = table_row_count;
-            if let Some(entry) = self
-                .vector_hnsw_catalog
-                .find(&table_owned, &vec_col_owned, dist_metric)
+            if let Some(entry) =
+                self.vector_hnsw_catalog
+                    .find(&table_owned, &vec_col_owned, dist_metric)
             {
                 if entry.len() > 0 {
                     hnsw_rows_scanned = entry.len();
@@ -20417,7 +20507,7 @@ impl NativeSqlEngine {
                     columns,
                     rows: rows_out,
                     command_tag: format!("SELECT {}", row_count),
-                ..Default::default()
+                    ..Default::default()
                 };
                 let total_ms = total_start.elapsed().as_secs_f64() * 1000.0;
                 let timing = if include_timing {
@@ -20452,7 +20542,7 @@ impl NativeSqlEngine {
                 columns,
                 rows: Vec::new(),
                 command_tag: "SELECT 0".to_string(),
-            ..Default::default()
+                ..Default::default()
             };
             let total_ms = total_start.elapsed().as_secs_f64() * 1000.0;
             let timing = if include_timing {
@@ -20600,7 +20690,7 @@ impl NativeSqlEngine {
             columns,
             rows: rows_out,
             command_tag: format!("SELECT {}", row_count),
-        ..Default::default()
+            ..Default::default()
         };
         let total_ms = total_start.elapsed().as_secs_f64() * 1000.0;
         let timing = if include_timing {
@@ -20851,7 +20941,7 @@ impl NativeSqlEngine {
         let hi = Self::parse_value(parts[4]).as_i64();
 
         // Record stats for auto-indexer
-        self.index_mgr.record_query_hit(table, col_name);
+        self.record_auto_index_query_hit(table, col_name);
         let _ = self
             .index_mgr
             .update_selectivity_from_histogram_between(table, col_name, lo as f64, hi as f64);
@@ -20866,7 +20956,7 @@ impl NativeSqlEngine {
                         .collect(),
                     rows: vec![],
                     command_tag: "SELECT 0".to_string(),
-                ..Default::default()
+                    ..Default::default()
                 });
             }
         };
@@ -20987,7 +21077,7 @@ impl NativeSqlEngine {
                 columns,
                 rows: rows_out,
                 command_tag: format!("SELECT {}", limited_count),
-            ..Default::default()
+                ..Default::default()
             });
         }
 
@@ -20999,6 +21089,20 @@ impl NativeSqlEngine {
                 let lo_key = IndexKey::Integer(lo);
                 let hi_key = IndexKey::Integer(hi);
                 let row_ids = tree.range_scan(&lo_key, &hi_key);
+                for rid in row_ids {
+                    if let Some(row) = t.rows.get(&rid) {
+                        matching_rows.push((rid, row));
+                        if limit.is_some_and(|lim| matching_rows.len() >= lim) {
+                            break;
+                        }
+                    }
+                }
+            } else if let Some(tree) = self.index_mgr.find_shadow_index(table, col_name) {
+                let lo_key = IndexKey::Integer(lo);
+                let hi_key = IndexKey::Integer(hi);
+                let row_ids = tree.range_scan(&lo_key, &hi_key);
+                self.index_mgr
+                    .record_shadow_observation(&tree.name, !row_ids.is_empty());
                 for rid in row_ids {
                     if let Some(row) = t.rows.get(&rid) {
                         matching_rows.push((rid, row));
@@ -21043,11 +21147,12 @@ impl NativeSqlEngine {
         }
 
         let row_count = rows_out.len();
+        self.record_auto_index_selectivity(table, col_name, row_count, t.rows.len());
         Ok(QueryResult {
             columns,
             rows: rows_out,
             command_tag: format!("SELECT {}", row_count),
-        ..Default::default()
+            ..Default::default()
         })
     }
 
@@ -21064,7 +21169,7 @@ impl NativeSqlEngine {
                 columns: vec![("count".to_string(), oid::INT8, 8)],
                 rows: Vec::new(),
                 command_tag: "SELECT 0".to_string(),
-            ..Default::default()
+                ..Default::default()
             });
         }
         let cnt: i64 = if let Some(wi) = up.find(" WHERE ") {
@@ -21077,36 +21182,67 @@ impl NativeSqlEngine {
             } else if let Some((col, lo_key, hi_key)) =
                 Self::parse_indexable_range_conjunction(pred)
             {
+                self.record_auto_index_query_hit(table, &col);
                 if let Some(tree) = self.index_mgr.find_index(table, &col) {
-                    self.index_mgr.record_query_hit(table, &col);
                     self.index_mgr.record_index_use(&tree.name);
-                    tree.range_scan(&lo_key, &hi_key)
+                    let count = tree
+                        .range_scan(&lo_key, &hi_key)
                         .into_iter()
                         .filter(|row_id| t.rows.contains_key(row_id))
-                        .count() as i64
+                        .count();
+                    self.record_auto_index_selectivity(table, &col, count, t.rows.len());
+                    count as i64
+                } else if let Some(tree) = self.index_mgr.find_shadow_index(table, &col) {
+                    let count = tree
+                        .range_scan(&lo_key, &hi_key)
+                        .into_iter()
+                        .filter(|row_id| t.rows.contains_key(row_id))
+                        .count();
+                    self.index_mgr
+                        .record_shadow_observation(&tree.name, count > 0);
+                    self.record_auto_index_selectivity(table, &col, count, t.rows.len());
+                    count as i64
                 } else {
-                    t.rows
+                    let count = t
+                        .rows
                         .iter()
                         .filter(|(row_id, row)| Self::eval_condition_for_row(**row_id, row, pred))
-                        .count() as i64
+                        .count();
+                    self.record_auto_index_selectivity(table, &col, count, t.rows.len());
+                    count as i64
                 }
             } else if let Some((col, key)) = Self::parse_indexable_eq_predicate(pred) {
+                self.record_auto_index_query_hit(table, &col);
                 if let Some(tree) = self.index_mgr.find_index(table, &col) {
-                    self.index_mgr.record_query_hit(table, &col);
                     self.index_mgr.record_index_use(&tree.name);
-                    tree.search(&key)
+                    let count = tree
+                        .search(&key)
                         .into_iter()
                         .filter(|row_id| t.rows.contains_key(row_id))
-                        .count() as i64
-                } else if let Some(count) =
-                    self.columnar_count_index_key(table, &*t, &col, &key)
-                {
+                        .count();
+                    self.record_auto_index_selectivity(table, &col, count, t.rows.len());
+                    count as i64
+                } else if let Some(tree) = self.index_mgr.find_shadow_index(table, &col) {
+                    let count = tree
+                        .search(&key)
+                        .into_iter()
+                        .filter(|row_id| t.rows.contains_key(row_id))
+                        .count();
+                    self.index_mgr
+                        .record_shadow_observation(&tree.name, count > 0);
+                    self.record_auto_index_selectivity(table, &col, count, t.rows.len());
+                    count as i64
+                } else if let Some(count) = self.columnar_count_index_key(table, &*t, &col, &key) {
+                    self.record_auto_index_selectivity(table, &col, count as usize, t.rows.len());
                     count
                 } else {
-                    t.rows
+                    let count = t
+                        .rows
                         .iter()
                         .filter(|(row_id, row)| Self::eval_condition_for_row(**row_id, row, pred))
-                        .count() as i64
+                        .count();
+                    self.record_auto_index_selectivity(table, &col, count, t.rows.len());
+                    count as i64
                 }
             } else if let Some(count) = self.columnar_count_from_predicate(table, &*t, pred) {
                 count
@@ -21130,7 +21266,7 @@ impl NativeSqlEngine {
             columns: vec![("count".to_string(), oid::INT8, 8)],
             rows: vec![vec![Some(cnt.to_string().into_bytes())]],
             command_tag: "SELECT 1".to_string(),
-        ..Default::default()
+            ..Default::default()
         })
     }
 
@@ -21227,7 +21363,7 @@ impl NativeSqlEngine {
                         columns,
                         rows,
                         command_tag: "SELECT 1".to_string(),
-                    ..Default::default()
+                        ..Default::default()
                     });
                 }
             }
@@ -21256,7 +21392,7 @@ impl NativeSqlEngine {
                     columns,
                     rows,
                     command_tag: "SELECT 1".to_string(),
-                ..Default::default()
+                    ..Default::default()
                 });
             }
         }
@@ -21411,14 +21547,14 @@ impl NativeSqlEngine {
                 columns,
                 rows,
                 command_tag: "SELECT 1".to_string(),
-            ..Default::default()
+                ..Default::default()
             })
         } else {
             Ok(QueryResult {
                 columns: vec![("sum".to_string(), oid::FLOAT8, 8)],
                 rows: vec![vec![Some("0".to_string().into_bytes())]],
                 command_tag: "SELECT 1".to_string(),
-            ..Default::default()
+                ..Default::default()
             })
         }
     }
@@ -21448,7 +21584,7 @@ impl NativeSqlEngine {
                     columns: vec![("avg".to_string(), oid::FLOAT8, 8)],
                     rows: vec![vec![Some(avg.to_string().into_bytes())]],
                     command_tag: "SELECT 1".to_string(),
-                ..Default::default()
+                    ..Default::default()
                 });
             }
         }
@@ -21487,7 +21623,7 @@ impl NativeSqlEngine {
                             columns: vec![("avg".to_string(), oid::FLOAT8, 8)],
                             rows: vec![vec![Some(avg.to_string().into_bytes())]],
                             command_tag: "SELECT 1".to_string(),
-                        ..Default::default()
+                            ..Default::default()
                         });
                     }
                 }
@@ -21515,14 +21651,14 @@ impl NativeSqlEngine {
                 columns: vec![("avg".to_string(), oid::FLOAT8, 8)],
                 rows: vec![vec![Some(avg.to_string().into_bytes())]],
                 command_tag: "SELECT 1".to_string(),
-            ..Default::default()
+                ..Default::default()
             })
         } else {
             Ok(QueryResult {
                 columns: vec![("avg".to_string(), oid::FLOAT8, 8)],
                 rows: vec![vec![Some("0".to_string().into_bytes())]],
                 command_tag: "SELECT 1".to_string(),
-            ..Default::default()
+                ..Default::default()
             })
         }
     }
@@ -21699,7 +21835,7 @@ impl NativeSqlEngine {
                         columns,
                         rows: rows_out,
                         command_tag: format!("SELECT {}", n),
-                    ..Default::default()
+                        ..Default::default()
                     });
                 }
             } else if let Some(grp_vals) = cc.int_cols.get(gb_col.as_str()) {
@@ -21787,7 +21923,7 @@ impl NativeSqlEngine {
                         columns,
                         rows: rows_out,
                         command_tag: format!("SELECT {}", n),
-                    ..Default::default()
+                        ..Default::default()
                     });
                 }
             }
@@ -21859,7 +21995,7 @@ impl NativeSqlEngine {
             columns,
             rows: rows_out,
             command_tag: format!("SELECT {}", n),
-        ..Default::default()
+            ..Default::default()
         })
     }
 
@@ -21991,7 +22127,7 @@ impl NativeSqlEngine {
                         ],
                         rows: out_rows,
                         command_tag: format!("SELECT {}", n),
-                    ..Default::default()
+                        ..Default::default()
                     });
                 }
             }
@@ -22090,7 +22226,7 @@ impl NativeSqlEngine {
             ],
             rows: out_rows,
             command_tag: format!("SELECT {}", n),
-        ..Default::default()
+            ..Default::default()
         })
     }
 
@@ -22330,7 +22466,7 @@ impl NativeSqlEngine {
             columns,
             rows,
             command_tag: format!("SELECT {}", n),
-        ..Default::default()
+            ..Default::default()
         })
     }
 
@@ -22854,7 +22990,7 @@ impl NativeSqlEngine {
             columns,
             rows: rows_out,
             command_tag: format!("SELECT {}", n_rows),
-        ..Default::default()
+            ..Default::default()
         })
     }
 
@@ -23101,7 +23237,7 @@ impl NativeSqlEngine {
             columns,
             rows: rows_out,
             command_tag: format!("SELECT {}", n_rows),
-        ..Default::default()
+            ..Default::default()
         })
     }
 
@@ -23624,6 +23760,7 @@ mod tests {
         Cell, ColumnarClassification, MvccIsolationLevel, MvccTransactionManager, MvccTxState,
         NativeColumnData, NativeRow, NativeSqlEngine,
     };
+    use crate::index::IndexState;
     use std::collections::{BTreeMap, HashMap};
 
     fn setup_join_fixtures(engine: &NativeSqlEngine) {
@@ -23695,6 +23832,42 @@ mod tests {
             NativeColumnData::Float64 { values, .. } => assert_eq!(&values[..], &[1.5, 2.5]),
             _ => panic!("expected float64 ratio column"),
         }
+    }
+
+    #[test]
+    fn auto_index_cycle_populates_shadow_and_promotes_from_sql_queries() {
+        let engine = NativeSqlEngine::new();
+        engine
+            .execute("CREATE TABLE auto_idx (id INTEGER PRIMARY KEY, status TEXT, score INTEGER)")
+            .unwrap();
+        for id in 1..=64 {
+            let status = if id == 7 { "hot" } else { "cold" };
+            engine
+                .execute(&format!(
+                    "INSERT INTO auto_idx (id, status, score) VALUES ({id}, '{status}', {id})"
+                ))
+                .unwrap();
+        }
+
+        for _ in 0..56 {
+            let res = engine
+                .execute("SELECT id FROM auto_idx WHERE status = 'hot'")
+                .unwrap();
+            assert_eq!(res.rows.len(), 1);
+            assert_eq!(res.rows[0][0].as_deref(), Some(b"7".as_slice()));
+        }
+
+        let promoted = engine.index_mgr.list_indexes().into_iter().any(|meta| {
+            meta.table == "auto_idx"
+                && meta.columns == vec!["status".to_string()]
+                && meta.state == IndexState::Active
+                && !meta.manual
+        });
+        assert!(
+            promoted,
+            "repeated selective SQL predicate should promote an auto index"
+        );
+        assert!(engine.index_mgr.find_index("auto_idx", "status").is_some());
     }
 
     #[test]
@@ -24109,9 +24282,7 @@ mod tests {
                  FROM generate_series(0, 99) AS t(i)",
             )
             .unwrap();
-        let count = engine
-            .execute("SELECT COUNT(*) FROM olap_bench")
-            .unwrap();
+        let count = engine.execute("SELECT COUNT(*) FROM olap_bench").unwrap();
         assert_eq!(count.rows[0][0].as_deref(), Some(b"100".as_ref()));
         let row = engine
             .execute("SELECT grp, val, tag FROM olap_bench WHERE id = 17")
@@ -27549,16 +27720,18 @@ mod tests {
             .unwrap();
         // Chinese / English text may contain the word "where" — must not become a SET/WHERE split.
         engine
-            .execute(
-                "UPDATE upd_quote SET text = 'go where you want [upd]' WHERE id = 1",
-            )
+            .execute("UPDATE upd_quote SET text = 'go where you want [upd]' WHERE id = 1")
             .expect("quoted WHERE must not confuse parser");
-        let r = engine.execute("SELECT text FROM upd_quote WHERE id = 1").unwrap();
+        let r = engine
+            .execute("SELECT text FROM upd_quote WHERE id = 1")
+            .unwrap();
         assert_eq!(
             String::from_utf8_lossy(r.rows[0][0].as_ref().unwrap()),
             "go where you want [upd]"
         );
-        let r2 = engine.execute("SELECT text FROM upd_quote WHERE id = 2").unwrap();
+        let r2 = engine
+            .execute("SELECT text FROM upd_quote WHERE id = 2")
+            .unwrap();
         assert_eq!(
             String::from_utf8_lossy(r2.rows[0][0].as_ref().unwrap()),
             "world"

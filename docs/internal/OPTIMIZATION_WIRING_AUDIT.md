@@ -36,26 +36,28 @@ Wire-in target:
 
 ### 2. Auto Index Manager Records Stats But Does Not Run Autonomous Lifecycle
 
-Status: partially wired.
+Status: first SQL-path wiring landed after this audit; latency-baseline refinement remains.
 
 Evidence:
 
 - `NativeSqlEngine` records `record_query_hit`, `record_writes`, and numeric histogram samples.
 - `IndexManager::evaluate`, `apply_decisions`, `populate_shadow`, `record_shadow_latency`, `record_shadow_observation`, and `gc_unused_indexes` exist.
-- Outside `index/auto_manager.rs` tests and Python wrapper helpers, no SQL hot path calls `evaluate`, `apply_decisions`, `populate_shadow`, or shadow latency observation.
+- `NativeSqlEngine` now routes repeated filter observations through `record_auto_index_query_hit`.
+- A low-frequency auto-index cycle evaluates decisions, creates/populates empty shadow B+Tree indexes, keeps shadow indexes current during DML maintenance, and lets equality/range/COUNT paths use shadow indexes as trial candidates.
+- Shadow indexes can promote after repeated beneficial trial observations; full active-vs-shadow latency replay is still not wired.
 
 Impact:
 
-- Repeated selective predicates collect stats, but they do not automatically build/promote indexes.
-- Performance depends on manual `CREATE INDEX` or existing specialized catalogs.
-- Composite-index and shadow-index logic exists but is not learning from real query latency in production path.
+- Repeated selective predicates can now build/populate/promote B+Tree auto indexes from SQL traffic.
+- Manual `CREATE INDEX` remains the explicit path, but common equality/range filters no longer depend on manual action only.
+- Composite-index and full latency comparison logic still need deeper executor support.
 
 Wire-in target:
 
-1. Add a low-frequency post-query or background evaluation trigger after enough `record_query_hit` samples.
-2. Populate shadow indexes from table rows without blocking foreground reads.
-3. Run selected queries against active vs shadow index to fill `record_shadow_latency` and `record_shadow_observation`.
-4. Promote only after the current cost-benefit gates pass.
+1. Replace bootstrap trial observation with real active-vs-shadow latency replay for selected cheap queries.
+2. Extend auto-index trial paths beyond simple equality/range/COUNT.
+3. Add background population for very large tables so foreground query latency is not affected.
+4. Add composite-index population semantics that preserve column tuple ordering instead of treating each column independently.
 
 ### 3. JIT Expression Infrastructure Is Not Connected To Native SQL Filters
 
@@ -212,4 +214,3 @@ Wire-in target:
 6. Feed `CostModel`, `SelectivityModel`, and observed cardinality into planner decisions.
 7. Consolidate binary WAL/storage pieces into Native SQL only after the logical WAL contract is preserved.
 8. Keep hub/satellite IPC experimental until one dispatch path beats in-process execution under benchmark.
-
