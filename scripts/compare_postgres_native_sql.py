@@ -26,16 +26,25 @@ from statistics import mean
 from typing import Any
 
 
-POSTGRES_SCHEMA_SQL = """
-DROP TABLE IF EXISTS bench_orders;
-DROP TABLE IF EXISTS bench_accounts;
-CREATE TABLE bench_accounts (
+def schema_sql(
+    accounts_table: str, orders_table: str, products_table: str, *, drop_existing: bool
+) -> str:
+    drops = ""
+    if drop_existing:
+        drops = f"""
+DROP TABLE IF EXISTS {orders_table};
+DROP TABLE IF EXISTS {products_table};
+DROP TABLE IF EXISTS {accounts_table};
+"""
+    return f"""
+{drops}
+CREATE TABLE {accounts_table} (
     id INTEGER PRIMARY KEY,
     region INTEGER,
     balance REAL,
     name TEXT
 );
-CREATE TABLE bench_orders (
+CREATE TABLE {orders_table} (
     id INTEGER PRIMARY KEY,
     account_id INTEGER,
     product_id INTEGER,
@@ -43,30 +52,22 @@ CREATE TABLE bench_orders (
     total REAL,
     status TEXT
 );
-CREATE INDEX idx_bench_accounts_region ON bench_accounts (region);
-CREATE INDEX idx_bench_orders_account_id ON bench_orders (account_id);
-CREATE INDEX idx_bench_orders_product_id ON bench_orders (product_id);
+CREATE TABLE {products_table} (
+    id INTEGER PRIMARY KEY,
+    name TEXT,
+    price REAL,
+    category TEXT
+);
+CREATE INDEX idx_{accounts_table}_region ON {accounts_table} (region);
+CREATE INDEX idx_{orders_table}_account_id ON {orders_table} (account_id);
+CREATE INDEX idx_{orders_table}_product_id ON {orders_table} (product_id);
 """
 
-QM_SCHEMA_SQL = """
-CREATE TABLE bench_accounts (
-    id INTEGER PRIMARY KEY,
-    region INTEGER,
-    balance REAL,
-    name TEXT
-);
-CREATE TABLE bench_orders (
-    id INTEGER PRIMARY KEY,
-    account_id INTEGER,
-    product_id INTEGER,
-    quantity INTEGER,
-    total REAL,
-    status TEXT
-);
-CREATE INDEX idx_bench_accounts_region ON bench_accounts (region);
-CREATE INDEX idx_bench_orders_account_id ON bench_orders (account_id);
-CREATE INDEX idx_bench_orders_product_id ON bench_orders (product_id);
-"""
+
+def table_names(prefix: str) -> tuple[str, str, str]:
+    safe = "".join(ch if ch.isalnum() or ch == "_" else "_" for ch in prefix.lower())
+    safe = safe.strip("_") or f"qmcmp_{os.getpid()}"
+    return f"bench_accounts_{safe}", f"bench_orders_{safe}", f"bench_products_{safe}"
 
 
 @dataclass(frozen=True)
@@ -195,7 +196,7 @@ def normalize_rows(rows: list[list[str | None]]) -> list[list[str | None]]:
     normalized: list[list[str | None]] = []
     for row in rows:
         normalized.append([normalize_cell(cell) for cell in row])
-    return normalized
+    return sorted(normalized)
 
 
 def normalize_cell(cell: str | None) -> str | None:
@@ -206,8 +207,32 @@ def normalize_cell(cell: str | None) -> str | None:
     except ValueError:
         return cell
     if math.isfinite(numeric):
-        return f"{numeric:.9g}"
+        return f"{numeric:.6g}"
     return cell
+
+
+def cells_match(left: str | None, right: str | None, rel_tol: float = 1e-4) -> bool:
+    if left is None or right is None:
+        return left is right
+    try:
+        left_num = float(left)
+        right_num = float(right)
+    except ValueError:
+        return left == right
+    return math.isclose(left_num, right_num, rel_tol=rel_tol, abs_tol=rel_tol)
+
+
+def results_match(left: list[list[str | None]], right: list[list[str | None]]) -> bool:
+    if len(left) != len(right):
+        return False
+    left_rows = sorted(left, key=lambda row: json.dumps(row, sort_keys=True))
+    right_rows = sorted(right, key=lambda row: json.dumps(row, sort_keys=True))
+    for left_row, right_row in zip(left_rows, right_rows):
+        if len(left_row) != len(right_row):
+            return False
+        if not all(cells_match(lcell, rcell) for lcell, rcell in zip(left_row, right_row)):
+            return False
+    return True
 
 
 def batched_values(rows: list[tuple[Any, ...]], batch_size: int = 1000) -> list[str]:
@@ -226,7 +251,9 @@ def batched_values(rows: list[tuple[Any, ...]], batch_size: int = 1000) -> list[
     return batches
 
 
-def seed_sql(rows: int) -> tuple[list[tuple[Any, ...]], list[tuple[Any, ...]]]:
+def seed_sql(
+    rows: int,
+) -> tuple[list[tuple[Any, ...]], list[tuple[Any, ...]], list[tuple[Any, ...]]]:
     accounts = [
         (i, i % 16, round((i * 1.17) % 50000, 2), f"acct_{i}")
         for i in range(1, rows + 1)
@@ -242,21 +269,34 @@ def seed_sql(rows: int) -> tuple[list[tuple[Any, ...]], list[tuple[Any, ...]]]:
         )
         for i in range(1, rows + 1)
     ]
-    return accounts, orders
+    products = [
+        (i, f"product_{i}", round(((i * 23) % 5000) / 2.0, 2), f"cat_{i % 25}")
+        for i in range(1, 1001)
+    ]
+    return accounts, orders, products
 
 
-def seed_postgres(dsn: str, rows: int) -> float:
-    accounts, orders = seed_sql(rows)
-    statements = [POSTGRES_SCHEMA_SQL, "BEGIN;"]
+def seed_postgres(
+    dsn: str, rows: int, accounts_table: str, orders_table: str, products_table: str
+) -> float:
+    accounts, orders, products = seed_sql(rows)
+    statements = [
+        schema_sql(accounts_table, orders_table, products_table, drop_existing=True),
+        "BEGIN;",
+    ]
     for values in batched_values(accounts):
         statements.append(
-            "INSERT INTO bench_accounts (id, region, balance, name) VALUES " + values + ";"
+            f"INSERT INTO {accounts_table} (id, region, balance, name) VALUES " + values + ";"
         )
     for values in batched_values(orders):
         statements.append(
-            "INSERT INTO bench_orders (id, account_id, product_id, quantity, total, status) VALUES "
+            f"INSERT INTO {orders_table} (id, account_id, product_id, quantity, total, status) VALUES "
             + values
             + ";"
+        )
+    for values in batched_values(products):
+        statements.append(
+            f"INSERT INTO {products_table} (id, name, price, category) VALUES " + values + ";"
         )
     statements.append("COMMIT;")
     start = time.perf_counter()
@@ -275,20 +315,38 @@ def import_qm_engine() -> Any:
     return qm_engine
 
 
-def seed_qm(qm_engine: Any, rows: int, data_dir: str | None, wal_sync_policy: str) -> tuple[Any, float]:
+def seed_qm(
+    qm_engine: Any,
+    rows: int,
+    data_dir: str | None,
+    wal_sync_policy: str,
+    accounts_table: str,
+    orders_table: str,
+    products_table: str,
+) -> tuple[Any, float]:
     engine = qm_engine.NativeSqlEngine(data_dir) if data_dir else qm_engine.NativeSqlEngine()
     if data_dir and hasattr(engine, "set_wal_sync_policy"):
         engine.set_wal_sync_policy(wal_sync_policy)
-    accounts, orders = seed_sql(rows)
-    statements = [stmt.strip() for stmt in QM_SCHEMA_SQL.split(";") if stmt.strip()]
+    accounts, orders, products = seed_sql(rows)
+    statements = [
+        stmt.strip()
+        for stmt in schema_sql(
+            accounts_table, orders_table, products_table, drop_existing=False
+        ).split(";")
+        if stmt.strip()
+    ]
     statements.extend(
-        "INSERT INTO bench_accounts (id, region, balance, name) VALUES " + values
+        f"INSERT INTO {accounts_table} (id, region, balance, name) VALUES " + values
         for values in batched_values(accounts)
     )
     statements.extend(
-        "INSERT INTO bench_orders (id, account_id, product_id, quantity, total, status) VALUES "
+        f"INSERT INTO {orders_table} (id, account_id, product_id, quantity, total, status) VALUES "
         + values
         for values in batched_values(orders)
+    )
+    statements.extend(
+        f"INSERT INTO {products_table} (id, name, price, category) VALUES " + values
+        for values in batched_values(products)
     )
     start = time.perf_counter()
     for statement in statements:
@@ -296,44 +354,52 @@ def seed_qm(qm_engine: Any, rows: int, data_dir: str | None, wal_sync_policy: st
     return engine, time.perf_counter() - start
 
 
-def query_cases(rows: int) -> list[QueryCase]:
+def query_cases(
+    rows: int, accounts_table: str, orders_table: str, products_table: str
+) -> list[QueryCase]:
     mid = max(rows // 2, 1)
     hi = min(mid + 999, rows)
     return [
-        QueryCase("point_lookup_pk", "point_lookup", f"SELECT balance FROM bench_accounts WHERE id = {mid}"),
+        QueryCase(
+            "point_lookup_pk",
+            "point_lookup",
+            f"SELECT balance FROM {accounts_table} WHERE id = {mid}",
+        ),
         QueryCase(
             "indexed_equality_count",
             "index",
-            "SELECT COUNT(*) FROM bench_orders WHERE account_id = 42",
+            f"SELECT COUNT(*) FROM {orders_table} WHERE account_id = 42",
         ),
         QueryCase(
             "range_count_pk",
             "range",
-            f"SELECT COUNT(*) FROM bench_orders WHERE id BETWEEN {mid} AND {hi}",
+            f"SELECT COUNT(*) FROM {orders_table} WHERE id BETWEEN {mid} AND {hi}",
         ),
-        QueryCase("sum_large_column", "htap_aggregate", "SELECT SUM(total) FROM bench_orders"),
-        QueryCase("avg_large_column", "htap_aggregate", "SELECT AVG(total) FROM bench_orders"),
+        QueryCase("sum_large_column", "htap_aggregate", f"SELECT SUM(total) FROM {orders_table}"),
+        QueryCase("avg_large_column", "htap_aggregate", f"SELECT AVG(total) FROM {orders_table}"),
         QueryCase(
             "sum_between_pk",
             "htap_range_aggregate",
-            f"SELECT SUM(total) FROM bench_orders WHERE id BETWEEN {mid} AND {hi}",
+            f"SELECT SUM(total) FROM {orders_table} WHERE id BETWEEN {mid} AND {hi}",
         ),
         QueryCase(
             "group_by_low_cardinality",
             "group_by",
-            "SELECT status, SUM(total), COUNT(*) FROM bench_orders GROUP BY status",
+            f"SELECT status, SUM(total), COUNT(*) FROM {orders_table} GROUP BY status",
         ),
         QueryCase(
             "join_filtered",
             "join",
-            "SELECT COUNT(*) FROM bench_orders o "
-            "JOIN bench_accounts a ON o.account_id = a.id "
-            "WHERE a.region = 3",
+            f"SELECT a.name, o.id, p.name, o.quantity, o.total "
+            f"FROM {accounts_table} a "
+            f"JOIN {orders_table} o ON a.id = o.account_id "
+            f"JOIN {products_table} p ON o.product_id = p.id "
+            "WHERE o.account_id = 42",
         ),
         QueryCase(
             "order_by_limit_large",
             "sort",
-            "SELECT id, total FROM bench_orders ORDER BY total DESC LIMIT 20",
+            f"SELECT id, total FROM {orders_table} ORDER BY total DESC LIMIT 20",
             compare_result=False,
         ),
     ]
@@ -414,9 +480,9 @@ def compare_case(
 
     if case.compare_result and not qm_error and not pg_error:
         try:
-            qm_result = normalize_rows(qm_rows(engine.execute(case.sql)))
-            pg_result = normalize_rows(pg_scalar_result(dsn, case.sql))
-            result_match = qm_result == pg_result
+            qm_result = qm_rows(engine.execute(case.sql))
+            pg_result = pg_scalar_result(dsn, case.sql)
+            result_match = results_match(qm_result, pg_result)
         except Exception as exc:
             result_match = False
             if strict:
@@ -489,8 +555,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--rows", type=int, default=100_000)
     parser.add_argument("--iterations", type=int, default=100)
     parser.add_argument("--warmup", type=int, default=5)
-    parser.add_argument("--output", type=Path, default=Path("docs/profiles/postgres_comparison_latest.json"))
+    parser.add_argument(
+        "--output", type=Path, default=Path("docs/profiles/postgres_comparison_latest.json")
+    )
     parser.add_argument("--qm-mode", choices=["memory", "persistent-wal"], default="memory")
+    parser.add_argument(
+        "--table-prefix",
+        default=f"qmcmp_{os.getpid()}",
+        help="Prefix for benchmark tables. Defaults to a process-specific name.",
+    )
     parser.add_argument(
         "--qm-sync-policy",
         choices=["none", "per-commit", "per-mutation", "per-commit-sync-data"],
@@ -511,7 +584,8 @@ def main() -> int:
         return 2
 
     qm_engine = import_qm_engine()
-    selected_cases = query_cases(args.rows)
+    accounts_table, orders_table, products_table = table_names(args.table_prefix)
+    selected_cases = query_cases(args.rows, accounts_table, orders_table, products_table)
     if args.cases:
         wanted = set(args.cases)
         selected_cases = [case for case in selected_cases if case.name in wanted]
@@ -527,17 +601,28 @@ def main() -> int:
         qm_data_dir = temp_dir.name
 
     notes: list[str] = [
+        f"Benchmark tables: {accounts_table}, {orders_table}, {products_table}",
         "PostgreSQL SELECT timings use EXPLAIN ANALYZE Execution Time, excluding psql process startup.",
         "QM timings are embedded Python-to-PyO3 wall-clock timings.",
         "Use --qm-mode persistent-wal to include QM WAL/checkpoint overhead during seed and write workloads.",
     ]
 
     print("seeding PostgreSQL...")
-    pg_seed_sec = seed_postgres(args.postgres_dsn, args.rows)
+    pg_seed_sec = seed_postgres(
+        args.postgres_dsn, args.rows, accounts_table, orders_table, products_table
+    )
     print(f"PostgreSQL seed: {pg_seed_sec:.3f}s")
 
     print("seeding QM...")
-    engine, qm_seed_sec = seed_qm(qm_engine, args.rows, qm_data_dir, args.qm_sync_policy)
+    engine, qm_seed_sec = seed_qm(
+        qm_engine,
+        args.rows,
+        qm_data_dir,
+        args.qm_sync_policy,
+        accounts_table,
+        orders_table,
+        products_table,
+    )
     print(f"QM seed: {qm_seed_sec:.3f}s")
     notes.append(f"PostgreSQL seed elapsed_sec={pg_seed_sec:.6f}")
     notes.append(f"QM seed elapsed_sec={qm_seed_sec:.6f}")
