@@ -9256,7 +9256,7 @@ impl NativeSqlEngine {
         self.buf_pool.put_cols(table_name, cc)
     }
 
-    /// Row ids without building full text/float columnar caches (order undefined).
+    /// Sorted row ids without building full text/float columnar caches.
     fn table_row_ids_fast(&self, table_name: &str, t: &NativeTable) -> Arc<Vec<i64>> {
         if let Some(ids) = self.buf_pool.get_ids(table_name) {
             return ids;
@@ -9264,11 +9264,12 @@ impl NativeSqlEngine {
         if let Some(cc) = self.buf_pool.get_cols(table_name) {
             return self.buf_pool.put_ids(table_name, cc.ids.clone());
         }
-        let ids: Vec<i64> = if t.rows.len() >= LIKE_COLUMNAR_SCAN_MIN_ROWS {
+        let mut ids: Vec<i64> = if t.rows.len() >= LIKE_COLUMNAR_SCAN_MIN_ROWS {
             t.rows.par_iter().map(|(id, _)| *id).collect()
         } else {
             t.rows.keys().copied().collect()
         };
+        ids.sort_unstable();
         self.buf_pool.put_ids(table_name, ids)
     }
 
@@ -19363,6 +19364,118 @@ impl NativeSqlEngine {
             }
         }
 
+        // ── Numeric Top-K fast path: ORDER BY numeric_col LIMIT n with no WHERE ──
+        // Keep only the best LIMIT candidates while scanning the columnar cache,
+        // avoiding full row materialization and O(n log n) full-table sort.
+        if where_pred_str.is_none() && sort_specs.len() == 1 && offset == 0 {
+            if let Some(lim) = limit {
+                let (ref sort_col, is_desc) = sort_specs[0];
+                if lim == 0 {
+                    return Ok(QueryResult {
+                        columns,
+                        rows: Vec::new(),
+                        command_tag: "SELECT 0".to_string(),
+                        ..Default::default()
+                    });
+                }
+                let cc = self.get_or_build_cols(table, &*t);
+                let numeric_values: Option<Vec<f64>> =
+                    if let Some(fv) = cc.float_cols.get(sort_col.as_str()) {
+                        Some(fv.clone())
+                    } else {
+                        cc.int_cols
+                            .get(sort_col.as_str())
+                            .map(|iv| iv.iter().map(|v| *v as f64).collect())
+                    };
+                if let Some(values) = numeric_values {
+                    let mut top: Vec<usize> = Vec::with_capacity(lim.min(values.len()));
+                    for idx in 0..values.len() {
+                        if top.len() < lim {
+                            top.push(idx);
+                            continue;
+                        }
+                        let mut worst_pos = 0usize;
+                        for pos in 1..top.len() {
+                            let current_worst = values[top[worst_pos]];
+                            let candidate = values[top[pos]];
+                            let is_worse = if is_desc {
+                                candidate < current_worst
+                            } else {
+                                candidate > current_worst
+                            };
+                            if is_worse {
+                                worst_pos = pos;
+                            }
+                        }
+                        let worst_value = values[top[worst_pos]];
+                        let candidate_value = values[idx];
+                        let is_better = if is_desc {
+                            candidate_value > worst_value
+                        } else {
+                            candidate_value < worst_value
+                        };
+                        if is_better {
+                            top[worst_pos] = idx;
+                        }
+                    }
+                    top.sort_by(|&a, &b| {
+                        let cmp = values[a].total_cmp(&values[b]);
+                        if is_desc {
+                            cmp.reverse().then_with(|| cc.ids[a].cmp(&cc.ids[b]))
+                        } else {
+                            cmp.then_with(|| cc.ids[a].cmp(&cc.ids[b]))
+                        }
+                    });
+
+                    enum ColRef<'a> {
+                        Id,
+                        Float(&'a [f64]),
+                        Text(&'a [String]),
+                        Int(&'a [i64]),
+                        Missing,
+                    }
+                    let col_refs: Vec<ColRef> = out_cols
+                        .iter()
+                        .map(|col| {
+                            if col == "id" {
+                                ColRef::Id
+                            } else if let Some(fv) = cc.float_cols.get(col.as_str()) {
+                                ColRef::Float(fv.as_slice())
+                            } else if let Some(tv) = cc.text_cols.get(col.as_str()) {
+                                ColRef::Text(tv.as_slice())
+                            } else if let Some(iv) = cc.int_cols.get(col.as_str()) {
+                                ColRef::Int(iv.as_slice())
+                            } else {
+                                ColRef::Missing
+                            }
+                        })
+                        .collect();
+                    let rows_out: Vec<Vec<Option<Vec<u8>>>> = top
+                        .into_iter()
+                        .map(|idx| {
+                            col_refs
+                                .iter()
+                                .map(|cr| match cr {
+                                    ColRef::Id => Some(cc.ids[idx].to_string().into_bytes()),
+                                    ColRef::Float(fv) => Some(fv[idx].to_string().into_bytes()),
+                                    ColRef::Text(tv) => Some(tv[idx].as_bytes().to_vec()),
+                                    ColRef::Int(iv) => Some(iv[idx].to_string().into_bytes()),
+                                    ColRef::Missing => None,
+                                })
+                                .collect()
+                        })
+                        .collect();
+                    let row_count = rows_out.len();
+                    return Ok(QueryResult {
+                        columns,
+                        rows: rows_out,
+                        command_tag: format!("SELECT {}", row_count),
+                        ..Default::default()
+                    });
+                }
+            }
+        }
+
         // Build sort-key type info: is each sort column numeric or text?
         let sort_col_types: Vec<bool> = sort_specs
             .iter()
@@ -21193,7 +21306,23 @@ impl NativeSqlEngine {
                 Self::parse_indexable_range_conjunction(pred)
             {
                 self.record_auto_index_query_hit(table, &col);
-                if let Some(tree) = self.index_mgr.find_index(table, &col) {
+                if (col == "id" || col == t.columns.first().map(|s| s.as_str()).unwrap_or(""))
+                    && matches!(
+                        (&lo_key, &hi_key),
+                        (IndexKey::Integer(_), IndexKey::Integer(_))
+                    )
+                {
+                    let (lo, hi) = match (&lo_key, &hi_key) {
+                        (IndexKey::Integer(lo), IndexKey::Integer(hi)) => (*lo, *hi),
+                        _ => unreachable!(),
+                    };
+                    let row_ids = self.table_row_ids_fast(table, &*t);
+                    let start = row_ids.partition_point(|id| *id < lo);
+                    let end = row_ids.partition_point(|id| *id <= hi);
+                    let count = end.saturating_sub(start);
+                    self.record_auto_index_selectivity(table, &col, count, t.rows.len());
+                    count as i64
+                } else if let Some(tree) = self.index_mgr.find_index(table, &col) {
                     self.index_mgr.record_index_use(&tree.name);
                     let count = tree
                         .range_scan(&lo_key, &hi_key)
@@ -22222,28 +22351,55 @@ impl NativeSqlEngine {
     fn handle_select_join(&self, s: &str) -> Result<QueryResult, String> {
         let plan = JoinPlan::from_sql(s);
 
-        let g = self.tables.to_native_map();
-        let orders_table_name = g
-            .keys()
-            .find(|k| k.starts_with("bench_orders"))
-            .cloned()
+        let table_names = if plan.accounts_table.is_none()
+            || plan.orders_table.is_none()
+            || plan.products_table.is_none()
+        {
+            self.tables.table_names()
+        } else {
+            Vec::new()
+        };
+        let orders_table_name = plan
+            .orders_table
+            .clone()
+            .or_else(|| {
+                table_names
+                    .iter()
+                    .find(|k| k.starts_with("bench_orders"))
+                    .cloned()
+            })
             .unwrap_or_default();
-        let accounts_table_name = g
-            .keys()
-            .find(|k| k.starts_with("bench_accounts"))
-            .cloned()
+        let accounts_table_name = plan
+            .accounts_table
+            .clone()
+            .or_else(|| {
+                table_names
+                    .iter()
+                    .find(|k| k.starts_with("bench_accounts"))
+                    .cloned()
+            })
             .unwrap_or_default();
-        let products_table_name = g
-            .keys()
-            .find(|k| k.starts_with("bench_products"))
-            .cloned()
+        let products_table_name = plan
+            .products_table
+            .clone()
+            .or_else(|| {
+                table_names
+                    .iter()
+                    .find(|k| k.starts_with("bench_products"))
+                    .cloned()
+            })
             .unwrap_or_default();
-        let a = g.get(&accounts_table_name);
-        let o = g.get(&orders_table_name);
-        let p = g.get(&products_table_name);
+        let a_shared = self.tables.get_shared(&accounts_table_name);
+        let o_shared = self.tables.get_shared(&orders_table_name);
+        let p_shared = self.tables.get_shared(&products_table_name);
 
         let mut out_rows = Vec::new();
-        if let (Some(at), Some(ot), Some(pt)) = (a, o, p) {
+        let mut used_specialized_join = false;
+        if let (Some(a_shared), Some(o_shared), Some(p_shared)) = (a_shared, o_shared, p_shared) {
+            let at = a_shared.read();
+            let ot = o_shared.read();
+            let pt = p_shared.read();
+            used_specialized_join = true;
             // Fast path: use B+Tree index on account_id when available
             if let Some(account_id) = plan.account_id_filter {
                 if let Some(tree) = self.index_mgr.find_index(&orders_table_name, "account_id") {
@@ -22252,7 +22408,7 @@ impl NativeSqlEngine {
                     let row_ids = tree.search(&idx_key);
                     let selected_rows: Vec<&NativeRow> =
                         row_ids.iter().filter_map(|rid| ot.rows.get(rid)).collect();
-                    out_rows = Self::probe_index_join_rows(at, pt, &selected_rows);
+                    out_rows = Self::probe_index_join_rows(&at, &pt, &selected_rows);
                     let n = out_rows.len();
                     return Ok(QueryResult {
                         columns: vec![
@@ -22269,36 +22425,59 @@ impl NativeSqlEngine {
                 }
             }
 
-            // Fallback: full scan path
-            let order_rows: Vec<&NativeRow> = ot.rows.values().collect();
+            // Fallback path: preserve fast selective joins even if the early
+            // index-return branch did not fire.
             let selected_rows: Vec<&NativeRow> = if let Some(account_id) = plan.account_id_filter {
-                order_rows
-                    .iter()
-                    .copied()
-                    .filter(|row| {
-                        row.cols
-                            .get("account_id")
-                            .cloned()
-                            .unwrap_or(Cell::Int(0))
-                            .as_i64()
-                            == account_id
-                    })
-                    .collect()
+                if let Some(tree) = self.index_mgr.find_index(&orders_table_name, "account_id") {
+                    self.index_mgr.record_index_use(&tree.name);
+                    tree.search(&IndexKey::Integer(account_id))
+                        .into_iter()
+                        .filter_map(|rid| ot.rows.get(&rid))
+                        .collect()
+                } else {
+                    let cc = self.get_or_build_cols(&orders_table_name, &ot);
+                    if let Some(account_ids) = cc.int_cols.get("account_id") {
+                        account_ids
+                            .iter()
+                            .enumerate()
+                            .filter_map(|(idx, aid)| {
+                                if *aid == account_id {
+                                    ot.rows.get(&cc.ids[idx])
+                                } else {
+                                    None
+                                }
+                            })
+                            .collect()
+                    } else {
+                        ot.rows
+                            .values()
+                            .filter(|row| {
+                                row.cols
+                                    .get("account_id")
+                                    .cloned()
+                                    .unwrap_or(Cell::Int(0))
+                                    .as_i64()
+                                    == account_id
+                            })
+                            .collect()
+                    }
+                }
             } else {
-                order_rows.iter().copied().collect()
+                ot.rows.values().collect()
             };
 
             let stats = JoinStats {
                 accounts_rows: at.rows.len(),
                 products_rows: pt.rows.len(),
-                orders_rows: order_rows.len(),
+                orders_rows: ot.rows.len(),
                 selected_orders: selected_rows.len(),
             };
             let strategy = Self::choose_join_strategy(&stats);
 
             out_rows = match strategy {
-                JoinStrategy::IndexJoin => Self::probe_index_join_rows(at, pt, &selected_rows),
+                JoinStrategy::IndexJoin => Self::probe_index_join_rows(&at, &pt, &selected_rows),
                 JoinStrategy::HashJoinParallel => {
+                    let order_rows: Vec<&NativeRow> = ot.rows.values().collect();
                     // --- Buffer Pool: try cached SoA for orders ---
                     let soa = match self.buf_pool.get_soa(&orders_table_name) {
                         Some(cached) => cached,
@@ -22316,14 +22495,14 @@ impl NativeSqlEngine {
                     let acc_map = match self.buf_pool.get_dim(&accounts_table_name) {
                         Some(cached) => cached,
                         None => {
-                            let map = Self::build_dim_hash(at);
+                            let map = Self::build_dim_hash(&at);
                             self.buf_pool.put_dim(&accounts_table_name, map)
                         }
                     };
                     let prod_map = match self.buf_pool.get_dim(&products_table_name) {
                         Some(cached) => cached,
                         None => {
-                            let map = Self::build_dim_hash(pt);
+                            let map = Self::build_dim_hash(&pt);
                             self.buf_pool.put_dim(&products_table_name, map)
                         }
                     };
@@ -22347,8 +22526,7 @@ impl NativeSqlEngine {
         }
 
         // If optimized bench_* path didn't match, try generic join.
-        if out_rows.is_empty() {
-            drop(g);
+        if !used_specialized_join {
             return self.handle_generic_join(s);
         }
 
@@ -23874,11 +24052,17 @@ impl JoinStats {
 #[derive(Clone, Debug)]
 struct JoinPlan {
     account_id_filter: Option<i64>,
+    accounts_table: Option<String>,
+    orders_table: Option<String>,
+    products_table: Option<String>,
 }
 
 impl JoinPlan {
     fn from_sql(sql: &str) -> Self {
         let mut account_id_filter = None;
+        let mut accounts_table = None;
+        let mut orders_table = None;
+        let mut products_table = None;
         let up = sql.to_ascii_uppercase();
         if let Some(where_idx) = up.find("WHERE") {
             let pred = sql[where_idx + 5..].trim();
@@ -23887,15 +24071,62 @@ impl JoinPlan {
                 account_id_filter = Some(NativeSqlEngine::parse_value(rhs).as_i64());
             }
         }
-        Self { account_id_filter }
+
+        if let Some(from_idx) = up.find(" FROM ") {
+            let after_from = &sql[from_idx + 6..];
+            let after_from_up = after_from.to_ascii_uppercase();
+            if let Some(join_idx) = after_from_up.find(" JOIN ") {
+                let (table, _) = NativeSqlEngine::parse_table_alias(after_from[..join_idx].trim());
+                if !table.is_empty() {
+                    accounts_table = Some(table);
+                }
+
+                let mut rem = &after_from[join_idx..];
+                let mut join_tables = Vec::new();
+                while let Some(ji) = rem.to_ascii_uppercase().find("JOIN ") {
+                    let after_join_kw = &rem[ji + 5..];
+                    let on_idx = match after_join_kw.to_ascii_uppercase().find(" ON ") {
+                        Some(idx) => idx,
+                        None => break,
+                    };
+                    let (table, _) =
+                        NativeSqlEngine::parse_table_alias(after_join_kw[..on_idx].trim());
+                    if !table.is_empty() {
+                        join_tables.push(table);
+                    }
+                    let after_on = &after_join_kw[on_idx + 4..];
+                    let cond_end = after_on
+                        .to_ascii_uppercase()
+                        .find(" JOIN ")
+                        .or_else(|| after_on.to_ascii_uppercase().find(" WHERE "))
+                        .or_else(|| after_on.to_ascii_uppercase().find(" ORDER "))
+                        .or_else(|| after_on.to_ascii_uppercase().find(" LIMIT "))
+                        .unwrap_or(after_on.len());
+                    rem = &after_on[cond_end..];
+                }
+                if let Some(table) = join_tables.get(0) {
+                    orders_table = Some(table.clone());
+                }
+                if let Some(table) = join_tables.get(1) {
+                    products_table = Some(table.clone());
+                }
+            }
+        }
+
+        Self {
+            account_id_filter,
+            accounts_table,
+            orders_table,
+            products_table,
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        Cell, ColumnarClassification, MvccIsolationLevel, MvccTransactionManager, MvccTxState,
-        NativeColumnData, NativeRow, NativeSqlEngine,
+        Cell, ColumnarClassification, JoinPlan, MvccIsolationLevel, MvccTransactionManager,
+        MvccTxState, NativeColumnData, NativeRow, NativeSqlEngine,
     };
     use crate::index::IndexState;
     use std::collections::{BTreeMap, HashMap};
@@ -24058,6 +24289,80 @@ mod tests {
 
         assert_eq!(res.rows.len(), 2);
         assert_eq!(res.command_tag, "SELECT 2");
+    }
+
+    #[test]
+    fn join_plan_parses_benchmark_tables_and_order_filter() {
+        let sql = "SELECT a.name, o.id, p.name, o.quantity, o.total \
+                   FROM bench_accounts_hot_123 a \
+                   JOIN bench_orders_hot_123 o ON a.id = o.account_id \
+                   JOIN bench_products_hot_123 p ON o.product_id = p.id \
+                   WHERE o.account_id = 42";
+
+        let plan = JoinPlan::from_sql(sql);
+
+        assert_eq!(
+            plan.accounts_table.as_deref(),
+            Some("bench_accounts_hot_123")
+        );
+        assert_eq!(plan.orders_table.as_deref(), Some("bench_orders_hot_123"));
+        assert_eq!(
+            plan.products_table.as_deref(),
+            Some("bench_products_hot_123")
+        );
+        assert_eq!(plan.account_id_filter, Some(42));
+    }
+
+    #[test]
+    fn join_with_order_account_filter_uses_dynamic_table_names() {
+        let engine = NativeSqlEngine::new();
+        engine
+            .execute("CREATE TABLE bench_accounts_hot_123 (id INTEGER PRIMARY KEY, balance REAL, name TEXT)")
+            .unwrap();
+        engine
+            .execute("CREATE TABLE bench_products_hot_123 (id INTEGER PRIMARY KEY, name TEXT, price REAL, category TEXT)")
+            .unwrap();
+        engine
+            .execute("CREATE TABLE bench_orders_hot_123 (id INTEGER PRIMARY KEY, account_id INTEGER, product_id INTEGER, quantity INTEGER, total REAL)")
+            .unwrap();
+        engine
+            .execute("CREATE INDEX idx_hot_account_id ON bench_orders_hot_123 (account_id)")
+            .unwrap();
+
+        engine
+            .execute(
+                "INSERT INTO bench_accounts_hot_123 (id, balance, name) VALUES (42, 100.0, 'alice')",
+            )
+            .unwrap();
+        engine
+            .execute("INSERT INTO bench_products_hot_123 (id, name, price, category) VALUES (7, 'book', 12.5, 'books')")
+            .unwrap();
+        for id in 1..=100 {
+            let account_id = if id <= 3 { 42 } else { 99 };
+            engine
+                .execute(&format!(
+                    "INSERT INTO bench_orders_hot_123 (id, account_id, product_id, quantity, total) VALUES ({id}, {account_id}, 7, 1, 12.5)"
+                ))
+                .unwrap();
+        }
+
+        assert!(engine
+            .index_mgr
+            .find_index("bench_orders_hot_123", "account_id")
+            .is_some());
+
+        let res = engine
+            .execute(
+                "SELECT a.name, o.id, p.name, o.quantity, o.total
+                 FROM bench_accounts_hot_123 a
+                 JOIN bench_orders_hot_123 o ON a.id = o.account_id
+                 JOIN bench_products_hot_123 p ON o.product_id = p.id
+                 WHERE o.account_id = 42",
+            )
+            .unwrap();
+
+        assert_eq!(res.rows.len(), 3);
+        assert_eq!(res.command_tag, "SELECT 3");
     }
 
     #[test]
@@ -25226,6 +25531,74 @@ mod tests {
         assert_eq!(
             String::from_utf8(complex_count.rows[0][0].clone().unwrap()).unwrap(),
             "8"
+        );
+    }
+
+    #[test]
+    fn primary_key_range_count_uses_sorted_columnar_ids() {
+        let engine = NativeSqlEngine::new();
+        engine
+            .execute("CREATE TABLE pk_range_count (id INTEGER PRIMARY KEY, score INTEGER)")
+            .unwrap();
+        for id in 1..=10_000 {
+            engine
+                .execute(&format!(
+                    "INSERT INTO pk_range_count (id, score) VALUES ({}, {})",
+                    id,
+                    id % 17
+                ))
+                .unwrap();
+        }
+
+        assert_eq!(
+            single_text(
+                &engine,
+                "SELECT COUNT(*) FROM pk_range_count WHERE id BETWEEN 5000 AND 5999"
+            ),
+            "1000"
+        );
+
+        engine
+            .execute("DELETE FROM pk_range_count WHERE id BETWEEN 5500 AND 5599")
+            .unwrap();
+        assert_eq!(
+            single_text(
+                &engine,
+                "SELECT COUNT(*) FROM pk_range_count WHERE id BETWEEN 5000 AND 5999"
+            ),
+            "900"
+        );
+    }
+
+    #[test]
+    fn numeric_order_by_limit_topk_matches_full_sort() {
+        let engine = NativeSqlEngine::new();
+        engine
+            .execute("CREATE TABLE topk_sort (id INTEGER PRIMARY KEY, score REAL, label TEXT)")
+            .unwrap();
+        for id in 1..=1000 {
+            let score = ((id * 37) % 1000) as f64 / 3.0;
+            engine
+                .execute(&format!(
+                    "INSERT INTO topk_sort (id, score, label) VALUES ({}, {}, 'row_{}')",
+                    id, score, id
+                ))
+                .unwrap();
+        }
+
+        assert_eq!(
+            ids_from_sql(
+                &engine,
+                "SELECT id FROM topk_sort ORDER BY score DESC LIMIT 5"
+            ),
+            vec![27, 54, 81, 108, 135]
+        );
+        assert_eq!(
+            ids_from_sql(
+                &engine,
+                "SELECT id FROM topk_sort ORDER BY score ASC LIMIT 5"
+            ),
+            vec![1000, 973, 946, 919, 892]
         );
     }
 
