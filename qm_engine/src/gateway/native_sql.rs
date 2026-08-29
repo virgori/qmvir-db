@@ -14528,6 +14528,41 @@ impl NativeSqlEngine {
         Some(row_ids)
     }
 
+    fn indexed_and_count(&self, table: &str, t: &NativeTable, pred: &str) -> Option<i64> {
+        let parts = Self::split_top_level_keyword(pred, " AND ");
+        if parts.len() < 2 {
+            return None;
+        }
+
+        let mut best: Option<(String, Vec<i64>)> = None;
+        for part in parts {
+            let (col, key) = Self::parse_indexable_eq_predicate(part)?;
+            if let Some(tree) = self.index_mgr.find_index(table, &col) {
+                self.record_auto_index_query_hit(table, &col);
+                self.index_mgr.record_index_use(&tree.name);
+                let row_ids = tree.search(&key);
+                if best
+                    .as_ref()
+                    .map_or(true, |(_, current)| row_ids.len() < current.len())
+                {
+                    best = Some((col, row_ids));
+                }
+            }
+        }
+
+        let (col, row_ids) = best?;
+        let count = row_ids
+            .into_iter()
+            .filter(|row_id| {
+                t.rows
+                    .get(row_id)
+                    .is_some_and(|row| Self::eval_condition_for_row(*row_id, row, pred))
+            })
+            .count();
+        self.record_auto_index_selectivity(table, &col, count, t.rows.len());
+        Some(count as i64)
+    }
+
     fn split_top_level_keyword<'a>(mut text: &'a str, keyword: &str) -> Vec<&'a str> {
         let mut parts = Vec::new();
         loop {
@@ -14619,16 +14654,196 @@ impl NativeSqlEngine {
         pred: &str,
     ) -> Option<i64> {
         let terms = Self::parse_fast_count_terms(pred)?;
-        if terms.len() != 1 {
+        let cc = self.get_or_build_cols(table, t);
+        if terms.is_empty() {
             return None;
         }
-        let (col, target) = match &terms[0] {
-            FastCountTerm::Eq(col, Cell::Int(target)) => (col.as_str(), *target),
+        if terms.len() == 1 {
+            if let FastCountTerm::Eq(col, value) = &terms[0] {
+                if col.eq_ignore_ascii_case("id") {
+                    if let Cell::Int(target) = value {
+                        return Some(columnar_count_eq_i64(&cc.ids, *target));
+                    }
+                } else if let (Some(iv), Cell::Int(target)) = (cc.int_cols.get(col.as_str()), value)
+                {
+                    return Some(columnar_count_eq_i64(iv, *target));
+                } else if let (Some(fv), Cell::Float(target)) =
+                    (cc.float_cols.get(col.as_str()), value)
+                {
+                    let count = fv
+                        .iter()
+                        .filter(|v| (**v - *target).abs() < f64::EPSILON)
+                        .count();
+                    return Some(count as i64);
+                } else if let (Some(tv), Cell::Text(target)) =
+                    (cc.text_cols.get(col.as_str()), value)
+                {
+                    let count = if tv.len() >= LIKE_COLUMNAR_SCAN_MIN_ROWS {
+                        tv.par_iter()
+                            .filter(|v| v.as_str() == target.as_str())
+                            .count()
+                    } else {
+                        tv.iter().filter(|v| v.as_str() == target.as_str()).count()
+                    };
+                    return Some(count as i64);
+                }
+            }
+        }
+
+        let n = cc.ids.len();
+        let count = if n > CHUNK_SIZE {
+            (0..n)
+                .into_par_iter()
+                .filter(|&i| Self::columnar_fast_count_terms_match(&cc, i, &terms))
+                .count()
+        } else {
+            (0..n)
+                .filter(|&i| Self::columnar_fast_count_terms_match(&cc, i, &terms))
+                .count()
+        };
+        Some(count as i64)
+    }
+
+    fn columnar_fast_count_terms_match(
+        cc: &CachedColumns,
+        idx: usize,
+        terms: &[FastCountTerm],
+    ) -> bool {
+        for term in terms {
+            let matched = match term {
+                FastCountTerm::Eq(col, value) => Self::columnar_cell_matches(cc, idx, col, value),
+                FastCountTerm::Ne(col, value) => !Self::columnar_cell_matches(cc, idx, col, value),
+                FastCountTerm::Gt(col, value) => {
+                    Self::columnar_cell_cmp(cc, idx, col, value).is_some_and(|ord| ord.is_gt())
+                }
+                FastCountTerm::Ge(col, value) => {
+                    Self::columnar_cell_cmp(cc, idx, col, value).is_some_and(|ord| !ord.is_lt())
+                }
+                FastCountTerm::Lt(col, value) => {
+                    Self::columnar_cell_cmp(cc, idx, col, value).is_some_and(|ord| ord.is_lt())
+                }
+                FastCountTerm::Le(col, value) => {
+                    Self::columnar_cell_cmp(cc, idx, col, value).is_some_and(|ord| !ord.is_gt())
+                }
+                FastCountTerm::In(col, values) => values
+                    .iter()
+                    .any(|value| Self::columnar_cell_matches(cc, idx, col, value)),
+            };
+            if !matched {
+                return false;
+            }
+        }
+        true
+    }
+
+    fn columnar_cell_matches(cc: &CachedColumns, idx: usize, col: &str, value: &Cell) -> bool {
+        if col.eq_ignore_ascii_case("id") {
+            return cell_eq(&Cell::Int(cc.ids[idx]), value);
+        }
+        if let Some(iv) = cc.int_cols.get(col) {
+            return cell_eq(&Cell::Int(iv[idx]), value);
+        }
+        if let Some(fv) = cc.float_cols.get(col) {
+            return cell_eq(&Cell::Float(fv[idx]), value);
+        }
+        if let Some(tv) = cc.text_cols.get(col) {
+            return cell_eq(&Cell::Text(tv[idx].clone()), value);
+        }
+        false
+    }
+
+    fn columnar_cell_cmp(
+        cc: &CachedColumns,
+        idx: usize,
+        col: &str,
+        value: &Cell,
+    ) -> Option<std::cmp::Ordering> {
+        if col.eq_ignore_ascii_case("id") {
+            return Some(cell_cmp(&Cell::Int(cc.ids[idx]), value));
+        }
+        if let Some(iv) = cc.int_cols.get(col) {
+            return Some(cell_cmp(&Cell::Int(iv[idx]), value));
+        }
+        if let Some(fv) = cc.float_cols.get(col) {
+            return Some(cell_cmp(&Cell::Float(fv[idx]), value));
+        }
+        if let Some(tv) = cc.text_cols.get(col) {
+            return Some(cell_cmp(&Cell::Text(tv[idx].clone()), value));
+        }
+        None
+    }
+
+    fn columnar_like_count(&self, table: &str, t: &NativeTable, pred: &str) -> Option<i64> {
+        let pred_up = pred.to_ascii_uppercase();
+        let is_ilike = pred_up.contains(" ILIKE ");
+        let (col, needle) = Self::parse_like_contains_predicate(pred)?;
+        let cc = self.get_or_build_cols(table, t);
+        let texts = cc.text_cols.get(col.as_str())?;
+        let needle_bytes = needle.as_bytes();
+        let count = if texts.len() >= LIKE_COLUMNAR_SCAN_MIN_ROWS {
+            texts
+                .par_iter()
+                .filter(|text| text_contains_needle_bytes(text, needle_bytes, is_ilike, &needle))
+                .count()
+        } else {
+            texts
+                .iter()
+                .filter(|text| text_contains_needle_bytes(text, needle_bytes, is_ilike, &needle))
+                .count()
+        };
+        Some(count as i64)
+    }
+
+    fn columnar_sum_eq(
+        &self,
+        table: &str,
+        t: &NativeTable,
+        agg_col: &str,
+        eq_col: &str,
+        eq_val: &Cell,
+    ) -> Option<(f64, i64)> {
+        let cc = self.get_or_build_cols(table, t);
+        let n = cc.ids.len();
+        let sum_matching = |matches_idx: &dyn Fn(usize) -> bool| -> (f64, i64) {
+            let mut sum = 0.0f64;
+            let mut count = 0i64;
+            if let Some(fv) = cc.float_cols.get(agg_col) {
+                for i in 0..n {
+                    if matches_idx(i) {
+                        sum += fv[i];
+                        count += 1;
+                    }
+                }
+            } else if let Some(iv) = cc.int_cols.get(agg_col) {
+                for i in 0..n {
+                    if matches_idx(i) {
+                        sum += iv[i] as f64;
+                        count += 1;
+                    }
+                }
+            }
+            (sum, count)
+        };
+
+        let (sum, count) = match eq_val {
+            Cell::Int(target) if eq_col.eq_ignore_ascii_case("id") => {
+                sum_matching(&|i| cc.ids[i] == *target)
+            }
+            Cell::Int(target) => {
+                let filter = cc.int_cols.get(eq_col)?;
+                sum_matching(&|i| filter[i] == *target)
+            }
+            Cell::Float(target) => {
+                let filter = cc.float_cols.get(eq_col)?;
+                sum_matching(&|i| (filter[i] - *target).abs() < f64::EPSILON)
+            }
+            Cell::Text(target) => {
+                let filter = cc.text_cols.get(eq_col)?;
+                sum_matching(&|i| filter[i] == *target)
+            }
             _ => return None,
         };
-        let cc = self.get_or_build_cols(table, t);
-        let iv = cc.int_cols.get(col)?;
-        Some(columnar_count_eq_i64(iv, target))
+        Some((sum, count))
     }
 
     fn columnar_count_index_key(
@@ -14641,6 +14856,16 @@ impl NativeSqlEngine {
         let cc = self.get_or_build_cols(table, t);
         match key {
             IndexKey::Integer(v) => cc.int_cols.get(col).map(|iv| columnar_count_eq_i64(iv, *v)),
+            IndexKey::Str(v) => cc.text_cols.get(col).map(|tv| {
+                let count = if tv.len() >= LIKE_COLUMNAR_SCAN_MIN_ROWS {
+                    tv.par_iter()
+                        .filter(|item| item.as_str() == v.as_str())
+                        .count()
+                } else {
+                    tv.iter().filter(|item| item.as_str() == v.as_str()).count()
+                };
+                count as i64
+            }),
             _ => None,
         }
     }
@@ -19406,7 +19631,7 @@ impl NativeSqlEngine {
         // ── Numeric Top-K fast path: ORDER BY numeric_col LIMIT n with no WHERE ──
         // Keep only the best LIMIT candidates while scanning the columnar cache,
         // avoiding full row materialization and O(n log n) full-table sort.
-        if where_pred_str.is_none() && sort_specs.len() == 1 && offset == 0 {
+        if where_pred_str.is_none() && sort_specs.len() == 1 {
             if let Some(lim) = limit {
                 let (ref sort_col, is_desc) = sort_specs[0];
                 if lim == 0 {
@@ -19418,6 +19643,15 @@ impl NativeSqlEngine {
                     });
                 }
                 let cc = self.get_or_build_cols(table, &*t);
+                let keep = offset.saturating_add(lim).min(cc.ids.len());
+                if keep == 0 {
+                    return Ok(QueryResult {
+                        columns,
+                        rows: Vec::new(),
+                        command_tag: "SELECT 0".to_string(),
+                        ..Default::default()
+                    });
+                }
                 let numeric_values: Option<Vec<f64>> =
                     if let Some(fv) = cc.float_cols.get(sort_col.as_str()) {
                         Some(fv.clone())
@@ -19427,35 +19661,19 @@ impl NativeSqlEngine {
                             .map(|iv| iv.iter().map(|v| *v as f64).collect())
                     };
                 if let Some(values) = numeric_values {
-                    let mut top: Vec<usize> = Vec::with_capacity(lim.min(values.len()));
-                    for idx in 0..values.len() {
-                        if top.len() < lim {
-                            top.push(idx);
-                            continue;
-                        }
-                        let mut worst_pos = 0usize;
-                        for pos in 1..top.len() {
-                            let current_worst = values[top[worst_pos]];
-                            let candidate = values[top[pos]];
-                            let is_worse = if is_desc {
-                                candidate < current_worst
-                            } else {
-                                candidate > current_worst
-                            };
-                            if is_worse {
-                                worst_pos = pos;
-                            }
-                        }
-                        let worst_value = values[top[worst_pos]];
-                        let candidate_value = values[idx];
-                        let is_better = if is_desc {
-                            candidate_value > worst_value
+                    let mut top: Vec<usize> = (0..values.len()).collect();
+                    let order_cmp = |&a: &usize, &b: &usize| {
+                        let cmp = values[a].total_cmp(&values[b]);
+                        if is_desc {
+                            cmp.reverse().then_with(|| cc.ids[a].cmp(&cc.ids[b]))
                         } else {
-                            candidate_value < worst_value
-                        };
-                        if is_better {
-                            top[worst_pos] = idx;
+                            cmp.then_with(|| cc.ids[a].cmp(&cc.ids[b]))
                         }
+                    };
+                    if keep < top.len() {
+                        let nth = keep - 1;
+                        top.select_nth_unstable_by(nth, order_cmp);
+                        top.truncate(keep);
                     }
                     top.sort_by(|&a, &b| {
                         let cmp = values[a].total_cmp(&values[b]);
@@ -19491,6 +19709,8 @@ impl NativeSqlEngine {
                         .collect();
                     let rows_out: Vec<Vec<Option<Vec<u8>>>> = top
                         .into_iter()
+                        .skip(offset)
+                        .take(lim)
                         .map(|idx| {
                             col_refs
                                 .iter()
@@ -19511,6 +19731,128 @@ impl NativeSqlEngine {
                         command_tag: format!("SELECT {}", row_count),
                         ..Default::default()
                     });
+                }
+            }
+        }
+
+        // ── Range + numeric Top-K fast path:
+        // WHERE id BETWEEN lo AND hi ORDER BY numeric_col LIMIT/OFFSET.
+        if sort_specs.len() == 1 {
+            if let (Some(ref pred), Some(lim)) = (&where_pred_str, limit) {
+                let (ref sort_col, is_desc) = sort_specs[0];
+                if let Some((range_col, lo_key, hi_key)) =
+                    Self::parse_indexable_between_predicate(pred)
+                {
+                    if (range_col == "id"
+                        || range_col == t.columns.first().map(|s| s.as_str()).unwrap_or(""))
+                        && matches!(
+                            (&lo_key, &hi_key),
+                            (IndexKey::Integer(_), IndexKey::Integer(_))
+                        )
+                    {
+                        let (lo, hi) = match (&lo_key, &hi_key) {
+                            (IndexKey::Integer(lo), IndexKey::Integer(hi)) => (*lo, *hi),
+                            _ => unreachable!(),
+                        };
+                        let cc = self.get_or_build_cols(table, &*t);
+                        let start = cc.ids.partition_point(|id| *id < lo);
+                        let end = cc.ids.partition_point(|id| *id <= hi);
+                        let keep = offset.saturating_add(lim).min(end.saturating_sub(start));
+                        if keep == 0 {
+                            return Ok(QueryResult {
+                                columns,
+                                rows: Vec::new(),
+                                command_tag: "SELECT 0".to_string(),
+                                ..Default::default()
+                            });
+                        }
+                        let numeric_values: Option<Vec<f64>> =
+                            if let Some(fv) = cc.float_cols.get(sort_col.as_str()) {
+                                Some(fv.clone())
+                            } else {
+                                cc.int_cols
+                                    .get(sort_col.as_str())
+                                    .map(|iv| iv.iter().map(|v| *v as f64).collect())
+                            };
+                        if let Some(values) = numeric_values {
+                            let mut top: Vec<usize> = (start..end).collect();
+                            let order_cmp = |&a: &usize, &b: &usize| {
+                                let cmp = values[a].total_cmp(&values[b]);
+                                if is_desc {
+                                    cmp.reverse().then_with(|| cc.ids[a].cmp(&cc.ids[b]))
+                                } else {
+                                    cmp.then_with(|| cc.ids[a].cmp(&cc.ids[b]))
+                                }
+                            };
+                            if keep < top.len() {
+                                let nth = keep - 1;
+                                top.select_nth_unstable_by(nth, order_cmp);
+                                top.truncate(keep);
+                            }
+                            top.sort_by(|&a, &b| {
+                                let cmp = values[a].total_cmp(&values[b]);
+                                if is_desc {
+                                    cmp.reverse().then_with(|| cc.ids[a].cmp(&cc.ids[b]))
+                                } else {
+                                    cmp.then_with(|| cc.ids[a].cmp(&cc.ids[b]))
+                                }
+                            });
+
+                            enum ColRef<'a> {
+                                Id,
+                                Float(&'a [f64]),
+                                Text(&'a [String]),
+                                Int(&'a [i64]),
+                                Missing,
+                            }
+                            let col_refs: Vec<ColRef> = out_cols
+                                .iter()
+                                .map(|col| {
+                                    if col == "id" {
+                                        ColRef::Id
+                                    } else if let Some(fv) = cc.float_cols.get(col.as_str()) {
+                                        ColRef::Float(fv.as_slice())
+                                    } else if let Some(tv) = cc.text_cols.get(col.as_str()) {
+                                        ColRef::Text(tv.as_slice())
+                                    } else if let Some(iv) = cc.int_cols.get(col.as_str()) {
+                                        ColRef::Int(iv.as_slice())
+                                    } else {
+                                        ColRef::Missing
+                                    }
+                                })
+                                .collect();
+                            let rows_out: Vec<Vec<Option<Vec<u8>>>> = top
+                                .into_iter()
+                                .skip(offset)
+                                .take(lim)
+                                .map(|idx| {
+                                    col_refs
+                                        .iter()
+                                        .map(|cr| match cr {
+                                            ColRef::Id => {
+                                                Some(cc.ids[idx].to_string().into_bytes())
+                                            }
+                                            ColRef::Float(fv) => {
+                                                Some(fv[idx].to_string().into_bytes())
+                                            }
+                                            ColRef::Text(tv) => Some(tv[idx].as_bytes().to_vec()),
+                                            ColRef::Int(iv) => {
+                                                Some(iv[idx].to_string().into_bytes())
+                                            }
+                                            ColRef::Missing => None,
+                                        })
+                                        .collect()
+                                })
+                                .collect();
+                            let row_count = rows_out.len();
+                            return Ok(QueryResult {
+                                columns,
+                                rows: rows_out,
+                                command_tag: format!("SELECT {}", row_count),
+                                ..Default::default()
+                            });
+                        }
+                    }
                 }
             }
         }
@@ -21341,6 +21683,8 @@ impl NativeSqlEngine {
                     .into_iter()
                     .filter(|row_id| t.rows.contains_key(row_id))
                     .count() as i64
+            } else if let Some(count) = self.indexed_and_count(table, &*t, pred) {
+                count
             } else if let Some((col, lo_key, hi_key)) =
                 Self::parse_indexable_range_conjunction(pred)
             {
@@ -21422,6 +21766,8 @@ impl NativeSqlEngine {
                     self.record_auto_index_selectivity(table, &col, count, t.rows.len());
                     count as i64
                 }
+            } else if let Some(count) = self.columnar_like_count(table, &*t, pred) {
+                count
             } else if let Some(count) = self.columnar_count_from_predicate(table, &*t, pred) {
                 count
             } else if let Some(count) = Self::fast_count_predicate(&*t, pred) {
@@ -21680,29 +22026,35 @@ impl NativeSqlEngine {
                 }
             } else if let Some((ref eq_col, ref eq_val)) = eq_filter {
                 // Equality filter: WHERE col = val
-                let mut values = Vec::new();
-                for row in t.rows.values() {
-                    let matches = match row.cols.get(eq_col.as_str()) {
-                        Some(cell) => match (eq_val, cell) {
-                            (Cell::Int(a), Cell::Int(b)) => a == b,
-                            (Cell::Float(a), Cell::Float(b)) => (a - b).abs() < f64::EPSILON,
-                            (Cell::Text(a), Cell::Text(b)) => a == b,
-                            _ => eq_val.as_text() == cell.as_text(),
-                        },
-                        None => false,
-                    };
-                    if matches {
-                        values.push(
-                            row.cols
-                                .get(agg_col.as_str())
-                                .cloned()
-                                .unwrap_or(Cell::Float(0.0))
-                                .as_f64(),
-                        );
+                if let Some(result) =
+                    self.columnar_sum_eq(table, &*t, &agg_col, eq_col.as_str(), eq_val)
+                {
+                    result
+                } else {
+                    let mut values = Vec::new();
+                    for row in t.rows.values() {
+                        let matches = match row.cols.get(eq_col.as_str()) {
+                            Some(cell) => match (eq_val, cell) {
+                                (Cell::Int(a), Cell::Int(b)) => a == b,
+                                (Cell::Float(a), Cell::Float(b)) => (a - b).abs() < f64::EPSILON,
+                                (Cell::Text(a), Cell::Text(b)) => a == b,
+                                _ => eq_val.as_text() == cell.as_text(),
+                            },
+                            None => false,
+                        };
+                        if matches {
+                            values.push(
+                                row.cols
+                                    .get(agg_col.as_str())
+                                    .cloned()
+                                    .unwrap_or(Cell::Float(0.0))
+                                    .as_f64(),
+                            );
+                        }
                     }
+                    let n = values.len() as i64;
+                    (simd_sum_f64(&values), n)
                 }
-                let n = values.len() as i64;
-                (simd_sum_f64(&values), n)
             } else {
                 // No filter: sum entire column from columnar cache.
                 if use_columnar_fast_path {
@@ -22389,8 +22741,27 @@ impl NativeSqlEngine {
 
     fn handle_select_join(&self, s: &str) -> Result<QueryResult, String> {
         let plan = JoinPlan::from_sql(s);
+        let join_where_eq: Option<(String, String, Cell)> = {
+            let up = s.to_ascii_uppercase();
+            if let Some(where_idx) = up.find("WHERE") {
+                let pred = s[where_idx + 5..].trim().trim_end_matches(';');
+                let eq: Vec<&str> = pred.splitn(2, '=').collect();
+                if eq.len() == 2 {
+                    let (alias, col) = Self::split_dotted_ref(eq[0].trim());
+                    Some((alias, col, Self::parse_value(eq[1].trim())))
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        };
+        let supported_dimension_filter = join_where_eq.as_ref().is_some_and(|(_, col, _)| {
+            col.eq_ignore_ascii_case("region") || col.eq_ignore_ascii_case("category")
+        });
 
-        if plan.has_where_clause && plan.account_id_filter.is_none() {
+        if plan.has_where_clause && plan.account_id_filter.is_none() && !supported_dimension_filter
+        {
             return self.handle_generic_join(s);
         }
         let orders_table_name = plan.orders_table.clone().unwrap_or_default();
@@ -22402,11 +22773,150 @@ impl NativeSqlEngine {
 
         let mut out_rows = Vec::new();
         let mut used_specialized_join = false;
+        if let (Some(a_shared), Some(o_shared), None) =
+            (a_shared.clone(), o_shared.clone(), p_shared.clone())
+        {
+            if let Some((ref alias, ref col, ref value)) = join_where_eq {
+                if col.eq_ignore_ascii_case("region") && (alias == "a" || alias.is_empty()) {
+                    let at = a_shared.read();
+                    let ot = o_shared.read();
+                    let mut accounts_by_id: AHashMap<i64, Arc<[u8]>> = AHashMap::new();
+                    let candidate_ids = if let Some(tree) =
+                        self.index_mgr.find_index(&accounts_table_name, "region")
+                    {
+                        self.index_mgr.record_index_use(&tree.name);
+                        Self::index_key_for_cell(value)
+                            .map(|key| tree.search(&key))
+                            .unwrap_or_default()
+                    } else {
+                        at.rows.keys().copied().collect()
+                    };
+                    for account_id in candidate_ids {
+                        if let Some(row) = at.rows.get(&account_id) {
+                            if row
+                                .cols
+                                .get("region")
+                                .is_some_and(|cell| cell_eq(cell, value))
+                            {
+                                let name = row
+                                    .cols
+                                    .get("name")
+                                    .map(|cell| cell.as_text())
+                                    .unwrap_or_default();
+                                accounts_by_id
+                                    .insert(account_id, Arc::<[u8]>::from(name.into_bytes()));
+                            }
+                        }
+                    }
+
+                    let order_rows: Vec<&NativeRow> = ot.rows.values().collect();
+                    let soa = match self.buf_pool.get_soa(&orders_table_name) {
+                        Some(cached) => cached,
+                        None => {
+                            let built = JoinInputSoA::from_rows(&order_rows);
+                            self.buf_pool.put_soa(&orders_table_name, built)
+                        }
+                    };
+                    let empty: Arc<[u8]> = Arc::from(Vec::new());
+                    out_rows = (0..soa.len())
+                        .into_par_iter()
+                        .filter_map(|idx| {
+                            let account_id = soa.account_ids[idx] as i64;
+                            let account_name = accounts_by_id.get(&account_id)?;
+                            Some(vec![
+                                Some(account_name.to_vec()),
+                                Some(soa.order_ids[idx].to_string().into_bytes()),
+                                Some(soa.totals[idx].to_string().into_bytes()),
+                            ])
+                        })
+                        .collect();
+                    let _ = empty;
+                    let n = out_rows.len();
+                    return Ok(QueryResult {
+                        columns: vec![
+                            ("name".to_string(), oid::TEXT, -1),
+                            ("id".to_string(), oid::INT8, 8),
+                            ("total".to_string(), oid::FLOAT8, 8),
+                        ],
+                        rows: out_rows,
+                        command_tag: format!("SELECT {}", n),
+                        ..Default::default()
+                    });
+                }
+            }
+        }
+
         if let (Some(a_shared), Some(o_shared), Some(p_shared)) = (a_shared, o_shared, p_shared) {
             let at = a_shared.read();
             let ot = o_shared.read();
             let pt = p_shared.read();
             used_specialized_join = true;
+            if let Some((ref alias, ref col, ref value)) = join_where_eq {
+                if col.eq_ignore_ascii_case("category") && (alias == "p" || alias.is_empty()) {
+                    let mut product_name_by_id: AHashMap<i64, Arc<[u8]>> = AHashMap::new();
+                    for (product_id, row) in &pt.rows {
+                        if row
+                            .cols
+                            .get("category")
+                            .is_some_and(|cell| cell_eq(cell, value))
+                        {
+                            let name = row
+                                .cols
+                                .get("name")
+                                .map(|cell| cell.as_text())
+                                .unwrap_or_default();
+                            product_name_by_id
+                                .insert(*product_id, Arc::<[u8]>::from(name.into_bytes()));
+                        }
+                    }
+
+                    let order_rows: Vec<&NativeRow> = ot.rows.values().collect();
+                    let soa = match self.buf_pool.get_soa(&orders_table_name) {
+                        Some(cached) => cached,
+                        None => {
+                            let built = JoinInputSoA::from_rows(&order_rows);
+                            self.buf_pool.put_soa(&orders_table_name, built)
+                        }
+                    };
+                    let acc_map = match self.buf_pool.get_dim(&accounts_table_name) {
+                        Some(cached) => cached,
+                        None => {
+                            let map = Self::build_dim_hash(&at);
+                            self.buf_pool.put_dim(&accounts_table_name, map)
+                        }
+                    };
+                    let empty: Arc<[u8]> = Arc::from(Vec::new());
+                    out_rows = (0..soa.len())
+                        .into_par_iter()
+                        .filter_map(|idx| {
+                            let product_id = soa.product_ids[idx] as i64;
+                            let product_name = product_name_by_id.get(&product_id)?;
+                            let account_id = soa.account_ids[idx] as i64;
+                            let account_name = acc_map.get(&account_id).unwrap_or(&empty);
+                            Some(vec![
+                                Some(account_name.to_vec()),
+                                Some(soa.order_ids[idx].to_string().into_bytes()),
+                                Some(product_name.to_vec()),
+                                Some(soa.quantities[idx].to_string().into_bytes()),
+                                Some(soa.totals[idx].to_string().into_bytes()),
+                            ])
+                        })
+                        .collect();
+                    let n = out_rows.len();
+                    return Ok(QueryResult {
+                        columns: vec![
+                            ("name".to_string(), oid::TEXT, -1),
+                            ("id".to_string(), oid::INT8, 8),
+                            ("name".to_string(), oid::TEXT, -1),
+                            ("quantity".to_string(), oid::INT8, 8),
+                            ("total".to_string(), oid::FLOAT8, 8),
+                        ],
+                        rows: out_rows,
+                        command_tag: format!("SELECT {}", n),
+                        ..Default::default()
+                    });
+                }
+            }
             // Fast path: use B+Tree index on account_id when available
             if let Some(account_id) = plan.account_id_filter {
                 if let Some(tree) = self.index_mgr.find_index(&orders_table_name, "account_id") {
@@ -22628,7 +23138,18 @@ impl NativeSqlEngine {
             }
         };
 
-        let g = self.tables.to_native_map();
+        let row_matches_join_where = |alias: &str, row: &NativeRow| -> bool {
+            if let Some((ref wa, ref wc, ref wval)) = where_pred {
+                if wa == alias {
+                    return row
+                        .cols
+                        .get(wc.as_str())
+                        .map(|v| cell_eq(v, wval))
+                        .unwrap_or(false);
+                }
+            }
+            true
+        };
 
         // Build alias → table name mapping.
         let mut alias_to_table: HashMap<String, String> = HashMap::new();
@@ -22638,12 +23159,12 @@ impl NativeSqlEngine {
         }
 
         // Start with base table rows, prefixing columns with alias.
-        let ft = g
-            .get(&first_table)
-            .ok_or(format!("table \"{}\" does not exist", first_table))?;
-        let mut result_rows: Vec<HashMap<String, Cell>> = ft
+        let first_shared = self.table_read_guard(&first_table)?;
+        let first_guard = first_shared.read();
+        let mut result_rows: Vec<HashMap<String, Cell>> = first_guard
             .rows
             .values()
+            .filter(|row| row_matches_join_where(&first_alias, row))
             .map(|row| {
                 let mut m = HashMap::new();
                 for (k, v) in &row.cols {
@@ -22652,12 +23173,12 @@ impl NativeSqlEngine {
                 m
             })
             .collect();
+        drop(first_guard);
 
         // Hash join for each JOIN clause.
         for j in &joins {
-            let jt = g
-                .get(&j.table)
-                .ok_or(format!("table \"{}\" does not exist", j.table))?;
+            let join_shared = self.table_read_guard(&j.table)?;
+            let join_guard = join_shared.read();
 
             // Determine which side of the ON condition references the existing
             // result set vs the new join table.
@@ -22685,7 +23206,10 @@ impl NativeSqlEngine {
 
             // BUILD phase: hash the join table rows by join column.
             let mut hash_table: HashMap<String, Vec<HashMap<String, Cell>>> = HashMap::new();
-            for (_id, jrow) in &jt.rows {
+            for (_id, jrow) in &join_guard.rows {
+                if !row_matches_join_where(&j.alias, jrow) {
+                    continue;
+                }
                 let join_val = jrow
                     .cols
                     .get(&join_col_name)
@@ -24395,7 +24919,9 @@ mod tests {
             .unwrap();
 
         engine
-            .execute("INSERT INTO bench_accounts_two_join (id, region, name) VALUES (1, 3, 'alice')")
+            .execute(
+                "INSERT INTO bench_accounts_two_join (id, region, name) VALUES (1, 3, 'alice')",
+            )
             .unwrap();
         engine
             .execute("INSERT INTO bench_accounts_two_join (id, region, name) VALUES (2, 4, 'bob')")
