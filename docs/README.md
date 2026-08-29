@@ -28,6 +28,7 @@ Canonical documentation for **QMvir 6.2.8**. Guides are grouped by language, wit
 | [Bench Optimization Handover](internal/HANDOVER_BENCH_OPT.md) | Maintainer handover notes for benchmark optimization |
 | [Optimization Wiring Audit](internal/OPTIMIZATION_WIRING_AUDIT.md) | Internal audit of optimization modules that are not fully wired into the current SQL hot path |
 | [PostgreSQL Comparison Benchmark](internal/POSTGRES_COMPARISON.md) | Fixed workload benchmark for finding where QMvir is still slower than PostgreSQL |
+| [Project Progress Report](internal/PROJECT_PROGRESS_REPORT.md) | End-to-end progress report covering cleanup, docs, license, benchmark work, and latest hot-path optimization |
 
 ## Quick Links
 
