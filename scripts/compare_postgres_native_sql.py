@@ -354,7 +354,7 @@ def seed_qm(
     return engine, time.perf_counter() - start
 
 
-def query_cases(
+def core_query_cases(
     rows: int, accounts_table: str, orders_table: str, products_table: str
 ) -> list[QueryCase]:
     mid = max(rows // 2, 1)
@@ -403,6 +403,88 @@ def query_cases(
             compare_result=False,
         ),
     ]
+
+
+def extended_query_cases(
+    rows: int, accounts_table: str, orders_table: str, products_table: str
+) -> list[QueryCase]:
+    mid = max(rows // 2, 1)
+    hi = min(mid + 9_999, rows)
+    return [
+        QueryCase(
+            "multi_predicate_count",
+            "predicate",
+            f"SELECT COUNT(*) FROM {orders_table} WHERE account_id = 42 AND status = 'paid'",
+        ),
+        QueryCase(
+            "low_selectivity_status_count",
+            "predicate",
+            f"SELECT COUNT(*) FROM {orders_table} WHERE status = 'paid'",
+        ),
+        QueryCase(
+            "range_filter_order_limit",
+            "sort",
+            f"SELECT id, total FROM {orders_table} "
+            f"WHERE id BETWEEN {mid} AND {hi} "
+            "ORDER BY total DESC LIMIT 20",
+            compare_result=False,
+        ),
+        QueryCase(
+            "order_by_limit_offset",
+            "sort",
+            f"SELECT id, total FROM {orders_table} ORDER BY total DESC LIMIT 20 OFFSET 1000",
+            compare_result=False,
+        ),
+        QueryCase(
+            "text_like_count",
+            "text",
+            f"SELECT COUNT(*) FROM {accounts_table} WHERE name LIKE '%999%'",
+        ),
+        QueryCase(
+            "aggregate_with_status_filter",
+            "aggregate",
+            f"SELECT SUM(total) FROM {orders_table} WHERE status = 'paid'",
+        ),
+        QueryCase(
+            "group_by_high_cardinality",
+            "group_by",
+            f"SELECT account_id, COUNT(*), SUM(total) FROM {orders_table} GROUP BY account_id",
+            compare_result=False,
+        ),
+        QueryCase(
+            "generic_two_table_join_filtered",
+            "join",
+            f"SELECT a.name, o.id, o.total "
+            f"FROM {accounts_table} a "
+            f"JOIN {orders_table} o ON a.id = o.account_id "
+            "WHERE a.region = 3",
+        ),
+        QueryCase(
+            "three_table_join_product_filter",
+            "join",
+            f"SELECT a.name, o.id, p.name, o.quantity, o.total "
+            f"FROM {accounts_table} a "
+            f"JOIN {orders_table} o ON a.id = o.account_id "
+            f"JOIN {products_table} p ON o.product_id = p.id "
+            "WHERE p.category = 'cat_7'",
+        ),
+    ]
+
+
+def query_cases(
+    rows: int,
+    accounts_table: str,
+    orders_table: str,
+    products_table: str,
+    suite: str,
+) -> list[QueryCase]:
+    core = core_query_cases(rows, accounts_table, orders_table, products_table)
+    extended = extended_query_cases(rows, accounts_table, orders_table, products_table)
+    if suite == "core":
+        return core
+    if suite == "extended":
+        return extended
+    return core + extended
 
 
 def benchmark_qm(engine: Any, case: QueryCase, iterations: int, warmup: int) -> tuple[dict[str, Any], str | None, dict[str, Any] | None]:
@@ -565,6 +647,12 @@ def parse_args() -> argparse.Namespace:
         help="Prefix for benchmark tables. Defaults to a process-specific name.",
     )
     parser.add_argument(
+        "--suite",
+        choices=["core", "extended", "all"],
+        default="core",
+        help="Benchmark suite to run. core is the stable baseline; extended probes harder planner paths.",
+    )
+    parser.add_argument(
         "--qm-sync-policy",
         choices=["none", "per-commit", "per-mutation", "per-commit-sync-data"],
         default="per-commit",
@@ -585,7 +673,9 @@ def main() -> int:
 
     qm_engine = import_qm_engine()
     accounts_table, orders_table, products_table = table_names(args.table_prefix)
-    selected_cases = query_cases(args.rows, accounts_table, orders_table, products_table)
+    selected_cases = query_cases(
+        args.rows, accounts_table, orders_table, products_table, args.suite
+    )
     if args.cases:
         wanted = set(args.cases)
         selected_cases = [case for case in selected_cases if case.name in wanted]
@@ -602,6 +692,7 @@ def main() -> int:
 
     notes: list[str] = [
         f"Benchmark tables: {accounts_table}, {orders_table}, {products_table}",
+        f"Benchmark suite: {args.suite}",
         "PostgreSQL SELECT timings use EXPLAIN ANALYZE Execution Time, excluding psql process startup.",
         "QM timings are embedded Python-to-PyO3 wall-clock timings.",
         "Use --qm-mode persistent-wal to include QM WAL/checkpoint overhead during seed and write workloads.",
