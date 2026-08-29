@@ -11738,6 +11738,45 @@ impl NativeSqlEngine {
             .collect()
     }
 
+    /// Parse SELECT columns while preserving alias-qualified refs for joins.
+    fn parse_select_columns_qualified(s: &str) -> Vec<String> {
+        let up = s.to_ascii_uppercase();
+        let select_end = up.find("SELECT").unwrap_or(0) + 6;
+        let from_idx = up.find(" FROM ").unwrap_or(s.len());
+        let cols_part = s[select_end..from_idx].trim();
+        let mut parts = Vec::new();
+        let mut start = 0usize;
+        let mut depth = 0i32;
+        let mut in_quote = false;
+        for (idx, b) in cols_part.bytes().enumerate() {
+            match b {
+                b'\'' => in_quote = !in_quote,
+                b'(' | b'[' | b'{' if !in_quote => depth += 1,
+                b')' | b']' | b'}' if !in_quote => depth -= 1,
+                b',' if !in_quote && depth == 0 => {
+                    parts.push(&cols_part[start..idx]);
+                    start = idx + 1;
+                }
+                _ => {}
+            }
+        }
+        parts.push(&cols_part[start..]);
+        parts
+            .into_iter()
+            .map(|c| {
+                let c = c.trim();
+                let c_up = c.to_ascii_uppercase();
+                let c = if let Some(as_idx) = c_up.rfind(" AS ") {
+                    c[as_idx + 4..].trim()
+                } else {
+                    c
+                };
+                c.trim_matches('"').to_string()
+            })
+            .filter(|c| !c.is_empty() && c != "*")
+            .collect()
+    }
+
     fn looks_like_vector_literal(t: &str) -> bool {
         let s = t.trim();
         if !(s.starts_with('[') && s.ends_with(']')) {
@@ -22351,44 +22390,12 @@ impl NativeSqlEngine {
     fn handle_select_join(&self, s: &str) -> Result<QueryResult, String> {
         let plan = JoinPlan::from_sql(s);
 
-        let table_names = if plan.accounts_table.is_none()
-            || plan.orders_table.is_none()
-            || plan.products_table.is_none()
-        {
-            self.tables.table_names()
-        } else {
-            Vec::new()
-        };
-        let orders_table_name = plan
-            .orders_table
-            .clone()
-            .or_else(|| {
-                table_names
-                    .iter()
-                    .find(|k| k.starts_with("bench_orders"))
-                    .cloned()
-            })
-            .unwrap_or_default();
-        let accounts_table_name = plan
-            .accounts_table
-            .clone()
-            .or_else(|| {
-                table_names
-                    .iter()
-                    .find(|k| k.starts_with("bench_accounts"))
-                    .cloned()
-            })
-            .unwrap_or_default();
-        let products_table_name = plan
-            .products_table
-            .clone()
-            .or_else(|| {
-                table_names
-                    .iter()
-                    .find(|k| k.starts_with("bench_products"))
-                    .cloned()
-            })
-            .unwrap_or_default();
+        if plan.has_where_clause && plan.account_id_filter.is_none() {
+            return self.handle_generic_join(s);
+        }
+        let orders_table_name = plan.orders_table.clone().unwrap_or_default();
+        let accounts_table_name = plan.accounts_table.clone().unwrap_or_default();
+        let products_table_name = plan.products_table.clone().unwrap_or_default();
         let a_shared = self.tables.get_shared(&accounts_table_name);
         let o_shared = self.tables.get_shared(&orders_table_name);
         let p_shared = self.tables.get_shared(&products_table_name);
@@ -22549,7 +22556,7 @@ impl NativeSqlEngine {
     /// Uses hash join (build on smaller table, probe with larger) for O(n+m)
     /// instead of O(n×m) nested-loop. Falls back to nested-loop for non-equi joins.
     fn handle_generic_join(&self, s: &str) -> Result<QueryResult, String> {
-        let select_cols = Self::parse_select_columns(s);
+        let select_cols = Self::parse_select_columns_qualified(s);
         let up = s.to_ascii_uppercase();
 
         // Parse FROM table [alias]
@@ -24055,6 +24062,7 @@ struct JoinPlan {
     accounts_table: Option<String>,
     orders_table: Option<String>,
     products_table: Option<String>,
+    has_where_clause: bool,
 }
 
 impl JoinPlan {
@@ -24064,11 +24072,17 @@ impl JoinPlan {
         let mut orders_table = None;
         let mut products_table = None;
         let up = sql.to_ascii_uppercase();
+        let mut has_where_clause = false;
         if let Some(where_idx) = up.find("WHERE") {
+            has_where_clause = true;
             let pred = sql[where_idx + 5..].trim();
             if let Some(eq_idx) = pred.find('=') {
-                let rhs = pred[eq_idx + 1..].trim();
-                account_id_filter = Some(NativeSqlEngine::parse_value(rhs).as_i64());
+                let lhs = pred[..eq_idx].trim().trim_matches('"');
+                let lhs_col = NativeSqlEngine::split_dotted_ref(lhs).1;
+                if lhs_col.eq_ignore_ascii_case("account_id") {
+                    let rhs = pred[eq_idx + 1..].trim();
+                    account_id_filter = Some(NativeSqlEngine::parse_value(rhs).as_i64());
+                }
             }
         }
 
@@ -24118,6 +24132,7 @@ impl JoinPlan {
             accounts_table,
             orders_table,
             products_table,
+            has_where_clause,
         }
     }
 }
@@ -24311,6 +24326,7 @@ mod tests {
             Some("bench_products_hot_123")
         );
         assert_eq!(plan.account_id_filter, Some(42));
+        assert!(plan.has_where_clause);
     }
 
     #[test]
@@ -24363,6 +24379,69 @@ mod tests {
 
         assert_eq!(res.rows.len(), 3);
         assert_eq!(res.command_tag, "SELECT 3");
+    }
+
+    #[test]
+    fn two_table_join_with_non_order_filter_does_not_use_three_table_fast_path() {
+        let engine = NativeSqlEngine::new();
+        engine
+            .execute("CREATE TABLE bench_accounts_two_join (id INTEGER PRIMARY KEY, region INTEGER, name TEXT)")
+            .unwrap();
+        engine
+            .execute("CREATE TABLE bench_orders_two_join (id INTEGER PRIMARY KEY, account_id INTEGER, product_id INTEGER, quantity INTEGER, total REAL)")
+            .unwrap();
+        engine
+            .execute("CREATE TABLE bench_products_two_join (id INTEGER PRIMARY KEY, name TEXT)")
+            .unwrap();
+
+        engine
+            .execute("INSERT INTO bench_accounts_two_join (id, region, name) VALUES (1, 3, 'alice')")
+            .unwrap();
+        engine
+            .execute("INSERT INTO bench_accounts_two_join (id, region, name) VALUES (2, 4, 'bob')")
+            .unwrap();
+        engine
+            .execute("INSERT INTO bench_products_two_join (id, name) VALUES (10, 'book')")
+            .unwrap();
+        engine
+            .execute("INSERT INTO bench_orders_two_join (id, account_id, product_id, quantity, total) VALUES (100, 1, 10, 2, 25.0)")
+            .unwrap();
+        engine
+            .execute("INSERT INTO bench_orders_two_join (id, account_id, product_id, quantity, total) VALUES (101, 2, 10, 1, 9.9)")
+            .unwrap();
+
+        let res = engine
+            .execute(
+                "SELECT a.name, o.id, o.total
+                 FROM bench_accounts_two_join a
+                 JOIN bench_orders_two_join o ON a.id = o.account_id
+                 WHERE a.region = 3",
+            )
+            .unwrap();
+
+        assert_eq!(res.rows.len(), 1);
+        assert_eq!(res.rows[0][0].as_deref(), Some(b"alice".as_slice()));
+        assert_eq!(res.rows[0][1].as_deref(), Some(b"100".as_slice()));
+        assert_eq!(res.command_tag, "SELECT 1");
+    }
+
+    #[test]
+    fn three_table_join_with_product_filter_falls_back_to_correct_generic_join() {
+        let engine = NativeSqlEngine::new();
+        setup_join_fixtures(&engine);
+
+        let res = engine
+            .execute(
+                "SELECT a.name, o.id, p.name, o.quantity, o.total
+                 FROM bench_accounts_test a
+                 JOIN bench_orders_test o ON a.id = o.account_id
+                 JOIN bench_products_test p ON o.product_id = p.id
+                 WHERE p.category = 'books'",
+            )
+            .unwrap();
+
+        assert_eq!(res.rows.len(), 2);
+        assert_eq!(res.command_tag, "SELECT 2");
     }
 
     #[test]
