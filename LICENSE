@@ -1,111 +1,88 @@
-# VIRGORI Source Available License
+# qmvir-db Commercial Use and Restricted Redistribution License
 
-**Copyright (c) 2025-2026 VIRGORI LAB (dev@virgori.com). All rights reserved.**
+Version 1.0 — 5 October 2026
 
-This license governs the QMvir Database software, including source code, binaries, documentation, build scripts, and related materials distributed by VIRGORI LAB (the "Software").
+This is a custom source-available license, not an OSI-approved open-source license. The English text is authoritative. By copying, modifying, distributing, or otherwise exercising permissions granted by this license, You accept its terms. Mere receipt of a copy does not by itself constitute acceptance.
 
-This is a source-available commercial license. It is not an open-source license.
+- Software: qmvir-db — only releases and files expressly carrying this license or incorporating it by reference.
+- Licensor / copyright holder: Virgori Labs.
+- Copyright: © 2026 Virgori Labs. All rights reserved except as expressly granted below.
+- Licensing and permission requests: virgorilabs@gmail.com.
+- Technical support: support@virgori.com.
+- Project maintainer: Huynh Canh Duong — huynhcanhduong981@gmail.com.
+- Territorial scope: worldwide.
+- International copyright protection and dispute resolution: see section 9. No specific national governing law or exclusive forum is designated.
 
-## 1. Definitions
+The project maintainer is identified as a maintenance contact. This identification does not itself transfer copyright or grant authority to issue separate licenses on behalf of Virgori Labs.
 
-"Licensor" means VIRGORI LAB.
+## 1. Scope and definitions
 
-"You" means any individual or legal entity accessing, copying, building, modifying, or using the Software.
+“Software” means the database software identified above, including its covered source code, binaries, and modifications of that code. Separately licensed third-party components are excluded and remain governed by their own licenses.
 
-"Production Use" means use of the Software to run, support, process, store, serve, or manage real customer, business, organizational, revenue-generating, or mission-critical workloads.
+“Modified Software” means the Software with changes, additions, or adaptations to its covered code, including a renamed version or a product incorporating a substantial portion of that code. An independently written application, client, driver, or plugin that merely communicates with the Software and does not incorporate covered code is not Modified Software solely because of that communication.
 
-"Non-Production Use" means development, testing, evaluation, benchmarking, security review, research, education, proof-of-concept work, and internal experimentation that does not process or serve Production Use workloads.
+“You” means an individual or legal entity exercising the rights granted below. Employees and contractors may act on Your behalf for authorized purposes, subject to confidentiality and restrictions at least as protective as this license. You remain responsible for their compliance.
 
-"Commercial Offering" means offering the Software, or functionality substantially derived from the Software, to third parties as a hosted service, managed service, database-as-a-service, platform feature, packaged product, support product, consulting deliverable, or other commercial product or service.
+“Database Service” means offering third parties direct access to substantial database functionality, including a database endpoint, query interface, or database administration interface, as a hosted, managed, or database-as-a-service offering. An application using the Software as an implementation component is not a Database Service merely because it stores or processes customer data, provided it does not expose substantial database functionality for customers' general-purpose use.
 
-## 2. License Grant
+## 2. Granted rights
 
-Subject to this license, Licensor grants You a limited, worldwide, non-exclusive, non-transferable, revocable, royalty-free license to:
+Subject to these terms, Licensor grants You a worldwide, non-exclusive, royalty-free copyright license to:
 
-- view, download, and inspect the source code;
-- build the Software from source;
-- run the Software for Non-Production Use;
-- modify the Software for Non-Production Use;
-- benchmark, evaluate, test, and perform security research on the Software;
-- share feedback, issues, patches, and vulnerability reports with Licensor.
+1. Download, inspect, copy, compile, install, and run the Software for personal, research, and commercial purposes.
+2. Use the Software to support Your commercial applications, websites, and business operations, including paid applications and services that are not Database Services.
+3. Modify the Software and use Modified Software within Your authorized deployments, including as the non-public implementation component of the applications permitted in item 2.
+4. Make private working copies, backups, and private forks for the foregoing purposes.
+5. Submit patches and proposed improvements directly to Licensor through designated contribution channels. Public patch submissions in Licensor's designated project channels are permitted solely for review and contribution to the original project.
 
-## 3. Commercial and Production Use
+This license does not require You to publish private modifications or customer data. It does not impose its terms on Your independently written applications, stored data, or query results merely because they use the Software. These permissions do not authorize distributing copies of the Software within those applications.
 
-Commercial Production Use requires a separate written commercial license or agreement with Licensor.
+## 3. Restricted distribution and database offerings
 
-Without a separate written agreement, You may not use the Software for:
+Without a separate written permission or license from Licensor, You may not:
 
-- Production Use in a commercial environment;
-- a Commercial Offering;
-- paid hosting, managed database service, SaaS, PaaS, or cloud service;
-- resale, sublicensing, rental, leasing, or commercial redistribution;
-- use by or for a third party as part of paid consulting, outsourcing, or service bureau work.
+1. Publish, distribute, sublicense, sell, or otherwise supply the Software or Modified Software to third parties, in source or binary form, whether modified or unmodified. This includes bundles, embedded copies, containers, packages, public mirrors, and public releases under another name.
+2. Publish a public derivative repository, fork, or collection of patches that makes Modified Software available outside the contribution exception in section 2.
+3. Offer the Software or Modified Software as a Database Service, whether paid or free.
 
-Internal Non-Production Use by a commercial organization is allowed under Section 2.
+Providing copies to employees and contractors solely to perform authorized work on Your behalf is permitted under section 1. Deployment to an infrastructure provider solely to host Your permitted applications is allowed if the provider does not use or distribute the Software for its own purposes.
 
-## 4. Redistribution Restrictions
+Linking others to Licensor's official downloads is allowed. A public repository platform's independently applicable viewing or forking permissions are not overridden by this license; they do not grant additional distribution, derivative-product, or Database Service rights under this license.
 
-You may not redistribute the Software, modified versions of the Software, or compiled binaries of the Software to any third party without prior written permission from Licensor.
+## 4. Notices, origin, and trademarks
 
-You may not publish, mirror, package, or make available public builds, container images, package-manager releases, hosted installers, or source archives derived from the Software without prior written permission from Licensor.
+Retain existing copyright, license, and attribution notices in all copies. Clearly mark private modifications where reasonably practicable. You may claim authorship of Your original changes, but may not claim authorship of Licensor's code or imply that Licensor endorses Your changes or business.
 
-## 5. Modifications
+No trademark, logo, or branding rights are granted, except truthful descriptive reference to the Software's origin. No advertising credit or prominent customer-facing attribution is required merely for permitted application use.
 
-You may create and use modifications for Non-Production Use.
+## 5. Contributions and third-party rights
 
-You may submit patches, issues, or pull requests to Licensor. Unless otherwise agreed in writing, any contribution You submit to Licensor may be used, modified, relicensed, sublicensed, and distributed by Licensor as part of the Software or related products.
+Submitting a contribution does not by itself transfer its copyright to Licensor. Contributions accepted for inclusion must be covered by a separate contributor agreement or other explicit grant sufficient for Licensor to distribute and license them under the project's chosen terms. Until then, no obligation to accept or incorporate a contribution exists.
 
-You retain ownership of Your independent work, but this license does not grant You any ownership interest in the Software or Licensor's trademarks, names, branding, or intellectual property.
+This license applies only to rights Licensor is authorized to grant. It does not replace dependency licenses, grant rights to another party's code, or limit permissions independently granted by applicable third-party licenses. No patent license is granted under this license.
 
-## 6. Reverse Engineering and Circumvention
+## 6. Termination and reinstatement
 
-You may not reverse engineer, decompile, disassemble, remove license checks from, bypass usage controls in, or otherwise attempt to circumvent technical or commercial restrictions in the Software, except to the extent such restriction is prohibited by applicable law.
+Material violation of these terms terminates the rights granted here. On termination, stop unauthorized use and distribution, including unauthorized Database Services. You may retain data that You independently own; this license does not require destruction of that data.
 
-Security research and vulnerability testing are allowed for Non-Production Use, provided that You do not access third-party data, disrupt third-party systems, or publicly disclose exploitable issues before giving Licensor a reasonable opportunity to remediate them.
+For a first violation, rights are reinstated if You fully cure the violation within 30 days after Licensor's written notice. Repeated violations require Licensor's written reinstatement. Termination does not affect rights arising independently under applicable law or third-party licenses.
 
-## 7. Benchmarking and Public Claims
+## 7. Warranty and liability
 
-You may run benchmarks for Non-Production Use.
+TO THE EXTENT PERMITTED BY APPLICABLE LAW, THE SOFTWARE IS PROVIDED “AS IS,” WITHOUT WARRANTIES OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE, AND NON-INFRINGEMENT. TO THE EXTENT PERMITTED BY APPLICABLE LAW, LICENSOR IS NOT LIABLE FOR DAMAGES ARISING FROM THE SOFTWARE OR ITS USE. NOTHING EXCLUDES LIABILITY THAT APPLICABLE LAW DOES NOT PERMIT TO BE EXCLUDED.
 
-You may not publish benchmark results, comparative performance claims, security claims, or production-readiness claims about the Software without clearly identifying the exact Software version, commit, configuration, hardware, workload, and methodology used.
+## 8. Other rights and separate agreements
 
-Licensor does not endorse third-party benchmark results unless expressly stated in writing.
+Rights not expressly granted are reserved. No automatic conversion to an open-source license is promised. Licensor may offer separate written licenses for redistribution, embedding, derivative products, or Database Services. A separate agreement prevails only to the extent it expressly grants different rights to its parties.
 
-## 8. Notices and Branding
+Mandatory legal rights and applicable copyright exceptions remain unaffected. If one provision is unenforceable, the remaining provisions continue to the extent permitted by law.
 
-You may not remove, obscure, or alter copyright notices, license notices, proprietary legends, trademarks, or attribution notices included with the Software.
+## 9. International copyright protection and dispute resolution
 
-This license does not grant permission to use the names "VIRGORI", "VIRGORI LAB", "QMvir", or any related logo or mark except as necessary to identify the Software accurately.
+The rights expressly granted by this license have worldwide territorial scope. Copyright protection for the Software is recognized under applicable national copyright laws and relevant international treaties, including the Berne Convention for the Protection of Literary and Artistic Works, to the extent those instruments apply in the relevant jurisdiction. Reference to the Berne Convention does not replace national law governing this license or independently establish jurisdiction over any party.
 
-## 9. Third-Party Software
+This license does not designate a particular national governing law. Applicable law shall be determined under the rules of the competent court or other lawfully agreed dispute-resolution forum, subject to mandatory laws and applicable treaties.
 
-Third-party dependencies included with or used by the Software remain subject to their own license terms. This license applies only to the Software owned or licensable by Licensor.
+Subject to applicable law, Virgori Labs may initiate proceedings in any court that has lawful jurisdiction over the dispute and the relevant parties. Its selection among competent courts does not create jurisdiction where none exists, prevent another party from exercising mandatory legal rights, or establish an exclusive forum chosen unilaterally after a dispute arises.
 
-## 10. No Warranty
-
-THE SOFTWARE IS PROVIDED "AS IS" AND "WITH ALL FAULTS." TO THE MAXIMUM EXTENT PERMITTED BY LAW, LICENSOR DISCLAIMS ALL WARRANTIES, WHETHER EXPRESS, IMPLIED, STATUTORY, OR OTHERWISE, INCLUDING WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE, TITLE, NON-INFRINGEMENT, SECURITY, AVAILABILITY, AND ERROR-FREE OPERATION.
-
-## 11. Limitation of Liability
-
-TO THE MAXIMUM EXTENT PERMITTED BY LAW, LICENSOR AND ITS CONTRIBUTORS WILL NOT BE LIABLE FOR ANY INDIRECT, INCIDENTAL, SPECIAL, CONSEQUENTIAL, EXEMPLARY, OR PUNITIVE DAMAGES, OR FOR LOSS OF PROFITS, REVENUE, GOODWILL, DATA, BUSINESS INTERRUPTION, OR SYSTEM FAILURE, ARISING FROM OR RELATED TO THE SOFTWARE OR THIS LICENSE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGES.
-
-LICENSOR'S TOTAL LIABILITY FOR ANY CLAIM ARISING FROM OR RELATED TO THE SOFTWARE OR THIS LICENSE WILL NOT EXCEED USD $100.
-
-## 12. Termination
-
-This license is effective until terminated.
-
-Your rights under this license terminate automatically if You violate any term of this license. Upon termination, You must stop using the Software and delete all copies in Your possession or control, including modified versions and compiled binaries.
-
-Sections that by their nature should survive termination will survive, including ownership, restrictions, warranty disclaimers, limitation of liability, and governing law.
-
-## 13. Governing Law
-
-This license is governed by the laws of the jurisdiction where Licensor is established, without regard to conflict-of-law rules.
-
-## 14. Commercial Licensing
-
-For Production Use, enterprise licensing, partnerships, redistribution rights, or custom agreements, contact:
-
-- Email: [dev@virgori.com](mailto:dev@virgori.com)
-- Official repository: [github.com/virgori/qmvir-db](https://github.com/virgori/qmvir-db)
+The parties may agree in a separate written agreement to a specific court, governing law, or arbitration procedure. Arbitration is not required or established by this license alone. Nothing in this section prevents seeking interim or protective relief from a competent court.

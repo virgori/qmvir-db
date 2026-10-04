@@ -8,9 +8,9 @@ version = "6.2.8"
 description = "QMvir — High-Performance Database Engine (Rust)"
 readme = "README.md"
 requires-python = ">=3.11"
-license = {text = "VIRGORI Source Available License"}
+license = {text = "qmvir-db Commercial Use and Restricted Redistribution License v1.0"}
 authors = [
-    {name = "QM Team"}
+    {name = "Virgori", email = "support@virgori.com"}
 ]
 
 keywords = [
